@@ -179,6 +179,9 @@ class Invoice extends Model
                 static::createInvoice($order, $agent, collect([$os]), $taxInfo, 1.0, "Service Invoice: " . ($os->service->name ?? 'Service'), null, 'primary');
             }
         }
+
+        // Add fixed-area and allowance-excess lines to consolidated invoices.
+        static::syncOrderInvoices($order);
     }
 
     /**
@@ -560,7 +563,13 @@ class Invoice extends Model
      */
     public static function syncOrderInvoices(Order $order)
     {
-        $order->load(['services.service']);
+        $order->load(['services.service', 'areas']);
+        $areaMetrics = app(\App\Services\AreaPricingService::class)
+            ->calculateAreaMetrics($order->areas->map(fn($area) => [
+                'type' => $area->type,
+                'footage' => $area->footage,
+                'custom_title' => $area->custom_title,
+            ])->toArray(), $order->organization_id);
         
         $activeInvoices = static::where('order_id', $order->id)
             ->where('status', '!=', 'paid')
@@ -641,6 +650,12 @@ class Invoice extends Model
                     }
                 }
 
+                $hasChanged = static::syncAreaChargeItems(
+                    $invoice,
+                    $areaMetrics,
+                    $multiplier
+                ) || $hasChanged;
+
                 if ($hasChanged) {
                     $invoice->recalculateTotals();
                 }
@@ -676,5 +691,65 @@ class Invoice extends Model
 
         // Sync order and invoice statuses after recalculating
         static::syncOrderStatus($order);
+    }
+
+    /**
+     * Keep fixed Other Area and allowance-excess charges on consolidated
+     * invoices without attaching them to a service item.
+     */
+    private static function syncAreaChargeItems(Invoice $invoice, array $metrics, float $multiplier): bool
+    {
+        $descriptions = [
+            'fixed' => 'Other Areas fixed charges',
+            'allowance' => 'Other Areas above free allowance',
+        ];
+        $amounts = [
+            'fixed' => round((float) ($metrics['custom_other_charges'] ?? 0) * $multiplier, 2),
+            'allowance' => round((float) ($metrics['excess_other_charge'] ?? 0) * $multiplier, 2),
+        ];
+        $existing = $invoice->items()
+            ->where('is_extra', true)
+            ->whereNull('order_service_id')
+            ->whereIn('description', array_values($descriptions))
+            ->get()
+            ->keyBy(function ($item) use ($descriptions) {
+                return array_search($item->description, $descriptions, true);
+            });
+
+        $changed = false;
+        foreach ($amounts as $key => $amount) {
+            $item = $existing->get($key);
+            if ($amount <= 0) {
+                if ($item) {
+                    $item->delete();
+                    $changed = true;
+                }
+                continue;
+            }
+
+            $description = $descriptions[$key];
+            if (!$item) {
+                $invoice->items()->create([
+                    'order_service_id' => null,
+                    'is_extra' => true,
+                    'description' => $description,
+                    'quantity' => 1,
+                    'unit_price' => $amount,
+                    'amount' => $amount,
+                ]);
+                $changed = true;
+                continue;
+            }
+
+            if ((float) $item->unit_price !== $amount || (float) $item->amount !== $amount) {
+                $item->update([
+                    'unit_price' => $amount,
+                    'amount' => $amount,
+                ]);
+                $changed = true;
+            }
+        }
+
+        return $changed;
     }
 }

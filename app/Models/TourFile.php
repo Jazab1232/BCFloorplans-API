@@ -54,6 +54,10 @@ class TourFile extends Model
         $tour = $this->tour;
         $order = $tour ? ($tour->order ?? $tour->orders) : null;
 
+        if ($order && $order->release_media_before_payment) {
+            return true;
+        }
+
         // If it's linked to a service, check the payment / media_access status
         if ($this->service_id) {
             if ($tour) {
@@ -218,9 +222,11 @@ class TourFile extends Model
         $user = request()->user();
         $isAdminOrVendor = $user && ($user instanceof \App\Models\User || $user instanceof \App\Models\Vendor);
 
+        $orderReleased = $this->tour && $this->tour->order && $this->tour->order->release_media_before_payment;
+
         // Expose url and file_path for videos if paid, complimentary, or requested by authenticated user
         if ($this->type === 'video') {
-            if ($this->is_paid || $this->is_complimentary || $user !== null) {
+            if ($this->is_paid || $this->is_complimentary || $user !== null || $orderReleased) {
                 $array['url'] = $this->url;
                 $array['file_path'] = $this->file_path;
             }
@@ -228,14 +234,14 @@ class TourFile extends Model
 
         // Expose url and file_path for PDFs and documents if paid, complimentary, or requested by admin/vendor
         if (in_array($this->type, ['pdf', 'document'])) {
-            if ($this->is_paid || $this->is_complimentary || $isAdminOrVendor) {
+            if ($this->is_paid || $this->is_complimentary || $isAdminOrVendor || $orderReleased) {
                 $array['url'] = $this->url;
                 $array['file_path'] = $this->file_path;
             }
         }
 
         // If paid or complimentary or admin/vendor, ensure url is exposed for non-photo or fallback media
-        if ($this->is_paid || $this->is_complimentary || $isAdminOrVendor) {
+        if ($this->is_paid || $this->is_complimentary || $isAdminOrVendor || $orderReleased) {
             if ($this->type !== 'photo' || empty($this->variants)) {
                 $array['url'] = $this->url;
             }

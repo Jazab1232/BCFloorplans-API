@@ -43,6 +43,12 @@ class MediaDownloadController extends Controller
 
         if (!$isAdminOrVendor) {
             $unpaidFiles = TourFile::whereIn('uuid', $uuids)->get()->filter(function ($f) {
+                $order = $f->tour?->order;
+
+                if ($order && $order->release_media_before_payment) {
+                    return false;
+                }
+
                 return !$f->is_paid && !$f->is_complimentary;
             });
 

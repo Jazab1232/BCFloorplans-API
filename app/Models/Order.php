@@ -33,6 +33,7 @@ class Order extends Model
         'split_invoice',
         'paid_amount',
         'lock_materials',
+        'release_media_before_payment',
         'meta',
         'agent_google_event_id',
         'cancellation_fee',
@@ -43,11 +44,13 @@ class Order extends Model
     ];
 
      protected $attributes = [
-        'lock_materials' => true 
+        'lock_materials' => true,
+        'release_media_before_payment' => false,
     ];
 
      protected $casts = [
         'lock_materials' => 'boolean',
+        'release_media_before_payment' => 'boolean',
         'meta' => 'array',
         'notes' => 'array',
         'co_agents' => 'array',

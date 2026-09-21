@@ -91,7 +91,7 @@ return [
             'admin' => true,
             'agent' => true,
         ],
-        'variables' => ['order_id', 'property_address', 'amount', 'payment_method', 'agent_name', 'payment_scope', 'service_name', 'invoice_number', 'receipt_url', 'payer_name'],
+        'variables' => ['order_id', 'property_address', 'amount', 'payment_method'],
         'mailable_class' => \App\Mail\AgentPaymentReceived::class,
     ],
     'vendor_payment_processed' => [

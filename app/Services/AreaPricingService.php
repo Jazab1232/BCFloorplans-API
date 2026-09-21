@@ -11,15 +11,12 @@ use Illuminate\Support\Facades\Log;
 class AreaPricingService
 {
     /**
-     * Calculate billable square footage and area charges for an array of order areas.
+     * Calculate service square footage and separate Other Area charges.
      *
-     * Rules:
-     * 1. Finished & Sub Areas: Always included in billable sqft.
-     * 2. Other Areas ($0 defined charge): Pooled into Free Allowance limit (default 2000 sq ft).
-     *    - Footage up to limit = $0 (free)
-     *    - Excess footage above limit = Added to billable sqft / charged at rate above allowance.
-     * 3. Other Areas (> $0 defined charge): Excluded from Free Allowance pool.
-     *    - Charged directly per sq. ft. from sq. ft. 1 based on defined charge rate.
+     * Finished/Sub Areas always contribute to service square footage. Other
+     * Areas with a configured charge are fixed-price items and are excluded
+     * from the allowance pool. The remaining Other Areas use the organization
+     * allowance when enabled, or are all billable when it is disabled.
      */
     public function calculateAreaMetrics(array $areas, ?int $organizationId = null): array
     {
@@ -34,17 +31,21 @@ class AreaPricingService
             return strtolower(trim($setting->area));
         });
 
-        // Default free allowance settings (fallback 2000 limit, 0 rate above)
+        // Keep defaults compatible with existing organizations without settings.
+        $allowanceEnabled = true;
         $freeAllowanceLimit = 2000;
         $rateAboveAllowance = 0.0;
         try {
             $orgUuid = $organizationId ? Organization::where('id', $organizationId)->value('uuid') : null;
             $portalSettings = app(SettingsService::class)->get($orgUuid, 'portal_settings');
-            if (isset($portalSettings['free_allowance_limit'])) {
-                $freeAllowanceLimit = (int) $portalSettings['free_allowance_limit'];
+            if (array_key_exists('other_areas_enable_allowance', $portalSettings)) {
+                $allowanceEnabled = (bool) $portalSettings['other_areas_enable_allowance'];
             }
-            if (isset($portalSettings['rate_above_allowance'])) {
-                $rateAboveAllowance = (float) $portalSettings['rate_above_allowance'];
+            if (array_key_exists('other_areas_free_allowance', $portalSettings)) {
+                $freeAllowanceLimit = max(0, (float) $portalSettings['other_areas_free_allowance']);
+            }
+            if (array_key_exists('other_areas_rate_per_sq_ft', $portalSettings)) {
+                $rateAboveAllowance = max(0, (float) $portalSettings['other_areas_rate_per_sq_ft']);
             }
         } catch (\Throwable $e) {
             // Fallback to defaults
@@ -75,23 +76,33 @@ class AreaPricingService
             } else {
                 // Category: Other Area
                 if ($definedCharge > 0) {
-                    // Explicitly charged Other Area (e.g. Servant Room, Barn)
-                    // Does NOT count towards free allowance pool, always charged from sq ft 1
-                    $customOtherCharges += ($footage * $definedCharge);
+                    // A configured Other Area charge is a fixed charge, not a
+                    // per-square-foot rate, and never consumes allowance.
+                    $customOtherCharges += $definedCharge;
                     $customOtherFootage += $footage;
                 } else {
-                    // $0 defined charge Other Area (e.g. standard Garage, Deck)
+                    // Zero-charge Other Areas participate in the allowance pool.
                     $zeroChargeOtherFootage += $footage;
                 }
             }
         }
 
-        // Calculate free allowance excess for $0 Other Areas
-        $excessOtherFootage = max(0, $zeroChargeOtherFootage - $freeAllowanceLimit);
-        $excessOtherCharge = $excessOtherFootage * $rateAboveAllowance;
+        $freeAllowanceUsed = $allowanceEnabled
+            ? min($zeroChargeOtherFootage, $freeAllowanceLimit)
+            : 0;
+        $excessOtherFootage = $allowanceEnabled
+            ? max(0, $zeroChargeOtherFootage - $freeAllowanceLimit)
+            : $zeroChargeOtherFootage;
+        $excessOtherCharge = $allowanceEnabled
+            ? $excessOtherFootage * $rateAboveAllowance
+            : 0;
 
-        // Billable square footage for services (e.g., 2D Floor Plan)
-        $totalBillableSqft = $finishedSubFootage + $excessOtherFootage;
+        // With allowance enabled, excess Other Areas are charged separately.
+        // With allowance disabled, all zero-charge Other Areas use normal
+        // service square-footage pricing.
+        $totalBillableSqft = $allowanceEnabled
+            ? $finishedSubFootage
+            : $finishedSubFootage + $zeroChargeOtherFootage;
 
         // Total standalone area charges
         $totalAreaCharges = $customOtherCharges + $excessOtherCharge;
@@ -99,8 +110,9 @@ class AreaPricingService
         return [
             'finished_sub_footage' => $finishedSubFootage,
             'zero_charge_other_footage' => $zeroChargeOtherFootage,
+            'allowance_enabled' => $allowanceEnabled,
             'free_allowance_limit' => $freeAllowanceLimit,
-            'free_allowance_used' => min($zeroChargeOtherFootage, $freeAllowanceLimit),
+            'free_allowance_used' => $freeAllowanceUsed,
             'excess_other_footage' => $excessOtherFootage,
             'excess_other_charge' => $excessOtherCharge,
             'custom_other_footage' => $customOtherFootage,
@@ -208,7 +220,5 @@ class AreaPricingService
         $grandTotal = $totalServiceAmount + $metrics['total_area_charges'];
         $order->update(['amount' => $grandTotal]);
 
-        // Sync master and partial invoices
-        \App\Models\Invoice::syncOrderInvoices($order);
     }
 }

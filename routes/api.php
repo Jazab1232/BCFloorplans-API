@@ -43,7 +43,6 @@ use App\Http\Controllers\Api\SignatureController;
 use App\Http\Controllers\Api\OrderCancellationController;
 use App\Http\Controllers\Api\PrintRequestController;
 use App\Http\Controllers\Api\VendorEarningsController;
-use App\Http\Controllers\Api\TaxSettingsController;
 
 use App\Http\Controllers\Api\DomainController;
 use App\Http\Controllers\Api\BrandingController;
@@ -64,10 +63,7 @@ Route::get('public/organizations', [OrganizationController::class, 'publicIndex'
 Route::get('packages', [PackageController::class, 'index'])->middleware(['resolve.org', 'throttle:30,1']);
 Route::get('services', [ServiceController::class, 'index'])->middleware(['resolve.org', 'throttle:30,1']);
 Route::get('vendors', [VendorController::class, 'index'])->middleware(['resolve.org', 'throttle:30,1']);
-Route::post('public/tax-preview', [TaxSettingsController::class, 'calculatePreview'])->middleware(['resolve.org']);
 Route::get('twilight-window', [OrderController::class, 'getTwilightWindow'])->middleware(['resolve.org']);
-Route::get('feature-sheets/order/{orderUuid}', [FeatureSheetController::class, 'indexByOrder'])->middleware(['resolve.org', 'throttle:60,1']);
-Route::get('feature-sheets/{featureSheetUuid}', [FeatureSheetController::class, 'show'])->middleware(['resolve.org', 'throttle:60,1']);
 Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api", "resolve.org"]], function () {
     // Moved from public — now org-scoped
     Route::get('/order-slots', [OrderController::class, 'getAllOrderSlots']);
@@ -79,8 +75,6 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api
     Route::get('/organizations/{uuid}', [OrganizationController::class, 'show']);
     Route::get('/organizations/{uuid}/branding', [BrandingController::class, 'show']);
     Route::get('/settings', [SettingsController::class, 'index']);
-    Route::get('/tax-settings', [TaxSettingsController::class, 'show']);
-    Route::post('/tax-settings/calculate-preview', [TaxSettingsController::class, 'calculatePreview']);
 
     Route::post('/notifications/email', [NotificationController::class, 'sendEmail']);
 
@@ -203,6 +197,12 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api
     Route::prefix('feature-sheets')->group(function () {
         Route::get('/agent/all', [FeatureSheetController::class, 'indexByAgent']);
         Route::post('/', [FeatureSheetController::class, 'store']);
+
+        // Order-based (UUID)
+        Route::get('/order/{orderUuid}', [FeatureSheetController::class, 'indexByOrder']);
+
+        // Feature sheet (UUID)
+        Route::get('/{featureSheetUuid}', [FeatureSheetController::class, 'show']);
         Route::put('/{featureSheetUuid}', [FeatureSheetController::class, 'update']);
         Route::patch('/{featureSheetUuid}/toggle-publish', [FeatureSheetController::class, 'togglePublish']);
         Route::delete('/{featureSheetUuid}', [FeatureSheetController::class, 'destroy']);
@@ -250,7 +250,6 @@ Route::group(["middleware" => ["auth:api", "resolve.org"]], function () {
 
     Route::post('/settings/{key}', [SettingsController::class, 'update']);
     Route::delete('/settings/{key}', [SettingsController::class, 'destroy']);
-    Route::post('/tax-settings', [TaxSettingsController::class, 'update']);
 
     Route::get('users', [UserController::class, 'index']);
     Route::get('users/{uuid}', [UserController::class, 'show']);
@@ -381,7 +380,6 @@ Route::group(["middleware" => ["auth:api", "resolve.org"]], function () {
         Route::post('/refresh', [QuickBooksController::class, 'refresh']);
         Route::post('/disconnect', [QuickBooksController::class, 'disconnect']);
         Route::get('/company-info', [QuickBooksController::class, 'getCompanyInfo']);
-        Route::get('/tax-codes', [QuickBooksController::class, 'getTaxCodes']);
         Route::post('/customers', [QuickBooksController::class, 'createCustomer']);
 
         // Invoice Management
@@ -445,7 +443,6 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api", "resolve
 
     Route::delete('orders/{uuid}', [OrderController::class, 'destroy']);
     Route::patch('orders/completion-status/update', [OrderController::class, 'IsOrderServiceCompleted']);
-    Route::patch('orders/media-access/update', [OrderController::class, 'updateOrderServiceMediaAccess']);
 
 
     // Sub Account management - admin only

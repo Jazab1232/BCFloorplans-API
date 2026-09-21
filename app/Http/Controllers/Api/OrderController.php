@@ -163,6 +163,12 @@ class OrderController extends Controller
                 $request->merge(['split_invoice' => false]);
             }
         }
+        if ($request->has('release_media_before_payment')) {
+            $releaseMedia = $request->input('release_media_before_payment');
+            $request->merge([
+                'release_media_before_payment' => filter_var($releaseMedia, FILTER_VALIDATE_BOOLEAN),
+            ]);
+        }
 
         $validator = Validator::make($request->all(), [
             'agent_id' => 'required|exists:agents,uuid',
@@ -177,6 +183,7 @@ class OrderController extends Controller
             'co_agents.*.number' => 'nullable',
             'co_agents.*.percentage' => 'nullable|numeric',
             'split_invoice' => 'nullable|boolean',
+            'release_media_before_payment' => 'nullable|boolean',
             'notes' => 'nullable|array',
             'notes.*.name' => 'nullable|string',
             'notes.*.note' => 'nullable|string',
@@ -250,6 +257,7 @@ class OrderController extends Controller
             $data['notes'] = array_values($incomingNotes);
             $data['split_invoice'] = $data['split_invoice'] ?? false;
             $data['lock_materials'] = $data['lock_materials'] ?? true;
+            $data['release_media_before_payment'] = $data['release_media_before_payment'] ?? false;
 
             $meta = [];
 
@@ -710,6 +718,12 @@ class OrderController extends Controller
             $request->merge(['split_invoice' => false]);
         }
     }
+    if ($request->has('release_media_before_payment')) {
+        $releaseMedia = $request->input('release_media_before_payment');
+        $request->merge([
+            'release_media_before_payment' => filter_var($releaseMedia, FILTER_VALIDATE_BOOLEAN),
+        ]);
+    }
 
     $validator = Validator::make($request->all(), [
         'agent_id' => 'sometimes|exists:agents,uuid',
@@ -724,6 +738,7 @@ class OrderController extends Controller
         'co_agents.*.number' => 'nullable',
         'co_agents.*.percentage' => 'nullable|numeric',
         'split_invoice' => 'nullable|boolean',
+        'release_media_before_payment' => 'nullable|boolean',
         'notes' => 'nullable|array',
         'notes.*.name' => 'nullable|string',
         'notes.*.note' => 'nullable|string',
@@ -1238,6 +1253,10 @@ private function prepareOrderData(Request $request, $order = null): array
 
     if ($request->has('lock_materials')) {
         $data['lock_materials'] = $request->lock_materials;
+    }
+
+    if ($request->has('release_media_before_payment')) {
+        $data['release_media_before_payment'] = $request->boolean('release_media_before_payment');
     }
 
     return $data;
