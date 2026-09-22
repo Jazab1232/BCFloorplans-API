@@ -54,10 +54,6 @@ class TourFile extends Model
         $tour = $this->tour;
         $order = $tour ? ($tour->order ?? $tour->orders) : null;
 
-        if ($order && $order->release_media_before_payment) {
-            return true;
-        }
-
         // If it's linked to a service, check the payment / media_access status
         if ($this->service_id) {
             if ($tour) {
@@ -221,8 +217,8 @@ class TourFile extends Model
 
         $user = request()->user();
         $isAdminOrVendor = $user && ($user instanceof \App\Models\User || $user instanceof \App\Models\Vendor);
-
-        $orderReleased = $this->tour && $this->tour->order && $this->tour->order->release_media_before_payment;
+        $order = $this->tour ? ($this->tour->order ?? $this->tour->orders) : null;
+        $orderReleased = $order && (bool) $order->release_media_before_payment;
 
         // Expose url and file_path for videos if paid, complimentary, or requested by authenticated user
         if ($this->type === 'video') {

@@ -222,7 +222,7 @@ class TourController extends Controller
             $isAdminOrVendor = $user && ($user instanceof \App\Models\User || $user instanceof \App\Models\Vendor);
             if (!$isAdminOrVendor) {
                 $order = $tour->order ?? $tour->orders;
-                $isPaidOrder = $order && $order->payment_status === 'PAID';
+                $isPaidOrder = $order && ($order->payment_status === 'PAID' || (bool) $order->release_media_before_payment);
                 if ($tour->links) {
                     $tour->links->transform(function ($link) use ($isPaidOrder) {
                         $isPaid = $link->service_id ? $link->is_paid : ($link->is_paid || $isPaidOrder);
@@ -875,7 +875,8 @@ class TourController extends Controller
             $query->latest('id');
 
             $transformTour = function ($tour) {
-                $isPaidOrder = $tour->orders && $tour->orders->payment_status === 'PAID';
+                $order = $tour->orders ?? $tour->order;
+                $isPaidOrder = $order && ($order->payment_status === 'PAID' || (bool) $order->release_media_before_payment);
                 if ($tour->links) {
                     $tour->links->transform(function ($link) use ($isPaidOrder) {
                         $isPaid = $link->service_id ? $link->is_paid : ($link->is_paid || $isPaidOrder);
@@ -1062,7 +1063,7 @@ class TourController extends Controller
 
             $user = auth()->user();
             $isAdminOrVendor = $user && ($user instanceof \App\Models\User || $user instanceof \App\Models\Vendor);
-            $isPaidOrder = $order->payment_status === 'PAID';
+            $isPaidOrder = $order && ($order->payment_status === 'PAID' || (bool) $order->release_media_before_payment);
 
             // Add downloadable URLs to files and snapshots
             $tours->transform(function ($tour) use ($isAdminOrVendor, $isPaidOrder) {
@@ -1134,12 +1135,14 @@ class TourController extends Controller
         try {
             $file = TourFile::where('uuid', $uuid)->firstOrFail();
 
-            // Security check: if not paid, prevent downloading original high-res files
+            // Security check: if not paid or released, prevent downloading original high-res files
             // Admins (User model) can always download
             $user = auth()->user();
             $isAdmin = $user && ($user instanceof \App\Models\User);
+            $order = $file->tour ? ($file->tour->order ?? $file->tour->orders) : null;
+            $orderReleased = $order && (bool) $order->release_media_before_payment;
 
-            if (!$isAdmin && !$file->is_paid) {
+            if (!$isAdmin && !$file->is_paid && !$orderReleased && !$file->is_complimentary) {
                 // If it's a PDF or video, block download entirely if not paid
                 // Or if it's an image and they haven't requested a specific (watermarked) size
                 $requestedSize = $request->query('size');

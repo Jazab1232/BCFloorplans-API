@@ -89,11 +89,14 @@ class ProcessUploadedImage implements ShouldQueue, ShouldBeUnique
                 }
             }
 
+            // Determine if watermarking should be skipped (paid OR released before payment)
+            $skipWatermark = (bool) $this->tourFile->is_paid || ($order && (bool) $order->release_media_before_payment);
+
             // Generate all size variants
             $variants = $resizer->processImage(
                 $this->tourFile->file_path,
                 null,
-                (bool) $this->tourFile->is_paid,
+                $skipWatermark,
                 $watermarkText
             );
 

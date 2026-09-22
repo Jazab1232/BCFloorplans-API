@@ -53,9 +53,13 @@ class ReprocessPaidMedia extends Command
             }
             $query->whereIn('id', $idArray);
         } else {
-            // Find photos belonging to PAID services or having no service
+            // Find photos belonging to PAID orders/services, released before payment, or having no service
             $query->where(function($q) {
-                $q->whereHas('tour.orders.services', function($subQuery) {
+                $q->whereHas('tour.orders', function($subQuery) {
+                    $subQuery->where('release_media_before_payment', true)
+                             ->orWhere('payment_status', 'PAID');
+                })
+                ->orWhereHas('tour.orders.services', function($subQuery) {
                     $subQuery->whereColumn('order_services.service_id', 'tour_files.service_id')
                              ->where('order_services.payment_status', 'PAID');
                 })

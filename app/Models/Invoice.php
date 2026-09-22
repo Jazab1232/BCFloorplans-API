@@ -558,19 +558,39 @@ class Invoice extends Model
      }
 
     /**
+     * Identify the primary area-based OrderService for an order (booked with a per sq. ft. option).
+     */
+    public static function findAreaOrderService(Order $order): ?OrderService
+    {
+        $order->loadMissing(['services.option']);
+
+        foreach ($order->services as $os) {
+            if ($os->option) {
+                if ((!empty($os->option->sq_ft_rate) && (float)$os->option->sq_ft_rate > 0) || !empty($os->option->sq_ft_range)) {
+                    return $os;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Synchronize consolidated and service-specific invoices with the current state of order services.
      * Useful when services are added, removed, or prices changed (e.g. square footage updates).
      */
     public static function syncOrderInvoices(Order $order)
     {
-        $order->load(['services.service', 'areas']);
+        $order->load(['services.option', 'services.service', 'areas']);
         $areaMetrics = app(\App\Services\AreaPricingService::class)
             ->calculateAreaMetrics($order->areas->map(fn($area) => [
                 'type' => $area->type,
                 'footage' => $area->footage,
                 'custom_title' => $area->custom_title,
             ])->toArray(), $order->organization_id);
-        
+
+        $areaOrderService = static::findAreaOrderService($order);
+
         $activeInvoices = static::where('order_id', $order->id)
             ->where('status', '!=', 'paid')
             ->where('status', '!=', 'void')
@@ -653,7 +673,8 @@ class Invoice extends Model
                 $hasChanged = static::syncAreaChargeItems(
                     $invoice,
                     $areaMetrics,
-                    $multiplier
+                    $multiplier,
+                    $areaOrderService ? $areaOrderService->id : null
                 ) || $hasChanged;
 
                 if ($hasChanged) {
@@ -673,6 +694,8 @@ class Invoice extends Model
                     continue;
                 }
 
+                $serviceInvoiceChanged = false;
+
                 if ($os->payment_status !== 'PAID') {
                     $expectedAmount = round((float)$os->amount * $multiplier, 2);
                     $itemDescription = ($os->custom ?: ($os->service->name ?? 'Service')) . ($multiplier < 1 ? " (" . ($multiplier * 100) . "%)" : "");
@@ -683,8 +706,35 @@ class Invoice extends Model
                             'amount' => $expectedAmount,
                             'description' => $itemDescription
                         ]);
-                        $invoice->recalculateTotals();
+                        $serviceInvoiceChanged = true;
                     }
+                }
+
+                // If this is the per-sqft service, sync area charge items onto its service invoice
+                $isAreaService = ($areaOrderService && $os->id === $areaOrderService->id);
+                if ($isAreaService) {
+                    $serviceInvoiceChanged = static::syncAreaChargeItems(
+                        $invoice,
+                        $areaMetrics,
+                        $multiplier,
+                        $os->id
+                    ) || $serviceInvoiceChanged;
+                } else {
+                    // Clean up any stray area charge items if this is NOT a per-sqft service
+                    $strayItems = $invoice->items()
+                        ->where('is_extra', true)
+                        ->whereIn('description', ['Other Areas fixed charges', 'Other Areas above free allowance'])
+                        ->get();
+                    if ($strayItems->isNotEmpty()) {
+                        foreach ($strayItems as $stray) {
+                            $stray->delete();
+                        }
+                        $serviceInvoiceChanged = true;
+                    }
+                }
+
+                if ($serviceInvoiceChanged) {
+                    $invoice->recalculateTotals();
                 }
             }
         }
@@ -694,10 +744,10 @@ class Invoice extends Model
     }
 
     /**
-     * Keep fixed Other Area and allowance-excess charges on consolidated
-     * invoices without attaching them to a service item.
+     * Sync fixed Other Area and allowance-excess charges on invoices,
+     * attached to the area OrderService.
      */
-    private static function syncAreaChargeItems(Invoice $invoice, array $metrics, float $multiplier): bool
+    private static function syncAreaChargeItems(Invoice $invoice, array $metrics, float $multiplier, ?int $orderServiceId = null): bool
     {
         $descriptions = [
             'fixed' => 'Other Areas fixed charges',
@@ -709,7 +759,6 @@ class Invoice extends Model
         ];
         $existing = $invoice->items()
             ->where('is_extra', true)
-            ->whereNull('order_service_id')
             ->whereIn('description', array_values($descriptions))
             ->get()
             ->keyBy(function ($item) use ($descriptions) {
@@ -730,7 +779,7 @@ class Invoice extends Model
             $description = $descriptions[$key];
             if (!$item) {
                 $invoice->items()->create([
-                    'order_service_id' => null,
+                    'order_service_id' => $orderServiceId,
                     'is_extra' => true,
                     'description' => $description,
                     'quantity' => 1,
@@ -741,11 +790,16 @@ class Invoice extends Model
                 continue;
             }
 
+            $updates = [];
             if ((float) $item->unit_price !== $amount || (float) $item->amount !== $amount) {
-                $item->update([
-                    'unit_price' => $amount,
-                    'amount' => $amount,
-                ]);
+                $updates['unit_price'] = $amount;
+                $updates['amount'] = $amount;
+            }
+            if ($orderServiceId && $item->order_service_id !== $orderServiceId) {
+                $updates['order_service_id'] = $orderServiceId;
+            }
+            if (!empty($updates)) {
+                $item->update($updates);
                 $changed = true;
             }
         }

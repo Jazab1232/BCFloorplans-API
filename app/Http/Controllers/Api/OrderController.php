@@ -825,8 +825,10 @@ class OrderController extends Controller
 
         // Update basic order fields
         $orderData = $this->prepareOrderData($request, $order);
+        $mediaSettingsChanged = false;
         if (!empty($orderData)) {
             $order->update($orderData);
+            $mediaSettingsChanged = $order->wasChanged('release_media_before_payment') || $order->wasChanged('payment_status');
         }
 
         // Process services if provided
@@ -1079,6 +1081,31 @@ class OrderController extends Controller
         }
 
         DB::commit();
+
+        // Trigger background reprocessing of photos if release_media_before_payment or payment_status changed
+        if (!empty($mediaSettingsChanged)) {
+            try {
+                $tourFiles = \App\Models\TourFile::where('type', 'photo')
+                    ->whereHas('tour', function ($q) use ($order) {
+                        $q->where('order_id', $order->id);
+                    })->get();
+
+                foreach ($tourFiles as $tourFile) {
+                    \App\Jobs\ProcessUploadedImage::dispatch($tourFile)->onQueue('image-processing');
+                    Log::info('Queued image reprocessing after order update', [
+                        'file_id' => $tourFile->id,
+                        'order_id' => $order->id,
+                        'release_media' => $order->release_media_before_payment,
+                        'payment_status' => $order->payment_status,
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                Log::error('Failed to queue image reprocessing after order update', [
+                    'order_id' => $order->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
 
         // Send email notifications after successful order update
         if ($this->hasSignificantChanges($changes)) {
@@ -2225,7 +2252,7 @@ private function createOrderNotification($order, array $changes)
                 },
             ]);
 
-            $isPaidOrder = $order->payment_status === 'PAID';
+            $isPaidOrder = $order->payment_status === 'PAID' || (bool) $order->release_media_before_payment;
             foreach ($order->tours as $tour) {
                 if ($tour->links) {
                     $tour->links->transform(function ($link) use ($isPaidOrder) {
@@ -2524,7 +2551,7 @@ private function createOrderNotification($order, array $changes)
             $user = auth()->user();
             $isAdmin = $user && ($user instanceof \App\Models\User);
             $isVendor = $user && ($user instanceof \App\Models\Vendor);
-            $isPaidOrder = $order->payment_status === 'PAID';
+            $isPaidOrder = $order->payment_status === 'PAID' || (bool) $order->release_media_before_payment;
 
             // Protect square footage measurements for unpaid agents when materials are locked
             // Vendors who measure and work on the order, as well as Admins, should always see the areas
