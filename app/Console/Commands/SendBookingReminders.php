@@ -35,87 +35,123 @@ class SendBookingReminders extends Command
 
         $now = Carbon::now();
 
-        // Default reminder intervals in hours
-        $intervals = [24, 1];
+        // Fetch organization preferences for booking reminders (across all tenants)
+        $orgPreferences = \App\Models\NotificationPreference::withoutGlobalScopes()
+            ->where('event_type', 'booking_reminder')
+            ->whereNull('user_id')
+            ->get()
+            ->groupBy('organization_id');
 
-        // Fetch from settings if available
-        $setting = \App\Models\Setting::where('key', 'booking_reminders')->first();
-        if ($setting && isset($setting->value['intervals'])) {
-            $intervals = $setting->value['intervals'];
-        }
-
-        Log::info('Reminder intervals', [
-            'intervals' => $intervals,
-            'now' => $now->toDateTimeString(),
-        ]);
-
-        // Fetch all upcoming slots with vendors
-        $slots = OrderSlot::with(['vendor', 'order','service'])
+        // Fetch all upcoming non-cancelled slots with vendors
+        $slots = OrderSlot::with(['vendor', 'order.organization', 'service'])
             ->where('date', '>=', $now->toDateString())
             ->whereNotNull('vendor_id')
+            ->where(function ($query) {
+                $query->whereNull('status')->orWhere('status', '!=', 'cancelled');
+            })
             ->get();
 
-        Log::info('Total slots fetched', ['count' => $slots->count()]);
+        $this->info("Total active upcoming slots fetched: {$slots->count()}");
+
+        $defaultIntervals = [
+            ['value' => 24, 'unit' => 'hours'],
+            ['value' => 1, 'unit' => 'hours'],
+        ];
 
         foreach ($slots as $slot) {
             $slotDateTime = Carbon::parse($slot->date . ' ' . $slot->start_time);
-            $hoursDiff = $now->diffInHours($slotDateTime, false);
+            $hoursDiff = $now->diffInMinutes($slotDateTime, false) / 60.0;
 
-            Log::info('Slot time check', [
-                'slot_id' => $slot->id,
-                'slot_time' => $slotDateTime->toDateTimeString(),
-                'hours_diff' => $hoursDiff,
-            ]);
+            if ($hoursDiff <= 0) {
+                continue; // Skip past appointments
+            }
 
-            $type = null;
-            $tolerance = 0.5; // ±30 minutes
+            // Determine organization intervals
+            $orgId = $slot->order?->organization_id ?? $slot->vendor?->organization_id;
+            $intervals = $defaultIntervals;
 
-            foreach ($intervals as $interval) {
-                if ($hoursDiff >= $interval - $tolerance && $hoursDiff <= $interval + $tolerance) {
-                    $type = $interval . 'h';
-                    break;
+            if ($orgId && isset($orgPreferences[$orgId])) {
+                $pref = $orgPreferences[$orgId]->firstWhere('role', 'vendor') 
+                     ?? $orgPreferences[$orgId]->first();
+                if ($pref && !empty($pref->intervals) && is_array($pref->intervals)) {
+                    $intervals = $pref->intervals;
                 }
             }
 
-            if (!$type) {
-                continue; // Skip slots outside any reminder window
-            }
+            foreach ($intervals as $intervalItem) {
+                // Normalize interval item to value and unit
+                if (is_array($intervalItem) && isset($intervalItem['value'], $intervalItem['unit'])) {
+                    $val = (float) $intervalItem['value'];
+                    $unit = strtolower($intervalItem['unit']);
+                } elseif (is_numeric($intervalItem)) {
+                    $val = (float) $intervalItem;
+                    $unit = 'hours';
+                } elseif (is_string($intervalItem) && preg_match('/^(\d+)([a-zA-Z]+)$/', $intervalItem, $matches)) {
+                    $val = (float) $matches[1];
+                    $unitChar = strtolower($matches[2]);
+                    $unit = match ($unitChar) {
+                        'w' => 'weeks',
+                        'd' => 'days',
+                        'h' => 'hours',
+                        'm' => 'minutes',
+                        default => 'hours',
+                    };
+                } else {
+                    continue;
+                }
 
-            // Skip if reminder already sent
-            $alreadySent = DB::table('booking_reminders')
-                ->where('order_slot_id', $slot->id)
-                ->where('type', $type)
-                ->exists();
+                $targetHours = match ($unit) {
+                    'weeks'   => $val * 24 * 7,
+                    'days'    => $val * 24,
+                    'hours'   => $val,
+                    'minutes' => $val / 60.0,
+                    default   => $val,
+                };
 
-            if ($alreadySent) {
-                continue;
-            }
+                // Precision window check: slot is within the milestone window for the hourly cron
+                // (e.g. For a 24h reminder: triggers when remaining time is between 22.8h and 24.0h)
+                if ($hoursDiff <= $targetHours && $hoursDiff > ($targetHours - 1.2)) {
+                    $type = "{$val}_{$unit}";
+                    $legacyType = "{$val}h";
 
-            try {
-                // Dispatch reminders to both agent and vendor via unified EmailDispatchService
-                app(\App\Services\EmailDispatchService::class)->dispatch('booking_reminder', $slot);
+                    // Check if already sent under structured or legacy milestone key
+                    $alreadySent = DB::table('booking_reminders')
+                        ->where('order_slot_id', $slot->id)
+                        ->whereIn('type', [$type, $legacyType])
+                        ->exists();
 
-                DB::table('booking_reminders')->insert([
-                    'order_slot_id' => $slot->id,
-                    'type' => $type ,
-                    'sent_at' => now(),
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ]);
+                    if ($alreadySent) {
+                        continue;
+                    }
 
-                Log::info('Reminder processed via dispatch service', [
-                    'slot_id' => $slot->id,
-                    'type' => $type,
-                ]);
+                    try {
+                        // Dispatch reminders via unified EmailDispatchService
+                        app(\App\Services\EmailDispatchService::class)->dispatch('booking_reminder', $slot);
 
-                $this->info("Processed {$type} reminder for Slot {$slot->id}");
-            } catch (\Exception $e) {
-                Log::error('Failed to send reminder emails', [
-                    'slot_id' => $slot->id,
-                    'type' => $type,
-                    'error' => $e->getMessage(),
-                ]);
-                $this->error("Failed to process {$type} reminder for Slot {$slot->id}: " . $e->getMessage());
+                        DB::table('booking_reminders')->insert([
+                            'order_slot_id' => $slot->id,
+                            'type' => $type,
+                            'sent_at' => now(),
+                            'created_at' => now(),
+                            'updated_at' => now(),
+                        ]);
+
+                        Log::info('Booking reminder dispatched', [
+                            'slot_id' => $slot->id,
+                            'milestone' => $type,
+                            'hours_remaining' => round($hoursDiff, 2),
+                        ]);
+
+                        $this->info("Dispatched {$type} reminder for Slot #{$slot->id} (Remaining: " . round($hoursDiff, 2) . "h)");
+                    } catch (\Exception $e) {
+                        Log::error('Failed to dispatch booking reminder', [
+                            'slot_id' => $slot->id,
+                            'milestone' => $type,
+                            'error' => $e->getMessage(),
+                        ]);
+                        $this->error("Failed to dispatch {$type} reminder for Slot #{$slot->id}: " . $e->getMessage());
+                    }
+                }
             }
         }
 

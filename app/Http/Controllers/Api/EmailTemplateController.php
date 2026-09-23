@@ -43,7 +43,14 @@ class EmailTemplateController extends Controller
             ], 422);
         }
 
-        $template = EmailTemplate::create($request->all());
+        $data = $request->all();
+        if (!empty($data['event_type']) && empty($data['type'])) {
+            $data['type'] = $data['event_type'];
+        } elseif (!empty($data['type']) && empty($data['event_type'])) {
+            $data['event_type'] = $data['type'];
+        }
+
+        $template = EmailTemplate::create($data);
 
         return response()->json([
             'success' => true,
@@ -88,7 +95,14 @@ class EmailTemplateController extends Controller
             ], 422);
         }
 
-        $template->update($request->all());
+        $data = $request->all();
+        if (array_key_exists('event_type', $data) && !array_key_exists('type', $data)) {
+            $data['type'] = $data['event_type'];
+        } elseif (array_key_exists('type', $data) && !array_key_exists('event_type', $data)) {
+            $data['event_type'] = $data['type'];
+        }
+
+        $template->update($data);
 
         return response()->json([
             'success' => true,

@@ -81,10 +81,40 @@ class CheckMatterportExpirations extends Command
 
             if ($org) {
                 try {
+                    // Check notification preferences first, fallback to tour settings
+                    $pref = \App\Models\NotificationPreference::where('organization_id', $org->id)
+                        ->where('event_type', 'matterport_expiry_reminder')
+                        ->whereNull('user_id')
+                        ->first();
+
+                    $rawIntervals = (!empty($pref?->intervals) && is_array($pref->intervals))
+                        ? $pref->intervals
+                        : null;
+
                     $tourSettings = $settingsService->get($org->uuid, 'tour_settings');
-                    if (!empty($tourSettings['matterport_reminder_intervals']) && is_array($tourSettings['matterport_reminder_intervals'])) {
-                        $intervals = array_map('intval', $tourSettings['matterport_reminder_intervals']);
+
+                    if (!$rawIntervals && !empty($tourSettings['matterport_reminder_intervals']) && is_array($tourSettings['matterport_reminder_intervals'])) {
+                        $rawIntervals = $tourSettings['matterport_reminder_intervals'];
                     }
+
+                    if (!empty($rawIntervals) && is_array($rawIntervals)) {
+                        $normalizedDays = [];
+                        foreach ($rawIntervals as $item) {
+                            if (is_array($item) && isset($item['value'], $item['unit'])) {
+                                $normalizedDays[] = match (strtolower($item['unit'])) {
+                                    'weeks' => (int) $item['value'] * 7,
+                                    'days' => (int) $item['value'],
+                                    default => (int) $item['value'],
+                                };
+                            } elseif (is_numeric($item)) {
+                                $normalizedDays[] = (int) $item;
+                            }
+                        }
+                        if (!empty($normalizedDays)) {
+                            $intervals = $normalizedDays;
+                        }
+                    }
+
                     if (isset($tourSettings['matterport_auto_invoice_enabled'])) {
                         $autoInvoiceEnabled = (bool) $tourSettings['matterport_auto_invoice_enabled'];
                     }

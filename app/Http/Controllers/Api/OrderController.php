@@ -1747,6 +1747,9 @@ private function processSlots($order, array $incomingSlots): array
                             }
                         }
                     } elseif ($oldVendorId && ($oldDate != $payload['date'] || $oldStartTime != $payload['start_time'] || $oldEndTime != $payload['end_time'])) {
+                        // Reset previously dispatched reminders so new reminders trigger for the updated appointment time
+                        DB::table('booking_reminders')->where('order_slot_id', $existing->id)->delete();
+
                         app(\App\Services\EmailDispatchService::class)->dispatch('slot_rescheduled', $existing, [
                             'data' => [
                                 'old_date' => $oldDate,
@@ -3131,6 +3134,9 @@ private function createOrderNotification($order, array $changes)
                         ]);
                     }
                 } elseif ($oldVendorId && ($oldDate != $request->date || $oldStartTime != $request->start_time || $oldEndTime != $request->end_time)) {
+                    // Reset previously dispatched reminders so new reminders trigger for the updated appointment time
+                    DB::table('booking_reminders')->where('order_slot_id', $slot->id)->delete();
+
                     // Rescheduled date/time with the same vendor
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_rescheduled', $slot, [
                         'data' => [

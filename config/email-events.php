@@ -80,6 +80,12 @@ return [
             'agent' => false,
             'vendor' => true,
         ],
+        'has_timing' => true,
+        'supported_units' => ['hours', 'days'],
+        'default_intervals' => [
+            ['value' => 24, 'unit' => 'hours'],
+            ['value' => 1, 'unit' => 'hours'],
+        ],
         'variables' => ['order_id', 'property_address', 'service_name', 'date', 'start_time'],
         'mailable_class' => \App\Mail\BookingReminder::class,
     ],
@@ -134,6 +140,14 @@ return [
         'defaults' => [
             'admin' => true,
             'agent' => true,
+        ],
+        'has_timing' => true,
+        'supported_units' => ['days', 'weeks'],
+        'default_intervals' => [
+            ['value' => 30, 'unit' => 'days'],
+            ['value' => 14, 'unit' => 'days'],
+            ['value' => 7, 'unit' => 'days'],
+            ['value' => 1, 'unit' => 'days'],
         ],
         'variables' => ['property_address', 'expiry_date', 'days_remaining', 'renewal_url', 'agent_name'],
         'mailable_class' => \App\Mail\MatterportExpiryReminder::class,

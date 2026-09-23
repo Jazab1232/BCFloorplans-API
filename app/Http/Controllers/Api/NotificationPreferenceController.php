@@ -69,6 +69,9 @@ class NotificationPreferenceController extends Controller
                 'recipients' => $details['recipients'] ?? [],
                 'defaults' => $details['defaults'] ?? [],
                 'always_send' => $details['always_send'] ?? false,
+                'has_timing' => $details['has_timing'] ?? false,
+                'supported_units' => $details['supported_units'] ?? [],
+                'default_intervals' => $details['default_intervals'] ?? [],
             ];
         }
 
@@ -95,6 +98,9 @@ class NotificationPreferenceController extends Controller
             'preferences.*.role' => 'required|string|in:admin,agent,vendor',
             'preferences.*.event_type' => 'required|string',
             'preferences.*.email_enabled' => 'required|boolean',
+            'preferences.*.intervals' => 'nullable|array',
+            'preferences.*.intervals.*.value' => 'required_with:preferences.*.intervals|integer|min:1',
+            'preferences.*.intervals.*.unit' => 'required_with:preferences.*.intervals|string|in:minutes,hours,days,weeks',
         ]);
 
         if ($validator->fails()) {
@@ -107,18 +113,32 @@ class NotificationPreferenceController extends Controller
         $preferencesData = $validator->validated()['preferences'];
 
         foreach ($preferencesData as $pref) {
-            NotificationPreference::updateOrCreate(
-                [
+            $updateData = [
+                'email_enabled' => $pref['email_enabled'],
+            ];
+
+            if (array_key_exists('intervals', $pref)) {
+                $updateData['intervals'] = $pref['intervals'];
+            }
+
+            $existing = NotificationPreference::where([
+                'organization_id' => $org->id,
+                'role' => $pref['role'],
+                'event_type' => $pref['event_type'],
+                'user_id' => null,
+            ])->first();
+
+            if ($existing) {
+                $existing->update($updateData);
+            } else {
+                NotificationPreference::create(array_merge([
                     'organization_id' => $org->id,
                     'role' => $pref['role'],
                     'event_type' => $pref['event_type'],
-                    'user_id' => null, // Org wide
-                ],
-                [
+                    'user_id' => null,
                     'uuid' => (string) Str::uuid(),
-                    'email_enabled' => $pref['email_enabled'],
-                ]
-            );
+                ], $updateData));
+            }
         }
 
         return response()->json([

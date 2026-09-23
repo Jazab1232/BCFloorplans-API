@@ -629,6 +629,7 @@ class EmailDispatchService
             $data['service_name'] = $slot->service ? $slot->service->name : 'Service';
             if ($slot->vendor) {
                 $data['vendor_name'] = trim($slot->vendor->first_name . ' ' . $slot->vendor->last_name);
+                $data['vendor_phone'] = $slot->vendor->primary_phone ?? $slot->vendor->phone ?? '';
             }
         }
 
@@ -654,37 +655,97 @@ class EmailDispatchService
             throw new \Exception("Event type not registered: {$eventType}");
         }
 
-        // 1. Check for DB override template
-        $template = null;
-        if ($org) {
-            $template = EmailTemplate::where('organization_id', $org->id)
-                ->where('event_type', $eventType)
-                ->where('is_active', true)
-                ->first();
-        }
+        // 1. Check for DB override template (Tenant-specific first, fallback to Global)
+        $template = EmailTemplate::withoutGlobalScopes()
+            ->where(function ($q) use ($org) {
+                if ($org) {
+                    $q->where('organization_id', $org->id)->orWhereNull('organization_id');
+                } else {
+                    $q->whereNull('organization_id');
+                }
+            })
+            ->where(function ($q) use ($eventType) {
+                $q->where('event_type', $eventType)
+                  ->orWhere('type', $eventType);
+            })
+            ->where('is_active', true)
+            ->orderByRaw('organization_id IS NULL ASC')
+            ->first();
 
         if ($template) {
+            $changesSummary = '';
+            if (!empty($data['changes_summary'])) {
+                if (is_array($data['changes_summary'])) {
+                    $changesSummary = implode(', ', array_map(function($k, $v) {
+                        return is_numeric($k) ? (string)$v : "{$k}: {$v}";
+                    }, array_keys($data['changes_summary']), $data['changes_summary']));
+                } else {
+                    $changesSummary = (string)$data['changes_summary'];
+                }
+            }
+
+            $companyName = $org?->name ?: config('app.name', 'BC Floor Plans');
             $placeholders = [
+                // Order & Property details
                 'order_id' => $data['order_id'] ?? '',
-                'property_address' => $data['property_address'] ?? '',
-                'agent_name' => $data['agent_name'] ?? '',
+                'property_address' => $data['property_address'] ?? $data['propertyAddress'] ?? '',
+                'listing_address' => $data['property_address'] ?? $data['propertyAddress'] ?? '',
+                'property_location' => $data['property_location'] ?? $data['propertyLocation'] ?? '',
+                'listing_location' => $data['property_location'] ?? $data['propertyLocation'] ?? '',
+                'agent_name' => $data['agent_name'] ?? $data['agentName'] ?? '',
                 'amount' => $data['amount'] ?? '',
                 'service_name' => $data['service_name'] ?? '',
+                'changes_summary' => $changesSummary,
+                
+                // Dates & times (with backwards-compatible frontend aliases)
                 'date' => $data['date'] ?? '',
+                'schedule_date' => $data['date'] ?? '',
+                'appointment_date' => $data['date'] ?? '',
+                'new_date' => $data['date'] ?? '',
                 'start_time' => $data['start_time'] ?? '',
+                'schedule_time' => $data['start_time'] ?? '',
+                'appointment_time' => $data['start_time'] ?? '',
+                'new_time' => $data['start_time'] ?? '',
                 'end_time' => $data['end_time'] ?? '',
-                'cancellation_reason' => $data['cancellation_reason'] ?? '',
-                'cancellation_fee' => $data['cancellation_fee'] ?? '',
-                'recipient_name' => $data['recipient_name'] ?? '',
+                'old_date' => $data['old_date'] ?? '',
+                'old_time' => $data['old_time'] ?? '',
+                
+                // Recipient & Vendor
+                'recipient_name' => $data['recipient_name'] ?? $data['recipientName'] ?? '',
+                'user_name' => $data['recipient_name'] ?? $data['recipientName'] ?? '',
+                'vendor_name' => $data['vendor_name'] ?? '',
+                'vendor_number' => $data['vendor_phone'] ?? $data['vendor_number'] ?? '',
+                'vendor_phone' => $data['vendor_phone'] ?? $data['vendor_number'] ?? '',
+                'company_name' => $companyName,
+                'organization_name' => $companyName,
+                
+                // Invoices & Payments
                 'payment_scope' => $data['payment_scope_description'] ?? '',
                 'invoice_number' => $data['invoice_number'] ?? '',
+                'invoice_id' => $data['invoice_id'] ?? '',
                 'receipt_url' => $data['receipt_url'] ?? '',
                 'payment_method' => $data['payment_method'] ?? '',
                 'payer_name' => $data['payer_name'] ?? '',
+                
+                // Cancellation
+                'cancellation_reason' => $data['cancellation_reason'] ?? '',
+                'cancellation_fee' => $data['cancellation_fee'] ?? '',
+                
+                // Matterport / 3D Tours
+                'expiry_date' => $data['expiry_date'] ?? $data['expiryDate'] ?? '',
+                'days_remaining' => (string)($data['days_remaining'] ?? $data['daysRemaining'] ?? ''),
+                'renewal_url' => $data['renewal_url'] ?? $data['renewalUrl'] ?? '',
+                'new_expiry_date' => $data['new_expiry_date'] ?? $data['newExpiryDate'] ?? '',
+                'duration_months' => (string)($data['duration_months'] ?? $data['durationMonths'] ?? ''),
             ];
 
             $parsedContent = $template->parseContent($placeholders);
+            
+            // Also parse placeholders inside the template title (subject line)
             $subject = $template->title;
+            foreach ($placeholders as $key => $val) {
+                $subject = str_replace('{{' . $key . '}}', (string)$val, $subject);
+            }
 
             return new \App\Mail\DynamicMailable($parsedContent, $subject, $org, $recipient['role']);
         }

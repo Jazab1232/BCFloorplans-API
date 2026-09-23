@@ -17,10 +17,12 @@ class NotificationPreference extends Model
         'role',
         'event_type',
         'email_enabled',
+        'intervals',
     ];
 
     protected $casts = [
         'email_enabled' => 'boolean',
+        'intervals' => 'array',
     ];
 
     /**

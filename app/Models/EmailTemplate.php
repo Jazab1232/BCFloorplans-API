@@ -18,6 +18,7 @@ class EmailTemplate extends Model
         'content',
         'tags',
         'type',
+        'event_type',
         'sort_order',
         'is_active',
     ];
