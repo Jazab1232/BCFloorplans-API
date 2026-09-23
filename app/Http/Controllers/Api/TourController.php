@@ -34,6 +34,7 @@ use Illuminate\Support\Facades\Cache;
 use App\Services\ImageResizeService;
 use App\Models\MatterportRenewal;
 use App\Models\Invoice;
+use App\Models\Notification;
 use App\Services\EmailDispatchService;
 use App\Services\SettingsService;
 use Carbon\Carbon;
@@ -2040,20 +2041,62 @@ class TourController extends Controller
             $agentName = $agent ? trim($agent->first_name . ' ' . $agent->last_name) : 'Agent';
             $frontendUrl = env('FRONTEND_URL', 'https://admin.bcfpsoftware.com');
             $renewalUrl = rtrim($frontendUrl, '/') . '/dashboard/file-manager/' . ($order ? $order->uuid : '');
+            $formattedExpiryDate = $expiryDate->format('M d, Y');
+            $remainingDays = max(0, $daysRemaining);
 
+            // 1. Dispatch email notification to Agent (and Admin if configured)
             app(EmailDispatchService::class)->dispatch('matterport_expiry_reminder', $tour, [
                 'data' => [
                     'propertyAddress' => $propertyAddress,
-                    'expiryDate' => $expiryDate->format('M d, Y'),
-                    'daysRemaining' => max(0, $daysRemaining),
+                    'property_address' => $propertyAddress,
+                    'expiryDate' => $formattedExpiryDate,
+                    'expiry_date' => $formattedExpiryDate,
+                    'daysRemaining' => $remainingDays,
+                    'days_remaining' => $remainingDays,
                     'agentName' => $agentName,
+                    'agent_name' => $agentName,
                     'renewalUrl' => $renewalUrl,
+                    'renewal_url' => $renewalUrl,
                 ],
             ]);
 
+            // 2. Create in-portal notification for the agent if linked
+            if ($agent && $agent->uuid) {
+                try {
+                    $currentUser = auth()->user();
+                    $creatorName = $currentUser ? trim($currentUser->first_name . ' ' . $currentUser->last_name) : 'Admin';
+
+                    Notification::create([
+                        'uuid' => (string) Str::uuid(),
+                        'organization_id' => $tour->organization_id ?? ($order ? $order->organization_id : null),
+                        'source' => 'Tour',
+                        'source_id' => $tour->uuid,
+                        'type' => 'matterport_expiry_reminder',
+                        'description' => "Reminder: Matterport 3D Tour hosting for '{$propertyAddress}' expires on {$formattedExpiryDate} ({$remainingDays} days remaining)",
+                        'diff_data' => [],
+                        'meta_data' => [
+                            'order_id' => $order?->id,
+                            'order_uuid' => $order?->uuid,
+                            'tour_uuid' => $tour->uuid,
+                            'property_address' => $propertyAddress,
+                            'expiry_date' => $formattedExpiryDate,
+                            'days_remaining' => $remainingDays,
+                            'renewal_url' => $renewalUrl,
+                        ],
+                        'agent_uuid' => $agent->uuid,
+                        'vendor_uuids' => null,
+                        'user_uuid' => null,
+                        'role' => 'agent',
+                        'created_by_name' => $creatorName ?: 'Admin',
+                    ]);
+                } catch (\Throwable $notifError) {
+                    Log::warning("Failed to create in-portal notification for matterport reminder: " . $notifError->getMessage());
+                }
+            }
+
             return response()->json([
                 'success' => true,
-                'message' => 'Renewal reminder email sent successfully.',
+                'message' => 'Renewal reminder sent successfully.',
             ]);
         } catch (\Exception $e) {
             return response()->json([

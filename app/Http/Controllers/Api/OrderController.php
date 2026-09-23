@@ -77,7 +77,12 @@ class OrderController extends Controller
                     'services', 
                     'services.option', 
                     'logs'
-                ])->where('agent_id', $agent->id);
+                ])->where(function($q) use ($agent) {
+                    $q->where('agent_id', $agent->id)
+                      ->orWhereJsonContains('co_agents', ['email' => $agent->email])
+                      ->orWhereJsonContains('co_agents', $agent->email)
+                      ->orWhere('co_agents', 'like', '%' . $agent->email . '%');
+                });
             } 
             // For other user types (admin, etc.)
             else {
@@ -239,7 +244,24 @@ class OrderController extends Controller
             $data['property_id'] = $property->id;
             $data['property_address'] = $property->address;
             $data['property_location'] = $property->city . ', ' . $property->province;
-            $data['co_agents'] = $data['co_agents'] ?? null;
+
+            if ($request->filled('co_agents') && is_array($request->co_agents)) {
+                $data['co_agents'] = app(\App\Services\CoAgentService::class)->processCoAgents(
+                    $request->co_agents,
+                    $agent,
+                    $property->address ?? null
+                );
+                if ($property) {
+                    $existingPropertyCoAgents = $property->co_agents ?? [];
+                    $propertyCoAgentEmails = array_unique(array_filter(array_merge(
+                        is_array($existingPropertyCoAgents) ? $existingPropertyCoAgents : [],
+                        array_column($data['co_agents'], 'email')
+                    )));
+                    $property->update(['co_agents' => array_values($propertyCoAgentEmails)]);
+                }
+            } else {
+                $data['co_agents'] = $data['co_agents'] ?? null;
+            }
             $incomingNotes = $data['notes'] ?? [];
             $user = auth()->user();
             $canManageInternalNotes = $user instanceof \App\Models\User || $user instanceof \App\Models\Vendor;
@@ -1238,8 +1260,22 @@ private function prepareOrderData(Request $request, $order = null): array
         }
     }
 
-    if ($request->filled('co_agents')) {
-        $data['co_agents'] = $request->co_agents;
+    if ($request->has('co_agents') && is_array($request->co_agents)) {
+        $orderAgent = $order->agent ?? Agent::find($data['agent_id'] ?? $order->agent_id);
+        $orderPropertyAddress = $order->property_address ?? $order->property?->address;
+        $data['co_agents'] = app(\App\Services\CoAgentService::class)->processCoAgents(
+            $request->co_agents,
+            $orderAgent,
+            $orderPropertyAddress
+        );
+        if ($order->property) {
+            $existingPropertyCoAgents = $order->property->co_agents ?? [];
+            $propertyCoAgentEmails = array_unique(array_filter(array_merge(
+                is_array($existingPropertyCoAgents) ? $existingPropertyCoAgents : [],
+                array_column($data['co_agents'], 'email')
+            )));
+            $order->property->update(['co_agents' => array_values($propertyCoAgentEmails)]);
+        }
     }
 
     if ($request->has('notes')) {
@@ -1666,6 +1702,11 @@ private function processSlots($order, array $incomingSlots): array
             );
 
             if ($hasChanged) {
+                $oldDate = $existing->date;
+                $oldStartTime = $existing->start_time;
+                $oldEndTime = $existing->end_time;
+                $oldVendorId = $existing->vendor_id;
+
                 $existing->update($payload);
                 $serviceName = Service::find($serviceId)->name ?? 'Unknown';
                 $vendorName = Vendor::find($vendorId)->name ?? 'Unknown';
@@ -1676,11 +1717,51 @@ private function processSlots($order, array $incomingSlots): array
                     'date' => $payload['date'],
                     'time' => $payload['start_time'] . ' - ' . $payload['end_time'],
                 ];
+
+                // Notify vendors on slot change
+                try {
+                    $existing->load(['service', 'order.property']);
+                    if ($oldVendorId && $oldVendorId != $payload['vendor_id']) {
+                        $oldVendor = \App\Models\Vendor::find($oldVendorId);
+                        if ($oldVendor && $oldVendor->email) {
+                            app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $existing, [
+                                'recipients' => [[
+                                    'email' => $oldVendor->email,
+                                    'name' => trim($oldVendor->first_name . ' ' . $oldVendor->last_name),
+                                    'role' => 'vendor',
+                                    'model' => $oldVendor
+                                ]]
+                            ]);
+                        }
+                        if (!empty($payload['vendor_id'])) {
+                            $newVendor = \App\Models\Vendor::find($payload['vendor_id']);
+                            if ($newVendor && $newVendor->email) {
+                                app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $existing, [
+                                    'recipients' => [[
+                                        'email' => $newVendor->email,
+                                        'name' => trim($newVendor->first_name . ' ' . $newVendor->last_name),
+                                        'role' => 'vendor',
+                                        'model' => $newVendor
+                                    ]]
+                                ]);
+                            }
+                        }
+                    } elseif ($oldVendorId && ($oldDate != $payload['date'] || $oldStartTime != $payload['start_time'] || $oldEndTime != $payload['end_time'])) {
+                        app(\App\Services\EmailDispatchService::class)->dispatch('slot_rescheduled', $existing, [
+                            'data' => [
+                                'old_date' => $oldDate,
+                                'old_time' => $oldStartTime . ($oldEndTime ? ' - ' . $oldEndTime : ''),
+                            ]
+                        ]);
+                    }
+                } catch (\Throwable $e) {
+                    Log::warning("Failed to dispatch vendor email on slot update: " . $e->getMessage());
+                }
             }
         }
         // NEW SLOT
         else {
-            $order->slots()->create(
+            $newSlot = $order->slots()->create(
                 array_merge($payload, ['uuid' => (string) Str::uuid()])
             );
 
@@ -1693,6 +1774,16 @@ private function processSlots($order, array $incomingSlots): array
                 'date' => $payload['date'],
                 'time' => $payload['start_time'] . ' - ' . $payload['end_time'],
             ];
+
+            // Notify newly assigned vendor
+            if (!empty($payload['vendor_id'])) {
+                try {
+                    $newSlot->load(['service', 'order.property', 'vendor']);
+                    app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $newSlot);
+                } catch (\Throwable $e) {
+                    Log::warning("Failed to dispatch slot_booked email for new slot: " . $e->getMessage());
+                }
+            }
         }
     }
 
@@ -1712,6 +1803,26 @@ private function processSlots($order, array $incomingSlots): array
             // ✅ CAPTURE SLOT ID BEFORE DELETION (for calendar cleanup)
             $deletedSlotIds[] = $existing->id;
             
+            // Dispatch slot_cancelled to vendor prior to deletion
+            if ($existing->vendor_id) {
+                try {
+                    $removedVendor = \App\Models\Vendor::find($existing->vendor_id);
+                    if ($removedVendor && $removedVendor->email) {
+                        $existing->load(['service', 'order.property']);
+                        app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $existing, [
+                            'recipients' => [[
+                                'email' => $removedVendor->email,
+                                'name' => trim($removedVendor->first_name . ' ' . $removedVendor->last_name),
+                                'role' => 'vendor',
+                                'model' => $removedVendor
+                            ]]
+                        ]);
+                    }
+                } catch (\Throwable $e) {
+                    Log::warning("Failed to dispatch slot_cancelled email for removed slot: " . $e->getMessage());
+                }
+            }
+
             $existing->delete();
         }
     }
@@ -2974,6 +3085,13 @@ private function createOrderNotification($order, array $changes)
                 ], 400);
             }
 
+            // Capture previous slot details prior to updating
+            $oldVendorId = $slot->vendor_id;
+            $oldDate = $slot->date;
+            $oldStartTime = $slot->start_time;
+            $oldEndTime = $slot->end_time;
+            $oldVendor = $slot->vendor;
+
             // Update the Slot
             $slot->vendor_id = $vendor->id;
             $slot->service_id = $service->id;
@@ -2986,6 +3104,44 @@ private function createOrderNotification($order, array $changes)
             $orderService->vendor_id = $vendor->uuid;
             $orderService->service_id = $service->id;
             $orderService->save();
+
+            // Email notifications for vendor on slot change
+            try {
+                $slot->load(['service', 'order.property', 'vendor']);
+                if ($oldVendorId && $oldVendorId != $vendor->id) {
+                    // Reassigned to a different vendor: cancel old vendor, book new vendor
+                    if ($oldVendor && $oldVendor->email) {
+                        app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $slot, [
+                            'recipients' => [[
+                                'email' => $oldVendor->email,
+                                'name' => trim($oldVendor->first_name . ' ' . $oldVendor->last_name),
+                                'role' => 'vendor',
+                                'model' => $oldVendor
+                            ]]
+                        ]);
+                    }
+                    if ($vendor && $vendor->email) {
+                        app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot, [
+                            'recipients' => [[
+                                'email' => $vendor->email,
+                                'name' => trim($vendor->first_name . ' ' . $vendor->last_name),
+                                'role' => 'vendor',
+                                'model' => $vendor
+                            ]]
+                        ]);
+                    }
+                } elseif ($oldVendorId && ($oldDate != $request->date || $oldStartTime != $request->start_time || $oldEndTime != $request->end_time)) {
+                    // Rescheduled date/time with the same vendor
+                    app(\App\Services\EmailDispatchService::class)->dispatch('slot_rescheduled', $slot, [
+                        'data' => [
+                            'old_date' => $oldDate,
+                            'old_time' => $oldStartTime . ($oldEndTime ? ' - ' . $oldEndTime : ''),
+                        ]
+                    ]);
+                }
+            } catch (\Throwable $emailError) {
+                Log::warning("Failed to dispatch vendor email notification in updateSlotTime: " . $emailError->getMessage());
+            }
 
             // Trigger calendar sync
             if (class_exists(SyncOrderCalendarEvents::class)) {

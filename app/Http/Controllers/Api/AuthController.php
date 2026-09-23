@@ -299,9 +299,17 @@ class AuthController extends Controller
             // Delete the token
             Password::getRepository()->delete($user);
 
+            $token = $user->createToken('auth_token')->accessToken;
+
             return response()->json([
                 'status' => true,
                 'message' => 'Password reset successfully',
+                'token' => $token,
+                'data' => [
+                    'token' => $token,
+                    'user' => $user->load('organization'),
+                    'type' => $role ?? ($user instanceof Agent ? 'agent' : ($user instanceof Vendor ? 'vendor' : 'user'))
+                ]
             ]);
 
         } catch (ValidationException $e) {

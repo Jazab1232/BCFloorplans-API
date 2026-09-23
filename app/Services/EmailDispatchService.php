@@ -31,8 +31,6 @@ class EmailDispatchService
                 Log::info("EmailDispatchService: Email already dispatched for payment ID {$model->id} at {$meta['email_dispatched_at']}, skipping.");
                 return;
             }
-            $meta['email_dispatched_at'] = now()->toISOString();
-            $model->update(['meta' => $meta]);
         }
 
         $org = $this->resolveOrganization($model);
@@ -40,6 +38,7 @@ class EmailDispatchService
         
         Log::info("EmailDispatchService: Found " . count($recipients) . " potential recipients");
 
+        $dispatchedCount = 0;
         foreach ($recipients as $recipient) {
             // Check notification preferences — skip if disabled
             if (!$this->isEmailEnabled($org, $recipient, $eventType)) {
@@ -62,12 +61,19 @@ class EmailDispatchService
                 
                 // Send & log
                 $this->sendAndLog($mailable, $recipient, $org, $eventType);
+                $dispatchedCount++;
             } catch (\Throwable $e) {
                 Log::error("EmailDispatchService: Error building or sending email for {$recipient['email']}", [
                     'error' => $e->getMessage(),
                     'trace' => $e->getTraceAsString()
                 ]);
             }
+        }
+
+        if ($eventType === 'agent_payment_received' && $model instanceof \App\Models\AgentPayment && $dispatchedCount > 0) {
+            $meta = is_array($model->meta) ? $model->meta : (json_decode($model->meta, true) ?? []);
+            $meta['email_dispatched_at'] = now()->toISOString();
+            $model->update(['meta' => $meta]);
         }
     }
 
@@ -463,6 +469,14 @@ class EmailDispatchService
         } elseif ($model instanceof \App\Models\OrderSlot) {
             $slot = $model;
             $order = $model->order;
+        } elseif ($model instanceof \App\Models\Tour) {
+            $order = $model->orders ?: $model->order;
+            $data['tour'] = $model;
+        } elseif ($model instanceof \App\Models\TourLink) {
+            $tour = $model->tour;
+            $order = $tour ? ($tour->orders ?: $tour->order) : null;
+            $data['tour'] = $tour;
+            $data['tour_link'] = $model;
         } elseif ($model instanceof \App\Models\AgentPayment) {
             $payment = $model;
             if (!$payment->relationLoaded('order') && $payment->order_id) {
@@ -720,6 +734,7 @@ class EmailDispatchService
                 $order = $data['order'] ?? null;
                 $orderService = $data['order_service'] ?? null;
                 $recipientRole = $recipient['role'] ?? 'agent';
+                $recipientName = $recipient['name'] ?? $data['recipient_name'] ?? 'Customer';
                 $mailable = new $mailableClass($payment, $order, $orderService, $recipientName, $recipientRole, $data);
                 break;
                 
@@ -747,6 +762,18 @@ class EmailDispatchService
                 
             case \App\Mail\InvoiceCreated::class:
                 $mailable = new $mailableClass($data['invoice'], $data['recipient_name'], $recipient['role']);
+                break;
+
+            case \App\Mail\MatterportExpiryReminder::class:
+            case \App\Mail\MatterportExpired::class:
+            case \App\Mail\MatterportRenewed::class:
+                $recipientName = $recipient['name'] ?? $data['recipient_name'] ?? 'Valued Customer';
+                $mailable = new $mailableClass(
+                    $data['tour'] ?? null,
+                    $recipientName,
+                    $recipient['role'] ?? 'agent',
+                    $data
+                );
                 break;
                 
             default:

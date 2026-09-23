@@ -27,13 +27,14 @@ class PropertyController extends Controller
                 'id', 'uuid', 'listing_price', 'bedrooms', 'bathrooms', 'square_footage', 
                 'year_constructed', 'parking_spots', 'property_type', 'property_status', 
                 'suite', 'address', 'city', 'province', 'postal_code', 'country', 
-                'status', 'tour_activated', 'created_at', 'agent_id', 'organization_id'
+                'latitude', 'longitude', 'map_zoom', 'map_type', 'map_center_lat', 'map_center_lng',
+                'status', 'tour_activated', 'created_at', 'agent_id', 'organization_id', 'co_agents'
             ])->with([
                 'agent' => function($query) {
                     $query->select('id', 'uuid', 'first_name', 'last_name', 'company_name', 'email', 'status', 'primary_phone');
                 },
                 'orders' => function($query) {
-                    $query->select('id', 'uuid', 'property_id', 'agent_id', 'amount', 'payment_status', 'order_status', 'created_at');
+                    $query->select('id', 'uuid', 'property_id', 'agent_id', 'amount', 'payment_status', 'order_status', 'created_at', 'co_agents');
                 },
                 'orders.tours' => function($query) {
                     $query->select('id', 'uuid', 'order_id', 'is_publish');
@@ -46,7 +47,18 @@ class PropertyController extends Controller
             $user = auth()->user();
             if ($user instanceof \App\Models\Agent) {
                 $agent = Agent::where('uuid', $user->uuid)->firstOrFail();
-                $properties->where('agent_id', $agent->id);
+                $properties->where(function ($q) use ($agent) {
+                    $q->where('agent_id', $agent->id)
+                      ->orWhereJsonContains('co_agents', ['email' => $agent->email])
+                      ->orWhereJsonContains('co_agents', $agent->email)
+                      ->orWhere('co_agents', 'like', '%' . $agent->email . '%')
+                      ->orWhereHas('orders', function ($orderQuery) use ($agent) {
+                          $orderQuery->where('agent_id', $agent->id)
+                              ->orWhereJsonContains('co_agents', ['email' => $agent->email])
+                              ->orWhereJsonContains('co_agents', $agent->email)
+                              ->orWhere('co_agents', 'like', '%' . $agent->email . '%');
+                      });
+                });
             } else if ($user instanceof \App\Models\Vendor) {
                 $vendorId = $user->id;
                 $properties->whereHas('orders.slots', function ($query) use ($vendorId) {
@@ -77,7 +89,8 @@ class PropertyController extends Controller
             $nullableFields = [
                 'listing_price', 'mls_number', 'bedrooms', 'bathrooms', 'square_footage', 
                 'lot_size', 'year_constructed', 'parking_spots', 'property_type', 
-                'property_status', 'heading', 'description', 'suite', 'postal_code'
+                'property_status', 'heading', 'description', 'suite', 'postal_code',
+                'latitude', 'longitude', 'map_zoom', 'map_type', 'map_center_lat', 'map_center_lng'
             ];
             foreach ($nullableFields as $field) {
                 if ($request->has($field) && $request->input($field) === '') {
@@ -105,6 +118,12 @@ class PropertyController extends Controller
                 'province' => 'required|string|max:50',
                 'postal_code' => 'nullable|string|max:20',
                 'country' => 'required|string|max:50',
+                'latitude' => 'nullable|numeric|between:-90,90',
+                'longitude' => 'nullable|numeric|between:-180,180',
+                'map_zoom' => 'nullable|integer|between:1,21',
+                'map_type' => 'nullable|string|in:roadmap,satellite,hybrid,terrain',
+                'map_center_lat' => 'nullable|numeric|between:-90,90',
+                'map_center_lng' => 'nullable|numeric|between:-180,180',
                 'tour_activated' => 'sometimes|boolean',
                 'publish_date' => 'nullable|date|after_or_equal:today',
                 'property_website' => 'nullable|url|max:255',
@@ -205,7 +224,8 @@ class PropertyController extends Controller
             $nullableFields = [
                 'listing_price', 'mls_number', 'bedrooms', 'bathrooms', 'square_footage', 
                 'lot_size', 'year_constructed', 'parking_spots', 'property_type', 
-                'property_status', 'heading', 'description', 'suite', 'postal_code'
+                'property_status', 'heading', 'description', 'suite', 'postal_code',
+                'latitude', 'longitude', 'map_zoom', 'map_type', 'map_center_lat', 'map_center_lng'
             ];
             foreach ($nullableFields as $field) {
                 if ($request->has($field) && $request->input($field) === '') {
@@ -238,6 +258,12 @@ class PropertyController extends Controller
                 'province' => 'sometimes|required|string|max:50',
                 'postal_code' => 'nullable|string|max:20',
                 'country' => 'sometimes|required|string|max:50',
+                'latitude' => 'nullable|numeric|between:-90,90',
+                'longitude' => 'nullable|numeric|between:-180,180',
+                'map_zoom' => 'nullable|integer|between:1,21',
+                'map_type' => 'nullable|string|in:roadmap,satellite,hybrid,terrain',
+                'map_center_lat' => 'nullable|numeric|between:-90,90',
+                'map_center_lng' => 'nullable|numeric|between:-180,180',
                 'tour_activated' => 'sometimes|boolean',
                 'publish_date' => 'nullable|date|after_or_equal:today',
                 'property_website' => 'nullable|url|max:255',
@@ -363,7 +389,8 @@ class PropertyController extends Controller
             $nullableFields = [
                 'listing_price', 'mls_number', 'bedrooms', 'bathrooms', 'square_footage', 
                 'lot_size', 'year_constructed', 'parking_spots', 'property_type', 
-                'property_status', 'heading', 'description', 'suite', 'postal_code'
+                'property_status', 'heading', 'description', 'suite', 'postal_code',
+                'latitude', 'longitude', 'map_zoom', 'map_type', 'map_center_lat', 'map_center_lng'
             ];
             foreach ($nullableFields as $field) {
                 if ($request->has($field) && $request->input($field) === '') {
@@ -391,6 +418,12 @@ class PropertyController extends Controller
                 'province' => 'required|string|max:50',
                 'postal_code' => 'nullable|string|max:20',
                 'country' => 'sometimes|string|max:50',
+                'latitude' => 'nullable|numeric|between:-90,90',
+                'longitude' => 'nullable|numeric|between:-180,180',
+                'map_zoom' => 'nullable|integer|between:1,21',
+                'map_type' => 'nullable|string|in:roadmap,satellite,hybrid,terrain',
+                'map_center_lat' => 'nullable|numeric|between:-90,90',
+                'map_center_lng' => 'nullable|numeric|between:-180,180',
                 'tour_activated' => 'sometimes|boolean',
                 'publish_date' => 'nullable|date|after_or_equal:today',
                 'property_website' => 'nullable|url|max:255',
@@ -466,7 +499,8 @@ class PropertyController extends Controller
             $nullableFields = [
                 'listing_price', 'mls_number', 'bedrooms', 'bathrooms', 'square_footage', 
                 'lot_size', 'year_constructed', 'parking_spots', 'property_type', 
-                'property_status', 'heading', 'description', 'suite', 'postal_code'
+                'property_status', 'heading', 'description', 'suite', 'postal_code',
+                'latitude', 'longitude', 'map_zoom', 'map_type', 'map_center_lat', 'map_center_lng'
             ];
             foreach ($nullableFields as $field) {
                 if ($request->has($field) && $request->input($field) === '') {
@@ -499,6 +533,12 @@ class PropertyController extends Controller
                 'province' => 'sometimes|required|string|max:50',
                 'postal_code' => 'nullable|string|max:20',
                 'country' => 'sometimes|string|max:50',
+                'latitude' => 'nullable|numeric|between:-90,90',
+                'longitude' => 'nullable|numeric|between:-180,180',
+                'map_zoom' => 'nullable|integer|between:1,21',
+                'map_type' => 'nullable|string|in:roadmap,satellite,hybrid,terrain',
+                'map_center_lat' => 'nullable|numeric|between:-90,90',
+                'map_center_lng' => 'nullable|numeric|between:-180,180',
                 'tour_activated' => 'sometimes|boolean',
                 'publish_date' => 'nullable|date|after_or_equal:today',
                 'property_website' => 'nullable|url|max:255',

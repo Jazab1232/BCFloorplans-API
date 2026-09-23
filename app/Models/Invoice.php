@@ -310,6 +310,9 @@ class Invoice extends Model
             }
         }
 
+        // Sync order and invoice statuses and area charges
+        static::syncOrderInvoices($order);
+
         return $primaryInvoice;
     }
 
@@ -394,7 +397,7 @@ class Invoice extends Model
      */
     public function recalculateTotals()
     {
-        $this->loadMissing(['items.orderService.service', 'agent', 'order.property']);
+        $this->load(['items.orderService.service', 'items.orderService.option', 'agent', 'order.property']);
 
         $province = 'BC';
         if (isset($this->order->property->state) && !empty($this->order->property->state)) {
@@ -558,21 +561,14 @@ class Invoice extends Model
      }
 
     /**
-     * Identify the primary area-based OrderService for an order (booked with a per sq. ft. option).
+     * Check if an OrderService uses a per-square-foot rate option (not range).
      */
-    public static function findAreaOrderService(Order $order): ?OrderService
+    public static function isPerSqftRateService(?OrderService $os): bool
     {
-        $order->loadMissing(['services.option']);
-
-        foreach ($order->services as $os) {
-            if ($os->option) {
-                if ((!empty($os->option->sq_ft_rate) && (float)$os->option->sq_ft_rate > 0) || !empty($os->option->sq_ft_range)) {
-                    return $os;
-                }
-            }
+        if (!$os || !$os->option) {
+            return false;
         }
-
-        return null;
+        return !empty($os->option->sq_ft_rate) && (float)$os->option->sq_ft_rate > 0 && empty($os->option->sq_ft_range);
     }
 
     /**
@@ -589,7 +585,7 @@ class Invoice extends Model
                 'custom_title' => $area->custom_title,
             ])->toArray(), $order->organization_id);
 
-        $areaOrderService = static::findAreaOrderService($order);
+        $totalAreaCharges = (float)($areaMetrics['total_area_charges'] ?? 0);
 
         $activeInvoices = static::where('order_id', $order->id)
             ->where('status', '!=', 'paid')
@@ -636,7 +632,12 @@ class Invoice extends Model
 
                 // 1. Add or Update items
                 foreach ($orderServices as $os) {
-                    $expectedAmount = round((float)$os->amount * $multiplier, 2);
+                    $isPerSqftRate = static::isPerSqftRateService($os);
+                    $effectiveServiceAmount = $isPerSqftRate 
+                        ? ((float)$os->amount + $totalAreaCharges)
+                        : (float)$os->amount;
+
+                    $expectedAmount = round($effectiveServiceAmount * $multiplier, 2);
                     $itemDescription = ($os->custom ?: ($os->service->name ?? 'Service')) . ($multiplier < 1 ? " (" . ($multiplier * 100) . "%)" : "");
 
                     if ($currentItems->has($os->id)) {
@@ -670,12 +671,17 @@ class Invoice extends Model
                     }
                 }
 
-                $hasChanged = static::syncAreaChargeItems(
-                    $invoice,
-                    $areaMetrics,
-                    $multiplier,
-                    $areaOrderService ? $areaOrderService->id : null
-                ) || $hasChanged;
+                // 3. Clean up any standalone area charge items on consolidated invoice
+                $consolidatedAreaItems = $invoice->items()
+                    ->where('is_extra', true)
+                    ->whereIn('description', ['Other Areas fixed charges', 'Other Areas above free allowance'])
+                    ->get();
+                if ($consolidatedAreaItems->isNotEmpty()) {
+                    foreach ($consolidatedAreaItems as $cItem) {
+                        $cItem->delete();
+                    }
+                    $hasChanged = true;
+                }
 
                 if ($hasChanged) {
                     $invoice->recalculateTotals();
@@ -710,9 +716,9 @@ class Invoice extends Model
                     }
                 }
 
-                // If this is the per-sqft service, sync area charge items onto its service invoice
-                $isAreaService = ($areaOrderService && $os->id === $areaOrderService->id);
-                if ($isAreaService) {
+                // Check if this service is a per-sqft rate service
+                $isPerSqftRate = static::isPerSqftRateService($os);
+                if ($isPerSqftRate) {
                     $serviceInvoiceChanged = static::syncAreaChargeItems(
                         $invoice,
                         $areaMetrics,
@@ -720,7 +726,7 @@ class Invoice extends Model
                         $os->id
                     ) || $serviceInvoiceChanged;
                 } else {
-                    // Clean up any stray area charge items if this is NOT a per-sqft service
+                    // Clean up any stray area charge items if this is NOT a per-sqft rate service
                     $strayItems = $invoice->items()
                         ->where('is_extra', true)
                         ->whereIn('description', ['Other Areas fixed charges', 'Other Areas above free allowance'])

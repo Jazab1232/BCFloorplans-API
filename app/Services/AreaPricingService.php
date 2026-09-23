@@ -188,37 +188,46 @@ class AreaPricingService
 
         $metrics = $this->calculateAreaMetrics($areas, $order->organization_id);
         $billableSqft = $metrics['total_billable_sqft'];
+        $totalAreaCharges = (float)($metrics['total_area_charges'] ?? 0.0);
 
-        $totalServiceAmount = 0.0;
+        $grandTotal = 0.0;
         foreach ($order->services as $os) {
+            $isPerSqftRate = false;
+
             if ($os->payment_status === 'PAID') {
-                $totalServiceAmount += (float)$os->amount;
-                continue;
-            }
-
-            if ($os->option) {
-                $res = $this->getUpdatedOptionAndPrice($os->option, $billableSqft, (float)$os->amount);
-                $newPrice = $res['price'];
-                $newOption = $res['option'];
-
-                $updates = [];
-                if ((float)$os->amount != $newPrice) {
-                    $updates['amount'] = $newPrice;
+                $basePrice = (float)$os->amount;
+                if ($os->option) {
+                    $isPerSqftRate = !empty($os->option->sq_ft_rate) && (float)$os->option->sq_ft_rate > 0 && empty($os->option->sq_ft_range);
                 }
-                if ($newOption && $os->option_id != $newOption->id) {
-                    $updates['option_id'] = $newOption->id;
-                }
-                if (!empty($updates)) {
-                    $os->update($updates);
-                }
-                $totalServiceAmount += $newPrice;
             } else {
-                $totalServiceAmount += (float)$os->amount;
+                if ($os->option) {
+                    $res = $this->getUpdatedOptionAndPrice($os->option, $billableSqft, (float)$os->amount);
+                    $basePrice = $res['price'];
+                    $newOption = $res['option'];
+
+                    $isPerSqftRate = !empty($newOption?->sq_ft_rate) && (float)$newOption->sq_ft_rate > 0 && empty($newOption?->sq_ft_range);
+
+                    $updates = [];
+                    if ((float)$os->amount != $basePrice) {
+                        $updates['amount'] = $basePrice;
+                    }
+                    if ($newOption && $os->option_id != $newOption->id) {
+                        $updates['option_id'] = $newOption->id;
+                    }
+                    if (!empty($updates)) {
+                        $os->update($updates);
+                    }
+                } else {
+                    $basePrice = (float)$os->amount;
+                }
             }
+
+            $serviceTotal = $isPerSqftRate ? ($basePrice + $totalAreaCharges) : $basePrice;
+            $grandTotal += $serviceTotal;
         }
 
-        $grandTotal = $totalServiceAmount + $metrics['total_area_charges'];
         $order->update(['amount' => $grandTotal]);
 
+        \App\Models\Invoice::syncOrderInvoices($order);
     }
 }

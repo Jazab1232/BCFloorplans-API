@@ -50,6 +50,8 @@ class Agent extends Authenticatable
         'google_calendar_id',
         'sync_google_calendar',
         'notification_email',
+        'agent_type',
+        'parent_agent_id',
     ];
 
     protected $hidden = [
@@ -184,5 +186,20 @@ class Agent extends Authenticatable
         // Many agents have a subaccount that acts as their co-agent.
         // We link to the first subaccount record for this agent.
         return $this->hasOne(SubAccount::class, 'agent_id');
+    }
+
+    public function parentAgent(): BelongsTo
+    {
+        return $this->belongsTo(Agent::class, 'parent_agent_id');
+    }
+
+    public function coAgents(): HasMany
+    {
+        return $this->hasMany(Agent::class, 'parent_agent_id');
+    }
+
+    public function isCoAgent(): bool
+    {
+        return $this->agent_type === 'co_agent';
     }
 }

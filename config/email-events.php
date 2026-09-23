@@ -136,6 +136,7 @@ return [
             'agent' => true,
         ],
         'variables' => ['property_address', 'expiry_date', 'days_remaining', 'renewal_url', 'agent_name'],
+        'mailable_class' => \App\Mail\MatterportExpiryReminder::class,
     ],
     'matterport_expired' => [
         'label' => '3D Tour / Matterport Expired',
@@ -146,6 +147,7 @@ return [
             'agent' => true,
         ],
         'variables' => ['property_address', 'expiry_date', 'renewal_url', 'agent_name'],
+        'mailable_class' => \App\Mail\MatterportExpired::class,
     ],
     'matterport_renewed' => [
         'label' => '3D Tour / Matterport Hosting Renewed',
@@ -156,6 +158,7 @@ return [
             'agent' => true,
         ],
         'variables' => ['property_address', 'new_expiry_date', 'duration_months', 'amount', 'agent_name'],
+        'mailable_class' => \App\Mail\MatterportRenewed::class,
     ],
 ];
 

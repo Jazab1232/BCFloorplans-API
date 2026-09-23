@@ -212,12 +212,16 @@ class InvoiceController extends Controller
             ]);
 
             if ($isAgent) {
-                $query->where(function($q) use ($user) {
-                    $q->where('agent_id', $user->id)
-                      ->orWhereHas('order', function($oq) use ($user) {
-                          $oq->where('agent_id', $user->id);
-                      });
-                });
+                if ($user->agent_type === 'co_agent') {
+                    $query->where('agent_id', $user->id);
+                } else {
+                    $query->where(function($q) use ($user) {
+                        $q->where('agent_id', $user->id)
+                          ->orWhereHas('order', function($oq) use ($user) {
+                              $oq->where('agent_id', $user->id);
+                          });
+                    });
+                }
             }
 
             if ($request->filled('status')) {
@@ -383,29 +387,14 @@ class InvoiceController extends Controller
                     if ($split['type'] === 'primary') {
                         $targetAgentId = $agent->id;
                     } else {
-                        // Co-agent: Find or Create
-                        $coAgent = Agent::where('email', $split['email'])->first();
-                        if (!$coAgent) {
-                            $roleId = Role::whereRaw('LOWER(name) LIKE ?', ['agent%'])->value('id');
-                            // Split name into first/last if possible
-                            $nameParts = explode(' ', $split['name'] ?? 'Co Agent', 2);
-                            $firstName = $nameParts[0];
-                            $lastName = $nameParts[1] ?? '';
-                            
-                            $coAgent = Agent::create([
-                                'uuid' => (string) Str::uuid(),
-                                'organization_id' => $agent->organization_id,
-                                'first_name' => $firstName,
-                                'last_name' => $lastName,
-                                'email' => $split['email'],
-                                'password' => bcrypt(Str::random(16)),
-                                'role_id' => $roleId,
-                                'status' => true,
-                                'requires_payment' => true,
-                                'payment_status' => 'GOOD',
-                                'company_name' => $agent->company_name,
-                            ]);
-                        }
+                        // Co-agent: Resolve or Create via CoAgentService
+                        $coAgent = app(\App\Services\CoAgentService::class)->resolveOrCreateCoAgent(
+                            $split['email'],
+                            $split['name'] ?? 'Co Agent',
+                            $split['number'] ?? $split['phone'] ?? null,
+                            $agent,
+                            $order->property_address ?? $order->property?->address
+                        );
                         $targetAgentId = $coAgent->id;
                     }
                     
