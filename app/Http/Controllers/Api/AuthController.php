@@ -101,8 +101,10 @@ class AuthController extends Controller
             // Try Agent login
             if ($credentials['role'] === 'agent' || !isset($credentials['role'])) {
                 $agent = Agent::where('email', $credentials['email'])->first();
+                $isCoAgent = false;
                 if (!$agent) {
                     $agent = SubAccount::where('primary_email', $credentials['email'])->first();
+                    $isCoAgent = (bool) $agent;
                 }
                 if ($agent && Hash::check($credentials['password'], $agent->password)) {
                     if (!$this->validateOrganizationAccess($agent, $request)) {
@@ -116,11 +118,11 @@ class AuthController extends Controller
 
                     return response()->json([
                         'status' => true,
-                        'message' => 'Agent login successful',
+                        'message' => $isCoAgent ? 'Co-Agent login successful' : 'Agent login successful',
                         'data' => [
                             'token' => $token,
                             'user' => $agent->load('organization'),
-                            'type' => 'agent'
+                            'type' => $isCoAgent ? 'co_agent' : 'agent'
                         ]
                     ]);
                 }

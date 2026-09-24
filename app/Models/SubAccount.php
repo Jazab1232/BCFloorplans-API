@@ -9,6 +9,7 @@ use Illuminate\Notifications\Notifiable;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Facades\Storage;
 use App\Traits\BelongsToOrganization;
+use App\Models\Permission;
 
 class SubAccount extends Authenticatable
 {
@@ -45,7 +46,7 @@ class SubAccount extends Authenticatable
         'password',
     ];
 
-    protected $appends = ['avatar_url', 'company_logo_url', 'company_banner_url', 'company_logos_urls', 'logo_url', 'banner_url'];
+    protected $appends = ['avatar_url', 'company_logo_url', 'company_banner_url', 'company_logos_urls', 'logo_url', 'banner_url', 'resolved_permissions', 'agent_type'];
 
     protected $casts = [
         'permissions' => 'array',
@@ -82,6 +83,31 @@ class SubAccount extends Authenticatable
     public function role(): BelongsTo
     {
         return $this->belongsTo(Role::class);
+    }
+
+    /**
+     * Resolves stored permission ID strings into full permission objects.
+     * Returns array of {id, name} objects matching the format used by User/Agent permissions.
+     */
+    public function getResolvedPermissionsAttribute(): array
+    {
+        $ids = $this->getRawOriginal('permissions');
+        $ids = is_string($ids) ? json_decode($ids, true) : ($ids ?? []);
+
+        if (empty($ids)) {
+            return [];
+        }
+
+        return Permission::whereIn('id', $ids)->get(['id', 'name'])->toArray();
+    }
+
+    /**
+     * SubAccounts are always co-agents by definition.
+     * Appended so that userInfo.agent_type is available in the frontend after login/refresh.
+     */
+    public function getAgentTypeAttribute(): string
+    {
+        return 'co_agent';
     }
 
     public function getAvatarUrlAttribute()
