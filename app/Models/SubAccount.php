@@ -91,10 +91,17 @@ class SubAccount extends Authenticatable
      */
     public function getResolvedPermissionsAttribute(): array
     {
-        $ids = $this->getRawOriginal('permissions');
-        $ids = is_string($ids) ? json_decode($ids, true) : ($ids ?? []);
+        $perms = $this->permissions;
+        if (is_string($perms)) {
+            $ids = json_decode($perms, true) ?? [];
+        } elseif (is_array($perms)) {
+            $ids = $perms;
+        } else {
+            $raw = $this->getRawOriginal('permissions');
+            $ids = is_string($raw) ? json_decode($raw, true) : ($raw ?? []);
+        }
 
-        if (empty($ids)) {
+        if (empty($ids) || !is_array($ids)) {
             return [];
         }
 
@@ -108,6 +115,28 @@ class SubAccount extends Authenticatable
     public function getAgentTypeAttribute(): string
     {
         return 'co_agent';
+    }
+
+    /**
+     * Determine if this SubAccount has permission or role to view all orders/properties of their parent agent
+     * (e.g. Assistants or SubAccounts granted 'View All Orders' / 'View All Appointments').
+     */
+    public function canViewAllAgentOrders(): bool
+    {
+        $perms = collect($this->resolved_permissions)->pluck('name')->map('strtolower');
+        if ($perms->contains('view all orders') || $perms->contains('view all appointments')) {
+            return true;
+        }
+        if ($perms->contains('view only orders for co-agent') || $perms->contains('view only appointments for co-agent')) {
+            return false;
+        }
+
+        $roleName = strtolower($this->role?->name ?? '');
+        if (str_contains($roleName, 'assistant') || str_contains($roleName, 'admin')) {
+            return true;
+        }
+
+        return false;
     }
 
     public function getAvatarUrlAttribute()

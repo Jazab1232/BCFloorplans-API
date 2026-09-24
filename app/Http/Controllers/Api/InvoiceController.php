@@ -200,6 +200,7 @@ class InvoiceController extends Controller
         try {
             $user   = Auth::user();
             $isAgent = $user instanceof Agent;
+            $isSubAccount = $user instanceof \App\Models\SubAccount;
 
             $query = Invoice::with([
                 'order:id,uuid,property_id,order_status,payment_status',
@@ -220,6 +221,28 @@ class InvoiceController extends Controller
                           ->orWhereHas('order', function($oq) use ($user) {
                               $oq->where('agent_id', $user->id);
                           });
+                    });
+                }
+            } elseif ($isSubAccount) {
+                if ($user->canViewAllAgentOrders()) {
+                    $query->where(function($q) use ($user) {
+                        $q->where('agent_id', $user->agent_id)
+                          ->orWhereHas('order', function($oq) use ($user) {
+                              $oq->where('agent_id', $user->agent_id);
+                          });
+                    });
+                } else {
+                    $subUuid = (string)$user->uuid;
+                    $subEmail = (string)$user->primary_email;
+                    $query->where(function($q) use ($subUuid, $subEmail) {
+                        $q->whereHas('order', function($oq) use ($subUuid, $subEmail) {
+                            $oq->whereJsonContains('co_agents', ['agent_uuid' => $subUuid])
+                               ->orWhereJsonContains('co_agents', ['uuid' => $subUuid])
+                               ->orWhereJsonContains('co_agents', ['email' => $subEmail])
+                               ->orWhereJsonContains('co_agents', ['primary_email' => $subEmail])
+                               ->orWhere('co_agents', 'like', '%' . $subEmail . '%')
+                               ->orWhere('co_agents', 'like', '%' . $subUuid . '%');
+                        });
                     });
                 }
             }
@@ -1158,6 +1181,22 @@ class InvoiceController extends Controller
 
             if (!$isOwner && !$isOrderOwner) {
                 abort(403, 'You do not have access to this invoice.');
+            }
+        } elseif ($user instanceof \App\Models\SubAccount) {
+            if ($user->canViewAllAgentOrders()) {
+                $isOwner = $invoice->agent_id === $user->agent_id;
+                $isOrderOwner = $invoice->order && $invoice->order->agent_id === $user->agent_id;
+                if (!$isOwner && !$isOrderOwner) {
+                    abort(403, 'You do not have access to this invoice.');
+                }
+            } else {
+                $subUuid = (string)$user->uuid;
+                $subEmail = (string)$user->primary_email;
+                $coAgentsStr = json_encode($invoice->order?->co_agents ?? []);
+                $isCoAgent = str_contains($coAgentsStr, $subUuid) || str_contains($coAgentsStr, $subEmail);
+                if (!$isCoAgent) {
+                    abort(403, 'You do not have access to this invoice.');
+                }
             }
         }
     }

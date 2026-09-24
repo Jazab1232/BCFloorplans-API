@@ -84,6 +84,36 @@ class OrderController extends Controller
                       ->orWhere('co_agents', 'like', '%' . $agent->email . '%');
                 });
             } 
+            // Check if user is a sub-account (co-agent or assistant)
+            else if ($user instanceof \App\Models\SubAccount) {
+                $user->loadMissing(['role']);
+                $email = strtolower(trim($user->primary_email));
+                $uuid = $user->uuid;
+                $canViewAll = $user->canViewAllAgentOrders();
+
+                $orders = Order::with([
+                    'agent', 
+                    'property',
+                    'package',
+                    'areas', 
+                    'slots.vendor.addresses', 
+                    'services.service',
+                    'services', 
+                    'services.option', 
+                    'logs'
+                ])->where(function($q) use ($user, $email, $uuid, $canViewAll) {
+                    $q->whereJsonContains('co_agents', ['agent_uuid' => $uuid])
+                      ->orWhereJsonContains('co_agents', ['uuid' => $uuid])
+                      ->orWhere('co_agents', 'like', '%' . $uuid . '%')
+                      ->orWhereJsonContains('co_agents', ['email' => $email])
+                      ->orWhereJsonContains('co_agents', $email)
+                      ->orWhere('co_agents', 'like', '%' . $email . '%');
+
+                    if ($canViewAll && !empty($user->agent_id)) {
+                        $q->orWhere('agent_id', $user->agent_id);
+                    }
+                });
+            } 
             // For other user types (admin, etc.)
             else {
                 $orders = Order::with([

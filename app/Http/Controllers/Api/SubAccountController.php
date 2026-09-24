@@ -191,8 +191,10 @@ class SubAccountController extends Controller
                 $data['password'] = bcrypt($data['password']);
             }
 
-            $agent = Agent::where('uuid', $data['agent_id'])->firstOrFail();
-            $data['agent_id'] = $agent->id;
+            if (isset($data['agent_id'])) {
+                $agent = Agent::where('uuid', $data['agent_id'])->firstOrFail();
+                $data['agent_id'] = $agent->id;
+            }
 
             $imageFields = ['avatar', 'company_logo', 'company_banner'];
             foreach ($imageFields as $field) {

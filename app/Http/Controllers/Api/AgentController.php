@@ -219,7 +219,21 @@ class AgentController extends Controller
     public function show($uuid): JsonResponse
     {
         try {
-            $agent = Agent::with('role','properties','properties.orders','audioFiles','organization', 'coagent')->where('uuid', $uuid)->firstOrFail();
+            $agent = Agent::with('role','properties','properties.orders','audioFiles','organization', 'coagent')->where('uuid', $uuid)->first();
+            if (!$agent) {
+                $subAccount = \App\Models\SubAccount::with(['role', 'agent', 'organization'])->where('uuid', $uuid)->first();
+                if ($subAccount) {
+                    return response()->json([
+                        'status' => true,
+                        'message' => 'SubAccount retrieved successfully',
+                        'data' => $subAccount
+                    ]);
+                }
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Agent not found'
+                ], 404);
+            }
             return response()->json([
                 'status' => true,
                 'message' => 'Agent retrieved successfully',

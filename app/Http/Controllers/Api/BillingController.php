@@ -18,7 +18,8 @@ class BillingController extends Controller
         // Determine user type
         $isAgent = $user instanceof \App\Models\Agent;
         $isVendor = $user instanceof \App\Models\Vendor;
-        $isAdmin = !$isAgent && !$isVendor;
+        $isSubAccount = $user instanceof \App\Models\SubAccount;
+        $isAdmin = !$isAgent && !$isVendor && !$isSubAccount;
 
         Log::info('Billing Debug:', [
             'user_type' => get_class($user),
@@ -39,6 +40,26 @@ class BillingController extends Controller
         if (!$isAdmin) {
             if ($isAgent) {
                 $query->where('agent_id', $user->id);
+            } elseif ($isSubAccount) {
+                $canViewAll = $user->canViewAllAgentOrders();
+                if ($canViewAll) {
+                    $query->where(function ($q) use ($user) {
+                        $q->where('agent_id', $user->agent_id)
+                          ->orWhere('co_agents', 'like', '%' . $user->primary_email . '%')
+                          ->orWhere('co_agents', 'like', '%' . $user->uuid . '%');
+                    });
+                } else {
+                    $subUuid = (string)$user->uuid;
+                    $subEmail = (string)$user->primary_email;
+                    $query->where(function ($q) use ($subUuid, $subEmail) {
+                        $q->whereJsonContains('co_agents', ['agent_uuid' => $subUuid])
+                          ->orWhereJsonContains('co_agents', ['uuid' => $subUuid])
+                          ->orWhereJsonContains('co_agents', ['email' => $subEmail])
+                          ->orWhereJsonContains('co_agents', ['primary_email' => $subEmail])
+                          ->orWhere('co_agents', 'like', '%' . $subEmail . '%')
+                          ->orWhere('co_agents', 'like', '%' . $subUuid . '%');
+                    });
+                }
             } elseif ($isVendor && method_exists($user, 'agents')) {
                 $agentIds = $user->agents()->pluck('id');
                 $query->whereIn('agent_id', $agentIds);

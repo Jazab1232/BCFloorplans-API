@@ -21,7 +21,7 @@ class AgentPaymentController extends Controller
     public function createCheckoutSession(Request $request)
     {   
         $request->validate([
-            'agent_uuid' => 'required|exists:agents,uuid',
+            'agent_uuid' => 'required|string',
             'amount' => 'required|numeric|min:0.5',
             'currency' => 'required|string',
             'order_id' => 'required|exists:orders,id',
