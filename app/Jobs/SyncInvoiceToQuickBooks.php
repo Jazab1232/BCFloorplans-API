@@ -15,6 +15,16 @@ class SyncInvoiceToQuickBooks implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
+    /**
+     * The number of times the job may be attempted.
+     */
+    public $tries = 3;
+
+    /**
+     * The number of seconds to wait before retrying (escalating backoff).
+     */
+    public $backoff = [60, 300, 900];
+
     protected $invoiceId;
 
     /**
