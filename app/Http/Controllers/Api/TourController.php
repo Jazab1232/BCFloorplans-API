@@ -781,8 +781,21 @@ class TourController extends Controller
                     return response()->json(['success' => false, 'message' => 'You do not have permission to publish this tour.'], 403);
                 }
             } else if ($user instanceof SubAccount) {
-                // SubAccount check: must belong to the agent who owns the order
-                if (!$tour->orders || $tour->orders->agent_id !== $user->agent_id) {
+                // SubAccount check: must belong to the agent who owns the order OR be assigned co-agent on the order
+                $isParentAgent = $tour->orders && $tour->orders->agent_id === $user->agent_id;
+                $isCoAgent = false;
+                if ($tour->orders && !empty($tour->orders->co_agents)) {
+                    $coAgents = is_string($tour->orders->co_agents) ? json_decode($tour->orders->co_agents, true) : $tour->orders->co_agents;
+                    if (is_array($coAgents)) {
+                        foreach ($coAgents as $co) {
+                            if (is_array($co) && (($co['uuid'] ?? '') === $user->uuid || ($co['agent_uuid'] ?? '') === $user->uuid || ($co['email'] ?? '') === $user->primary_email)) {
+                                $isCoAgent = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!$isParentAgent && !$isCoAgent) {
                     return response()->json(['success' => false, 'message' => 'You do not have permission to publish this tour.'], 403);
                 }
             } else {

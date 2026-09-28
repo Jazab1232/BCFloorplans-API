@@ -104,7 +104,7 @@ class FeatureSheetController extends Controller
             $request->validate([
                 'order_uuid'   => 'required|uuid',
                 'type'         => 'required|in:template,pdf',
-                'uploaded_by'  => 'nullable|in:agent,admin,vendor',
+                'uploaded_by'  => 'nullable|in:agent,admin,vendor,subaccount,co_agent,agent_admin,assistant',
                 'is_published' => 'nullable|boolean',
 
                 // Template

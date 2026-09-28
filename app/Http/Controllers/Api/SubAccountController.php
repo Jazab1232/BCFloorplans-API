@@ -300,11 +300,12 @@ class SubAccountController extends Controller
             $subAccount = SubAccount::where('uuid', $uuid)->firstOrFail();
             $currentUser = auth()->user();
             
-            // Check authorization: user can update their own password OR admin can update anyone's
+            // Check authorization: user can update their own password OR admin/parent agent can update
             $isOwnPassword = $currentUser instanceof SubAccount && $currentUser->uuid === $uuid;
             $isAdmin = $currentUser instanceof \App\Models\User; // Admin user
+            $isParentAgent = $currentUser instanceof \App\Models\Agent && $currentUser->id === $subAccount->agent_id;
             
-            if (!$isOwnPassword && !$isAdmin) {
+            if (!$isOwnPassword && !$isAdmin && !$isParentAgent) {
                 return response()->json([
                     'status' => false,
                     'message' => 'Unauthorized to change this password'

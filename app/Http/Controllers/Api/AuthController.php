@@ -73,7 +73,7 @@ class AuthController extends Controller
                 'domain' => 'nullable|string'
             ]);
 
-            // Try User login first
+            // Try User (admin) login first
             if ($credentials['role'] === 'admin' || !isset($credentials['role'])) {
                 $user = User::where('email', $credentials['email'])->first();
                 if ($user && Hash::check($credentials['password'], $user->password)) {
@@ -98,8 +98,10 @@ class AuthController extends Controller
                 }
             }
 
-            // Try Agent login
-            if ($credentials['role'] === 'agent' || !isset($credentials['role'])) {
+            // Try Agent / SubAccount (co-agent) login.
+            // Also runs when role === 'admin' as a fallback so that co-agents who accidentally
+            // (or by frontend default) send role='admin' are still found in sub_accounts table.
+            if ($credentials['role'] === 'agent' || $credentials['role'] === 'admin' || !isset($credentials['role'])) {
                 $agent = Agent::where('email', $credentials['email'])->first();
                 $isCoAgent = false;
                 if (!$agent) {
@@ -116,13 +118,27 @@ class AuthController extends Controller
 
                     $token = $agent->createToken('agent_auth_token')->accessToken;
 
+                    // For SubAccounts, also load 'role' and 'organization' so agent_type resolves correctly
+                    $userData = $isCoAgent
+                        ? $agent->load(['organization', 'role'])
+                        : $agent->load('organization');
+
+                    // For SubAccounts, determine type: 'agent_admin' if role has admin/assistant, else 'co_agent'
+                    $subAccountType = 'co_agent';
+                    if ($isCoAgent) {
+                        $roleName = strtolower($agent->role?->name ?? '');
+                        if (str_contains($roleName, 'admin') || str_contains($roleName, 'assistant')) {
+                            $subAccountType = 'agent_admin';
+                        }
+                    }
+
                     return response()->json([
                         'status' => true,
-                        'message' => $isCoAgent ? 'Co-Agent login successful' : 'Agent login successful',
+                        'message' => $isCoAgent ? 'Sub-Account login successful' : 'Agent login successful',
                         'data' => [
                             'token' => $token,
-                            'user' => $agent->load('organization'),
-                            'type' => $isCoAgent ? 'co_agent' : 'agent'
+                            'user' => $userData,
+                            'type' => $isCoAgent ? $subAccountType : 'agent'
                         ]
                     ]);
                 }
@@ -157,6 +173,7 @@ class AuthController extends Controller
                 'status' => false,
                 'message' => 'Invalid credentials'
             ], 401);
+
 
         } catch (ValidationException $e) {
             return response()->json([

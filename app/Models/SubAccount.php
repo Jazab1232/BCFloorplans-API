@@ -109,11 +109,19 @@ class SubAccount extends Authenticatable
     }
 
     /**
-     * SubAccounts are always co-agents by definition.
+     * SubAccounts return their effective type based on their role.
+     * Admin/Assistant roles return 'agent_admin'
+     * so the frontend can differentiate them from platform 'admin' (User) and grant full data access without co-agent ownership filtering.
+     * All other sub-accounts return 'co_agent'.
      * Appended so that userInfo.agent_type is available in the frontend after login/refresh.
      */
     public function getAgentTypeAttribute(): string
     {
+        $role = $this->relationLoaded('role') ? $this->role : ($this->role_id ? Role::find($this->role_id) : null);
+        $roleName = strtolower($role?->name ?? '');
+        if (str_contains($roleName, 'admin') || str_contains($roleName, 'assistant')) {
+            return 'agent_admin';
+        }
         return 'co_agent';
     }
 
