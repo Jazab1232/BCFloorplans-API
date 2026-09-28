@@ -153,12 +153,14 @@ class QuickBooksController extends Controller
     }
 
     /**
-     * Get QuickBooks connection status
+     * Get QuickBooks connection status with live health verification
      */
     public function status(): JsonResponse
     {
         try {
-            $tokens = $this->quickBooksService->getStoredTokens();
+            $user = Auth::user();
+            $organization = $user ? $user->organization : null;
+            $tokens = $this->quickBooksService->getStoredTokens($organization);
             
             if (!$tokens) {
                 return response()->json([
@@ -167,8 +169,25 @@ class QuickBooksController extends Controller
                 ]);
             }
 
+            // Perform live health verification with QuickBooks
+            $companyName = null;
+            try {
+                $dataService = $this->quickBooksService->getDataService($organization);
+                $companyInfo = $dataService->getCompanyInfo();
+                $companyName = $companyInfo?->CompanyName ?? 'QuickBooks Company';
+            } catch (\Exception $healthError) {
+                Log::warning('QuickBooks live health check failed: ' . $healthError->getMessage());
+                return response()->json([
+                    'connected' => false,
+                    'error' => 'Connection to QuickBooks expired or invalid. Please reconnect.',
+                    'needs_reconnect' => true,
+                    'realm_id' => $tokens['realm_id'],
+                ]);
+            }
+
             return response()->json([
                 'connected' => true,
+                'company_name' => $companyName,
                 'realm_id' => $tokens['realm_id'],
                 'access_expires_at' => $tokens['expires_in'],
                 'refresh_expires_at' => $tokens['refresh_expires_in'],

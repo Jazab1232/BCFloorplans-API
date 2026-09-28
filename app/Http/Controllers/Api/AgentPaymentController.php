@@ -464,84 +464,43 @@ class AgentPaymentController extends Controller
     }
 }
 
-/**
- * Dispatch QuickBooks job (separate method for clarity)
- */
-private function dispatchQuickBooksJob($payment)
-{
-    Log::info('QuickBooks creation started for payment: ' . $payment->id);
-    
-    dispatch(function() use ($payment) {
-        try {
-            $order = Order::with('agent', 'services')->find($payment->order_id);
-            
-            if (!$order) {
-                Log::warning('Order not found for QB sync', [
-                    'payment_id' => $payment->id
-                ]);
-                return;
-            }
+    /**
+     * Dispatch QuickBooks sync job for the payment's invoice.
+     * Uses the modern SyncInvoiceToQuickBooks job (same path as Stripe webhook
+     * and InvoiceController::markPaid) which provides:
+     * - QbSyncLog tracking
+     * - Canadian GST/HST/PST tax support
+     * - Correct org resolution from invoice->order->organization
+     * - Proper DocNumber format (INV-BCF-2026-00001)
+     * - Idempotency guard (skips if already synced)
+     */
+    private function dispatchQuickBooksJob($payment)
+    {
+        $invoiceId = $payment->invoice_id;
 
-            // Check if QuickBooks is connected
-            $organization = \App\Models\Organization::whereNotNull('qb_access_token')
-                ->whereNotNull('qb_realm_id')
-                ->first();
-            
-            Log::info('QuickBooks organization check', [
-                'org_found' => $organization ? true : false,
-                'payment_id' => $payment->id
-            ]);
-
-            if (!$organization) {
-                Log::info('QuickBooks not connected, skipping sync', [
-                    'payment_id' => $payment->id
-                ]);
-                return;
-            }
-
-            $quickBooksService = app(\App\Services\QuickBooksService::class);
-            Log::info('Starting QuickBooks invoice creation', [
-                'order_id' => $order->id,
-                'payment_id' => $payment->id
-            ]);
-            
-            $qbInvoice = $quickBooksService->createInvoiceForOrder($order, $payment);
-            
-            Log::info('QuickBooks invoice creation attempt finished', [
-                'order_id' => $order->id,
-                'payment_id' => $payment->id
-            ]);
-            
-            if ($qbInvoice) {
-                Log::info('QuickBooks invoice created successfully', [
-                    'order_id' => $order->id,
-                    'payment_id' => $payment->id,
-                    'qb_invoice_id' => $qbInvoice['invoice_id']
-                ]);
-                
-                $quickbookData = [
-                    'quickbooks_invoice_id' => $qbInvoice['invoice_id'],
-                    'quickbooks_payment_id' => $qbInvoice['payment_id'],
-                    'quickbooks_txn_id'     => $qbInvoice['doc_number'],
-                    'quickbooks_synced_at'  => $qbInvoice['synced_at'],
-                ];
-
-                $payment->update($quickbookData);
-            } else {
-                Log::warning('QuickBooks invoice creation returned null', [
-                    'order_id' => $order->id,
-                    'payment_id' => $payment->id
-                ]);
-            }
-            
-        } catch (\Exception $qbError) {
-            Log::error('QuickBooks sync error (non-fatal): ' . $qbError->getMessage(), [
-                'payment_id' => $payment->id,
-                'error_trace' => $qbError->getTraceAsString()
-            ]);
+        // Fallback: if payment does not have invoice_id directly, look up by order_id
+        if (!$invoiceId && $payment->order_id) {
+            $invoiceId = \App\Models\Invoice::where('order_id', $payment->order_id)
+                ->where('agent_id', $payment->agent_id)
+                ->value('id')
+                ?? \App\Models\Invoice::where('order_id', $payment->order_id)->value('id');
         }
-    })->afterResponse()->onQueue('quickbooks');
-}
+
+        if (!$invoiceId) {
+            Log::info('QB sync skipped: payment has no associated invoice_id', [
+                'payment_id' => $payment->id,
+                'order_id' => $payment->order_id,
+            ]);
+            return;
+        }
+
+        Log::info('Dispatching SyncInvoiceToQuickBooks job for payment', [
+            'payment_id' => $payment->id,
+            'invoice_id' => $invoiceId,
+        ]);
+
+        \App\Jobs\SyncInvoiceToQuickBooks::dispatch($invoiceId);
+    }
 
     /**
      * Create notification and dispatch email for agent payment success
