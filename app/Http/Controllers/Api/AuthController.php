@@ -98,16 +98,12 @@ class AuthController extends Controller
                 }
             }
 
-            // Try Agent / SubAccount (co-agent) login.
-            // Also runs when role === 'admin' as a fallback so that co-agents who accidentally
-            // (or by frontend default) send role='admin' are still found in sub_accounts table.
+            // Try Agent / SubAccount (co-agent, assistant, agent_admin) login
             if ($credentials['role'] === 'agent' || $credentials['role'] === 'admin' || !isset($credentials['role'])) {
-                $agent = Agent::where('email', $credentials['email'])->first();
-                $isCoAgent = false;
-                if (!$agent) {
-                    $agent = SubAccount::where('primary_email', $credentials['email'])->first();
-                    $isCoAgent = (bool) $agent;
-                }
+                $email = strtolower(trim($credentials['email']));
+
+                // 1. Check Primary Agent
+                $agent = Agent::whereRaw('LOWER(email) = ?', [$email])->first();
                 if ($agent && Hash::check($credentials['password'], $agent->password)) {
                     if (!$this->validateOrganizationAccess($agent, $request)) {
                         return response()->json([
@@ -118,27 +114,48 @@ class AuthController extends Controller
 
                     $token = $agent->createToken('agent_auth_token')->accessToken;
 
-                    // For SubAccounts, also load 'role' and 'organization' so agent_type resolves correctly
-                    $userData = $isCoAgent
-                        ? $agent->load(['organization', 'role'])
-                        : $agent->load('organization');
+                    return response()->json([
+                        'status' => true,
+                        'message' => 'Agent login successful',
+                        'data' => [
+                            'token' => $token,
+                            'user' => $agent->load('organization'),
+                            'type' => 'agent'
+                        ]
+                    ]);
+                }
 
-                    // For SubAccounts, determine type: 'agent_admin' if role has admin/assistant, else 'co_agent'
+                // 2. Check SubAccount (co_agent, assistant, agent_admin)
+                $subAccount = SubAccount::whereRaw('LOWER(primary_email) = ?', [$email])
+                    ->orWhereRaw('LOWER(secondary_email) = ?', [$email])
+                    ->first();
+
+                if ($subAccount && Hash::check($credentials['password'], $subAccount->password)) {
+                    if (!$this->validateOrganizationAccess($subAccount, $request)) {
+                        return response()->json([
+                            'status' => false,
+                            'message' => 'Unauthorized: You do not have access to this portal.'
+                        ], 401);
+                    }
+
+                    $token = $subAccount->createToken('agent_auth_token')->accessToken;
+
+                    $userData = $subAccount->load(['organization', 'role']);
+
+                    // Determine subaccount type
+                    $roleName = strtolower($subAccount->role?->name ?? '');
                     $subAccountType = 'co_agent';
-                    if ($isCoAgent) {
-                        $roleName = strtolower($agent->role?->name ?? '');
-                        if (str_contains($roleName, 'admin') || str_contains($roleName, 'assistant')) {
-                            $subAccountType = 'agent_admin';
-                        }
+                    if (str_contains($roleName, 'admin') || str_contains($roleName, 'assistant')) {
+                        $subAccountType = 'agent_admin';
                     }
 
                     return response()->json([
                         'status' => true,
-                        'message' => $isCoAgent ? 'Sub-Account login successful' : 'Agent login successful',
+                        'message' => 'Sub-Account login successful',
                         'data' => [
                             'token' => $token,
                             'user' => $userData,
-                            'type' => $isCoAgent ? $subAccountType : 'agent'
+                            'type' => $subAccountType
                         ]
                     ]);
                 }
@@ -213,9 +230,11 @@ class AuthController extends Controller
             }
 
             if (!$user && ($role === 'agent' || !$role)) {
-                $user = Agent::where('email', $email)->first();
+                $user = Agent::whereRaw('LOWER(email) = ?', [strtolower(trim($email))])->first();
                 if (!$user) {
-                    $user = SubAccount::where('primary_email', $email)->first();
+                    $user = SubAccount::whereRaw('LOWER(primary_email) = ?', [strtolower(trim($email))])
+                        ->orWhereRaw('LOWER(secondary_email) = ?', [strtolower(trim($email))])
+                        ->first();
                 }
                 if ($user) {
                     $userType = 'agent';
@@ -223,7 +242,7 @@ class AuthController extends Controller
             }
 
             if (!$user && ($role === 'vendor' || !$role)) {
-                $user = Vendor::where('email', $email)->first();
+                $user = Vendor::whereRaw('LOWER(email) = ?', [strtolower(trim($email))])->first();
                 if ($user) {
                     $userType = 'vendor';
                 }
@@ -270,7 +289,7 @@ class AuthController extends Controller
                 'role' => 'nullable|in:admin,agent,vendor'
             ]);
 
-            $email = $data['email'];
+            $email = strtolower(trim($data['email']));
             $password = $data['password'];
             $token = $data['token'];
             $role = $data['role'] ?? null;
@@ -278,19 +297,21 @@ class AuthController extends Controller
 
             // Find user in appropriate table based on role
             if ($role === 'admin') {
-                $user = User::where('email', $email)->first();
+                $user = User::whereRaw('LOWER(email) = ?', [$email])->first();
             } elseif ($role === 'agent') {
-                $user = Agent::where('email', $email)->first() ?? SubAccount::where('primary_email', $email)->first();
+                $user = Agent::whereRaw('LOWER(email) = ?', [$email])->first() 
+                    ?? SubAccount::whereRaw('LOWER(primary_email) = ?', [$email])->orWhereRaw('LOWER(secondary_email) = ?', [$email])->first();
             } elseif ($role === 'vendor') {
-                $user = Vendor::where('email', $email)->first();
+                $user = Vendor::whereRaw('LOWER(email) = ?', [$email])->first();
             } else {
                 // If no role provided, search all tables in sequence
-                $user = User::where('email', $email)->first();
+                $user = User::whereRaw('LOWER(email) = ?', [$email])->first();
                 if (!$user) {
-                    $user = Agent::where('email', $email)->first() ?? SubAccount::where('primary_email', $email)->first();
+                    $user = Agent::whereRaw('LOWER(email) = ?', [$email])->first() 
+                        ?? SubAccount::whereRaw('LOWER(primary_email) = ?', [$email])->orWhereRaw('LOWER(secondary_email) = ?', [$email])->first();
                 }
                 if (!$user) {
-                    $user = Vendor::where('email', $email)->first();
+                    $user = Vendor::whereRaw('LOWER(email) = ?', [$email])->first();
                 }
             }
 
