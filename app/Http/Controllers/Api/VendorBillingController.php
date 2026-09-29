@@ -588,7 +588,7 @@ class VendorBillingController extends Controller
             $orgDetailsSnapshot = array_merge([
                 'id' => $org?->id,
                 'name' => $org?->name ?? 'BC Floor plans',
-                'email' => $org?->contact_email ?? $org?->from_email ?? 'info@bcfloorplans.com',
+                'email' => $org?->contact_email ?? $org?->from_email ?? config('mail.from.address', 'noreply@tojuco.com'),
                 'phone' => $org?->phone ?? '',
                 'address' => $org?->address ?? '',
             ], (array) ($request->input('org_details') ?? []));

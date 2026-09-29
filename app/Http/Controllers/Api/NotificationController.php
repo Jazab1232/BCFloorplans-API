@@ -343,7 +343,7 @@ class NotificationController extends Controller
 
             // Fallback if no admin emails were resolved
             if (empty($adminEmails)) {
-                $fallback = $organization?->from_email ?: config('mail.from.address', 'support@bcfpsoftware.com');
+                $fallback = $organization?->from_email ?: config('mail.from.address', 'noreply@tojuco.com');
                 if ($fallback && filter_var($fallback, FILTER_VALIDATE_EMAIL)) {
                     $adminEmails = [$fallback];
                 }

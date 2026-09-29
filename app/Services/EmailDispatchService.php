@@ -855,32 +855,38 @@ class EmailDispatchService
     }
 
     /**
-     * Set verified domain from address or fallback.
+     * Set dynamic "From" address based on org whitelabel status.
+     *
+     * Non-Whitelabel:
+     *   From: "{Org Name} via Tojuco Solutions" <noreply@tojuco.com>
+     *
+     * Whitelabel:
+     *   From: "{org->from_name}" <{org->from_email}>
+     *   (Requires: org domain verified in Resend dashboard)
      */
     protected function setFromAddress($mailable, ?Organization $org)
     {
-        $fromEmail = 'noreply@bcfloorplans.com';
-        $fromName = 'BC Floor Plans';
+        // ── Non-Whitelabel (or no org context) ────────────────────────────────
+        if (!$org || !$org->is_whitelabel) {
+            $orgName  = $org?->name ?? 'Tojuco Solutions';
+            $fromName = "{$orgName} (via Tojuco Solutions)";
 
-        if ($org) {
-            $orgEmail = $org->from_email ?: $org->contact_email;
-            $orgName = $org->from_name ?: $org->name;
-
-            if ($orgEmail) {
-                $domain = substr(strrchr($orgEmail, "@"), 1);
-                // Currently only bcfloorplans.com is verified
-                $allowedDomains = ['bcfloorplans.com'];
-                
-                if (in_array(strtolower($domain), $allowedDomains)) {
-                    $fromEmail = $orgEmail;
-                    $fromName = $orgName;
-                } else {
-                    // Fall back to verified domain but use organization's branding name
-                    $fromName = $orgName;
-                }
-            }
+            Log::info("EmailDispatchService: setFromAddress — non-whitelabel, sending from noreply@tojuco.com as '{$fromName}'");
+            return $mailable->from('noreply@tojuco.com', $fromName);
         }
 
+        // ── Whitelabel — use org's own from_email & from_name ─────────────────
+        $fromEmail = $org->from_email;
+        $fromName  = $org->from_name ?: $org->name;
+
+        if (!$fromEmail) {
+            // Whitelabel org has no from_email configured — fallback to Tojuco
+            $fromName = ($org->name ?? 'Tojuco Solutions') . ' (via Tojuco Solutions)';
+            Log::warning("EmailDispatchService: Whitelabel org [{$org->id}] '{$org->name}' has no from_email set. Falling back to noreply@tojuco.com.");
+            return $mailable->from('noreply@tojuco.com', $fromName);
+        }
+
+        Log::info("EmailDispatchService: setFromAddress — whitelabel org [{$org->id}], sending from '{$fromEmail}' as '{$fromName}'");
         return $mailable->from($fromEmail, $fromName);
     }
 
