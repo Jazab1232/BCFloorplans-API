@@ -194,14 +194,4 @@ class SubAccount extends Authenticatable
     {
         return 'subaccounts';
     }
-
-    /**
-     * Get the email address where password reset links are sent.
-     *
-     * @return string
-     */
-    public function getEmailForPasswordReset()
-    {
-        return $this->primary_email;
-    }
 }
