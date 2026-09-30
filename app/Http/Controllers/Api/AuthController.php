@@ -99,7 +99,7 @@ class AuthController extends Controller
             }
 
             // Try Agent / SubAccount (co-agent, assistant, agent_admin) login
-            if ($credentials['role'] === 'agent' || $credentials['role'] === 'admin' || !isset($credentials['role'])) {
+            if ($credentials['role'] === 'agent' || !isset($credentials['role'])) {
                 $email = strtolower(trim($credentials['email']));
 
                 // 1. Check Primary Agent
@@ -257,7 +257,24 @@ class AuthController extends Controller
 
             // Generate token and send notification with user type
             $token = Password::createToken($user);
-            $user->notify(new ResetPasswordNotification($token, $userType));
+
+            // Dispatch through unified EmailDispatchService so it uses the verified
+            // Resend sender, respects whitelabel branding, and is logged in email_logs.
+            app(\App\Services\EmailDispatchService::class)->dispatch('password_reset', $user, [
+                'recipients' => [[
+                    'email' => method_exists($user, 'getEmailForPasswordReset')
+                        ? $user->getEmailForPasswordReset()
+                        : ($user->email ?? ''),
+                    'name'  => trim(($user->first_name ?? $user->name ?? '') . ' ' . ($user->last_name ?? '')),
+                    'role'  => $userType,
+                    'model' => $user,
+                ]],
+                'data' => [
+                    'token'     => $token,
+                    'user_type' => $userType,
+                    'role'      => $userType,
+                ],
+            ]);
 
             return response()->json([
                 'status' => true,

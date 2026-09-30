@@ -132,6 +132,8 @@ return [
             'vendor' => true,
         ],
         'always_send' => true,
+        'variables' => ['name', 'reset_link', 'organization_name', 'email'],
+        'mailable_class' => \App\Mail\PasswordReset::class,
     ],
     'matterport_expiry_reminder' => [
         'label' => '3D Tour / Matterport Expiry Reminder',

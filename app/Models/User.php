@@ -130,7 +130,19 @@ class User extends Authenticatable
 
     public function sendPasswordResetNotification($token)
     {
-        $this->notify(new ResetPasswordNotification($token));
+        app(\App\Services\EmailDispatchService::class)->dispatch('password_reset', $this, [
+            'recipients' => [[
+                'email' => $this->email,
+                'name'  => trim(($this->first_name ?? $this->name ?? '') . ' ' . ($this->last_name ?? '')),
+                'role'  => 'admin',
+                'model' => $this,
+            ]],
+            'data' => [
+                'token'     => $token,
+                'user_type' => 'admin',
+                'role'      => 'admin',
+            ],
+        ]);
     }
 
     public function getAvatarUrlAttribute()

@@ -46,10 +46,18 @@ class EmailDispatchService
                 continue;
             }
             
-            // Build role-specific data (filter sensitive info by role)
-            $data = $this->buildRoleData($eventType, $model, $recipient, $org);
+            // Pre-seed options data so buildRoleData can access token/user_type (critical for password_reset URL builder)
+            $preSeededData = [];
             if (!empty($options['data'])) {
-                $data = array_merge($data, $options['data']);
+                $preSeededData = $options['data'];
+            }
+            
+            // Build role-specific data (filter sensitive info by role)
+            $data = $this->buildRoleData($eventType, $model, $recipient, $org, $preSeededData);
+            
+            // Merge options data again so any further overrides take effect (buildRoleData computed values win for known keys)
+            if (!empty($options['data'])) {
+                $data = array_merge($options['data'], $data);
             }
             
             try {
@@ -344,18 +352,45 @@ class EmailDispatchService
             }
         }
 
-        // Generic fallback (e.g. Password resets)
-        if (empty($recipients) && $model instanceof \App\Models\User) {
-            $role = 'admin';
-            if ($model->hasRole('agent')) $role = 'agent';
-            if ($model->hasRole('vendor')) $role = 'vendor';
-            
-            $recipients[] = [
-                'email' => $model->email,
-                'name' => $model->name ?? trim(($model->first_name ?? '') . ' ' . ($model->last_name ?? '')),
-                'role' => $role,
-                'model' => $model,
-            ];
+        // Generic fallback — supports User, Agent, Vendor, SubAccount (password reset etc.)
+        if (empty($recipients)) {
+            if ($model instanceof \App\Models\User) {
+                $role = 'admin';
+                $recipients[] = [
+                    'email' => $model->email,
+                    'name'  => trim(($model->first_name ?? $model->name ?? '') . ' ' . ($model->last_name ?? '')),
+                    'role'  => $role,
+                    'model' => $model,
+                ];
+            } elseif ($model instanceof \App\Models\Agent) {
+                $recipients[] = [
+                    'email' => $model->email,
+                    'name'  => trim($model->first_name . ' ' . $model->last_name),
+                    'role'  => 'agent',
+                    'model' => $model,
+                ];
+            } elseif ($model instanceof \App\Models\SubAccount) {
+                $email = $model->primary_email ?? $model->secondary_email;
+                if ($email) {
+                    $recipients[] = [
+                        'email' => $email,
+                        'name'  => trim($model->first_name . ' ' . $model->last_name),
+                        'role'  => 'agent',
+                        'model' => $model,
+                    ];
+                }
+            } elseif ($model instanceof \App\Models\Vendor) {
+                $vendorEmails = $this->getVendorEmails($model);
+                foreach ($vendorEmails as $vEmail) {
+                    $recipients[] = [
+                        'email' => $vEmail,
+                        'name'  => trim($model->first_name . ' ' . $model->last_name),
+                        'role'  => 'vendor',
+                        'model' => $model,
+                    ];
+                    break; // Only first email for resets
+                }
+            }
         }
 
         return $recipients;
@@ -447,16 +482,19 @@ class EmailDispatchService
 
     /**
      * Build role-specific data array.
+     *
+     * @param array $preSeededData Optional raw data from dispatch options, pre-seeded so event-specific
+     *                             builders (e.g. password_reset URL builder) can read token/user_type.
      */
-    protected function buildRoleData(string $eventType, $model, array $recipient, ?Organization $org): array
+    protected function buildRoleData(string $eventType, $model, array $recipient, ?Organization $org, array $preSeededData = []): array
     {
         $role = $recipient['role'];
-        $data = [
-            'event_type' => $eventType,
+        $data = array_merge($preSeededData, [
+            'event_type'     => $eventType,
             'recipient_role' => $role,
             'recipient_name' => $recipient['name'],
-            'organization' => $org,
-        ];
+            'organization'   => $org,
+        ]);
 
         $order = null;
         $slot = null;
@@ -642,6 +680,52 @@ class EmailDispatchService
             }
         }
 
+        // ── Password Reset ─────────────────────────────────────────────────────
+        if ($eventType === 'password_reset' &&
+            ($model instanceof \App\Models\User
+            || $model instanceof \App\Models\Agent
+            || $model instanceof \App\Models\SubAccount
+            || $model instanceof \App\Models\Vendor)
+        ) {
+            $token    = $data['token'] ?? null;
+            $email    = $recipient['email'] ?? '';
+            $userType = $data['user_type'] ?? $role;
+
+            // Resolve the correct platform base URL per portal type
+            $baseUrl = config('app.admin_app', 'https://app.bcfloorplans.com');
+
+            // For whitelabel orgs: look up their custom domain for this portal type
+            if ($org && $org->is_whitelabel) {
+                $domainRecord = $org->domains()->where('portal_type', $userType)->first();
+                if ($domainRecord) {
+                    $baseUrl = 'https://' . rtrim($domainRecord->domain, '/');
+                } else {
+                    $baseUrl = 'https://' . ltrim($org->domain ?? 'tojuco.com', '/');
+                }
+            }
+
+            $baseUrl = rtrim($baseUrl, '/');
+
+            // Path varies by role
+            $resetPath = match($userType) {
+                'agent'  => '/agent/new-password',
+                'vendor' => '/vendor/new-password',
+                default  => '/new-password',
+            };
+
+            $resetUrl = $baseUrl . $resetPath
+                . '?token=' . urlencode($token ?? '')
+                . '&email=' . urlencode($email)
+                . '&role='  . urlencode($userType);
+
+            $data['url']        = $resetUrl;
+            $data['reset_link'] = $resetUrl;
+            $data['token']      = $token;
+            $data['user_type']  = $userType;
+            $data['organization_name'] = ($org && $org->is_whitelabel) ? $org->name : 'Tojuco';
+        }
+        // ── End Password Reset ─────────────────────────────────────────────────
+
         return $data;
     }
 
@@ -696,6 +780,11 @@ class EmailDispatchService
                 'amount' => $data['amount'] ?? '',
                 'service_name' => $data['service_name'] ?? '',
                 'changes_summary' => $changesSummary,
+                // Password reset
+                'name'              => $data['recipient_name'] ?? '',
+                'reset_link'        => $data['reset_link'] ?? $data['url'] ?? '',
+                'organization_name' => $data['organization_name'] ?? ($org?->name ?? ''),
+                'email'             => $recipient['email'] ?? '',
                 
                 // Dates & times (with backwards-compatible frontend aliases)
                 'date' => $data['date'] ?? '',
@@ -837,6 +926,15 @@ class EmailDispatchService
                 );
                 break;
                 
+            case \App\Mail\PasswordReset::class:
+                $mailable = new $mailableClass(
+                    $data['url'] ?? '',
+                    $data['recipient_name'] ?? 'User',
+                    $data['user_type'] ?? $recipient['role'] ?? 'admin',
+                    $org
+                );
+                break;
+
             default:
                 // Handle new/missing mailables dynamically if they accept data array
                 $mailable = new $mailableClass($data);

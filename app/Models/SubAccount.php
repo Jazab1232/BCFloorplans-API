@@ -74,6 +74,15 @@ class SubAccount extends Authenticatable
         return 'uuid';
     }
 
+    /**
+     * SubAccounts use primary_email as the password reset identifier.
+     * Override Authenticatable default which reads $this->email (not present on subaccounts).
+     */
+    public function getEmailForPasswordReset(): string
+    {
+        return $this->primary_email ?? $this->secondary_email ?? '';
+    }
+
     // Relationships
     public function agent(): BelongsTo
     {

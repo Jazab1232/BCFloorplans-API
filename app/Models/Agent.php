@@ -202,4 +202,25 @@ class Agent extends Authenticatable
     {
         return $this->agent_type === 'co_agent';
     }
+
+    /**
+     * Route legacy password reset calls through EmailDispatchService
+     * so they use the verified Resend sender and whitelabel branding.
+     */
+    public function sendPasswordResetNotification($token)
+    {
+        app(\App\Services\EmailDispatchService::class)->dispatch('password_reset', $this, [
+            'recipients' => [[
+                'email' => $this->email,
+                'name'  => trim($this->first_name . ' ' . $this->last_name),
+                'role'  => 'agent',
+                'model' => $this,
+            ]],
+            'data' => [
+                'token'     => $token,
+                'user_type' => 'agent',
+                'role'      => 'agent',
+            ],
+        ]);
+    }
 }

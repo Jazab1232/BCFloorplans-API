@@ -113,4 +113,25 @@ class Vendor extends Authenticatable
     {
         return $this->hasMany(VendorPortfolioImage::class);
     }
+
+    /**
+     * Route legacy password reset calls through EmailDispatchService
+     * so they use the verified Resend sender and whitelabel branding.
+     */
+    public function sendPasswordResetNotification($token)
+    {
+        app(\App\Services\EmailDispatchService::class)->dispatch('password_reset', $this, [
+            'recipients' => [[
+                'email' => $this->email,
+                'name'  => trim($this->first_name . ' ' . $this->last_name),
+                'role'  => 'vendor',
+                'model' => $this,
+            ]],
+            'data' => [
+                'token'     => $token,
+                'user_type' => 'vendor',
+                'role'      => 'vendor',
+            ],
+        ]);
+    }
 }

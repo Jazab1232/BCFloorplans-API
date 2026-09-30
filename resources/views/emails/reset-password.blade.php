@@ -1,57 +1,52 @@
-<!DOCTYPE html>
-<html>
- <head>
- <meta charset="UTF-8">
- <title>Reset Password</title>
- </head>
- <body style="margin: 0; padding: 0; background-color: #F5F5F5; font-family: Arial, sans-serif;">
- <table width="100%" cellpadding="0" cellspacing="0" style="padding: 40px 0; background-color: #F5F5F5;">
-  <tr>
-  <td align="center">
-   <table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 10px;">
-   <tr>
-    <td align="center" style="padding: 20px;">
-    <img src="{{ config('app.admin_app_img') }}" alt="BCFP Logo" style="width: 135px; border: none;">
-    </td>
-   </tr>
-   <tr>
-    <td style="padding: 20px; font-family: Arial, sans-serif; color: #3d4852;">
-    <h1 style="font-size: 24px; font-weight: normal; margin: 0 0 16px; border-bottom: 1px solid #CCCCCC; padding-bottom: 16px;">
-     Reset Password for BCFP Software
-    </h1>
-    <h2 style="font-size: 16px; font-weight: bold; margin: 20px 0 25px;">Hello</h2>
-    <p style="font-size: 14px; line-height: 30px; margin: 0 0 30px;color: #424242;">
-     Looks like you need to reset your password for BCFP Software. Click the button below to reset your password, or copy the link into your browser.
-    </p>
-    <p style="font-size: 14px; line-height: 30px; margin: 0 0 10px;color: #424242;">
-     If you did not request this reset, you can ignore this message. This email link will be active for 15 minutes.
-    </p>
-    <table width="100%" cellpadding="0" cellspacing="0">
-     <tr>
-     <td align="center">
-      <a href="{{ $url }}"
-       style="display: inline-block; background-color: #4290E9;width: 330px; color: #ffffff; padding: 12px 24px; font-size: 16px; text-decoration: none; border-radius: 6px; font-family: Arial, sans-serif;"
-       target="_blank" rel="noopener noreferrer">
-      Reset Password Now
-      </a>
-     </td>
-     </tr>
-    </table>
-    <p style="font-size: 14px; line-height: 100%; color: #424242; margin: 30px 0 2px;">
-     Reset Link:
-    </p>
-    <p style="font-size: 14px; line-height: 100%; word-break: break-word;margin-top: 0;">
-     <a href="{{ $url }}" style="color: #4290E9;">{{ $url }}</a>
-    </p>
-    <hr style="border: none; border-top: 1px solid #CCCCCC; margin: 16px 0;">
-    <p style="font-size: 12px; color: #666666; line-height: 20px;margin: 0;">
-     You received this email because you signed up on our website. This is an automated email. If you need to get in touch, email us at support@bcfpsoftware.com <a href="#" style="color: #4290E9;">unsubscribe</a>.
-    </p>
-    </td>
-   </tr>
-   </table>
-  </td>
-  </tr>
- </table>
- </body>
-</html>
+@extends('emails.layouts.master')
+
+@section('title', 'Reset Your Password')
+
+@section('content')
+@php
+    $org     = $organization ?? null;
+    $orgName = ($org && $org->is_whitelabel) ? $org->name : 'Tojuco';
+    $primaryColor = ($org && $org->primary_color) ? $org->primary_color : '#2563EB';
+@endphp
+
+<h1 style="font-size: 22px; font-weight: 600; margin: 0 0 16px; color: #1a1a2e;">
+    Reset Your Password
+</h1>
+
+<p style="font-size: 15px; color: #4B5563; margin: 0 0 12px;">
+    Hello {{ $name ?? 'there' }},
+</p>
+
+<p style="font-size: 15px; color: #4B5563; line-height: 1.7; margin: 0 0 24px;">
+    We received a request to reset the password for your <strong>{{ $orgName }}</strong> account.
+    Click the button below to choose a new password. This link is valid for <strong>60 minutes</strong>.
+</p>
+
+<table width="100%" cellpadding="0" cellspacing="0" style="margin: 0 0 24px;">
+    <tr>
+        <td align="center">
+            <a href="{{ $url }}"
+               style="display: inline-block; background-color: {{ $primaryColor }}; color: #ffffff;
+                      padding: 14px 36px; font-size: 15px; font-weight: 600; text-decoration: none;
+                      border-radius: 6px; font-family: Arial, sans-serif; letter-spacing: 0.3px;"
+               target="_blank" rel="noopener noreferrer">
+                Reset Password
+            </a>
+        </td>
+    </tr>
+</table>
+
+<p style="font-size: 13px; color: #6B7280; margin: 0 0 6px;">
+    Or copy and paste this link into your browser:
+</p>
+<p style="font-size: 13px; word-break: break-all; margin: 0 0 24px;">
+    <a href="{{ $url }}" style="color: {{ $primaryColor }}; text-decoration: underline;">{{ $url }}</a>
+</p>
+
+<hr style="border: none; border-top: 1px solid #E5E7EB; margin: 20px 0;">
+
+<p style="font-size: 13px; color: #9CA3AF; margin: 0;">
+    If you did not request a password reset, you can safely ignore this email.
+    Your password will remain unchanged.
+</p>
+@endsection
