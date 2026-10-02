@@ -7,20 +7,20 @@ use App\Models\User;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
 
-return new class extends Migration
-{
+return new class extends Migration {
     /**
      * Run the migrations.
      */
     public function up(): void
     {
-        \Illuminate\Support\Facades\DB::table('users')->updateOrInsert(
+        User::updateOrCreate(
             ['email' => 'todd@tojuco.com'],
             [
-                'name' => 'Todd Long',
+                'first_name' => 'Todd',
+                'last_name' => 'Long',
                 'password' => Hash::make('BCFloor486!'),
-                'created_at' => now(),
-                'updated_at' => now(),
+                'organization_id' => null,
+                'uuid' => (string) Str::uuid(),
             ]
         );
     }

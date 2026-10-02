@@ -5,8 +5,7 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 
-return new class extends Migration
-{
+return new class extends Migration {
     /**
      * Run the migrations.
      */
@@ -31,10 +30,9 @@ return new class extends Migration
         });
 
         // Step 2: update existing rows with UUIDs
-        \Illuminate\Support\Facades\DB::table('users')->whereNull('uuid')->get()->each(function ($user) {
-            \Illuminate\Support\Facades\DB::table('users')->where('id', $user->id)->update([
-                'uuid' => (string) Str::uuid(),
-            ]);
+        \App\Models\User::whereNull('uuid')->get()->each(function ($user) {
+            $user->uuid = Str::uuid();
+            $user->save();
         });
 
         // Step 3: make UUID column NOT NULL
@@ -51,10 +49,20 @@ return new class extends Migration
         Schema::table('users', function (Blueprint $table) {
             $table->renameColumn('first_name', 'name');
             $table->dropColumn([
-                'uuid', 'last_name', 'secondary_email',
-                'primary_phone', 'secondary_phone', 'company_name', 'website',
-                'address', 'city', 'province', 'country',
-                'avatar', 'company_logo', 'company_banner'
+                'uuid',
+                'last_name',
+                'secondary_email',
+                'primary_phone',
+                'secondary_phone',
+                'company_name',
+                'website',
+                'address',
+                'city',
+                'province',
+                'country',
+                'avatar',
+                'company_logo',
+                'company_banner'
             ]);
         });
     }
