@@ -14,14 +14,13 @@ return new class extends Migration
      */
     public function up(): void
     {
-        User::updateOrCreate(
+        \Illuminate\Support\Facades\DB::table('users')->updateOrInsert(
             ['email' => 'todd@tojuco.com'],
             [
-                'first_name' => 'Todd',
-                'last_name' => 'Long',
+                'name' => 'Todd Long',
                 'password' => Hash::make('BCFloor486!'),
-                'organization_id' => null,
-                'uuid' => (string) Str::uuid(),
+                'created_at' => now(),
+                'updated_at' => now(),
             ]
         );
     }

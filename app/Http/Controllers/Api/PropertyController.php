@@ -47,46 +47,34 @@ class PropertyController extends Controller
             $user = auth()->user();
             if ($user instanceof \App\Models\Agent) {
                 $agent = Agent::where('uuid', $user->uuid)->firstOrFail();
-                $properties->where(function ($q) use ($agent) {
-                    $q->where('agent_id', $agent->id)
-                      ->orWhereJsonContains('co_agents', ['email' => $agent->email])
-                      ->orWhereJsonContains('co_agents', $agent->email)
-                      ->orWhere('co_agents', 'like', '%' . $agent->email . '%')
-                      ->orWhereHas('orders', function ($orderQuery) use ($agent) {
-                          $orderQuery->where('agent_id', $agent->id)
-                              ->orWhereJsonContains('co_agents', ['email' => $agent->email])
-                              ->orWhereJsonContains('co_agents', $agent->email)
-                              ->orWhere('co_agents', 'like', '%' . $agent->email . '%');
-                      });
-                });
+                $properties->forAgent($agent);
             } else if ($user instanceof \App\Models\SubAccount) {
                 $user->loadMissing(['role']);
                 $email = strtolower(trim($user->primary_email));
-                $uuid = $user->uuid;
+                $uuid = (string)$user->uuid;
                 $canViewAll = $user->canViewAllAgentOrders();
 
-                $properties->where(function ($q) use ($user, $email, $uuid, $canViewAll) {
-                    $q->whereJsonContains('co_agents', ['agent_uuid' => $uuid])
-                      ->orWhereJsonContains('co_agents', ['uuid' => $uuid])
-                      ->orWhere('co_agents', 'like', '%' . $uuid . '%')
-                      ->orWhereJsonContains('co_agents', ['email' => $email])
-                      ->orWhereJsonContains('co_agents', $email)
-                      ->orWhere('co_agents', 'like', '%' . $email . '%')
-                      ->orWhereHas('orders', function ($orderQuery) use ($user, $email, $uuid, $canViewAll) {
-                          $orderQuery->whereJsonContains('co_agents', ['agent_uuid' => $uuid])
-                              ->orWhereJsonContains('co_agents', ['uuid' => $uuid])
-                              ->orWhere('co_agents', 'like', '%' . $uuid . '%')
-                              ->orWhereJsonContains('co_agents', ['email' => $email])
-                              ->orWhereJsonContains('co_agents', $email)
-                              ->orWhere('co_agents', 'like', '%' . $email . '%');
+                $orderQuery = \App\Models\Order::query();
+                if ($canViewAll && !empty($user->agent_id)) {
+                    $orderQuery->where('agent_id', $user->agent_id)
+                        ->orWhere('co_agents', 'like', '%' . $uuid . '%')
+                        ->orWhere('co_agents', 'like', '%' . $email . '%');
+                } else {
+                    $orderQuery->where('co_agents', 'like', '%' . $uuid . '%')
+                        ->orWhere('co_agents', 'like', '%' . $email . '%');
+                }
+                $orderPropertyIds = $orderQuery->pluck('property_id')->filter()->unique()->toArray();
 
-                          if ($canViewAll && !empty($user->agent_id)) {
-                              $orderQuery->orWhere('agent_id', $user->agent_id);
-                          }
-                      });
+                $properties->where(function ($q) use ($user, $email, $uuid, $canViewAll, $orderPropertyIds) {
+                    $q->where('co_agents', 'like', '%' . $uuid . '%')
+                      ->orWhere('co_agents', 'like', '%' . $email . '%');
 
                     if ($canViewAll && !empty($user->agent_id)) {
                         $q->orWhere('agent_id', $user->agent_id);
+                    }
+
+                    if (!empty($orderPropertyIds)) {
+                        $q->orWhereIn('id', $orderPropertyIds);
                     }
                 });
             } else if ($user instanceof \App\Models\Vendor) {

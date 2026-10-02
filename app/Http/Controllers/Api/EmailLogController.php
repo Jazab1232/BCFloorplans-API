@@ -4,7 +4,8 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
-use Resend\Laravel\Facades\Resend;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Exception;
 
 class EmailLogController extends Controller
@@ -91,25 +92,28 @@ class EmailLogController extends Controller
 
             if ($localLog->resend_email_id) {
                 try {
-                    $resendEmail = Resend::emails()->get($localLog->resend_email_id);
-                    if ($resendEmail) {
-                        $resendData = is_object($resendEmail) 
-                            ? (method_exists($resendEmail, 'toArray') ? $resendEmail->toArray() : (array)$resendEmail) 
-                            : $resendEmail;
-                        
-                        $html = $resendData['html'] ?? null;
-                        $text = $resendData['text'] ?? null;
-                        $status = $resendData['last_event'] ?? $resendData['status'] ?? $localLog->status;
-                        $lastEvent = $resendData['last_event'] ?? $status;
+                    $resendApiKey = config('services.resend.key') ?? env('RESEND_KEY') ?? env('RESEND_API_KEY');
+                    if ($resendApiKey) {
+                        $response = Http::withToken($resendApiKey)
+                            ->timeout(10)
+                            ->get("https://api.resend.com/emails/{$localLog->resend_email_id}");
 
-                        // Update local log status if it has been updated in Resend
-                        if ($status !== $localLog->status) {
-                            $localLog->update(['status' => $status]);
+                        if ($response->successful()) {
+                            $resendData = $response->json();
+                            $html = $resendData['html'] ?? null;
+                            $text = $resendData['text'] ?? null;
+                            $status = $resendData['last_event'] ?? $resendData['status'] ?? $localLog->status;
+                            $lastEvent = $resendData['last_event'] ?? $status;
+
+                            // Update local log status if it has been updated in Resend
+                            if ($status !== $localLog->status) {
+                                $localLog->update(['status' => $status]);
+                            }
                         }
                     }
                 } catch (Exception $resendException) {
                     // Fall back to local data on Resend API failure
-                    \Illuminate\Support\Facades\Log::warning("Failed to fetch fresh details from Resend for ID {$localLog->resend_email_id}: " . $resendException->getMessage());
+                    Log::warning("Failed to fetch fresh details from Resend for ID {$localLog->resend_email_id}: " . $resendException->getMessage());
                 }
             }
 

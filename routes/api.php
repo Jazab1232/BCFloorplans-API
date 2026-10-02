@@ -14,6 +14,7 @@ use App\Http\Controllers\Api\CompanyController;
 use App\Http\Controllers\Api\PaymentMethodController;
 use App\Http\Controllers\Api\PropertyController;
 use App\Http\Controllers\Api\AgentController;
+use App\Http\Controllers\Api\CoAgentController;
 use App\Http\Controllers\Api\SubAccountController;
 use App\Http\Controllers\Api\VendorController;
 use App\Http\Controllers\Api\OrderController;
@@ -454,8 +455,12 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api", "resolve
     Route::get('sub-accounts/{uuid}', [SubAccountController::class, 'show']);
     Route::match(['put', 'patch'], 'sub-accounts/{uuid}', [SubAccountController::class, 'update']);
     Route::match(['put', 'patch'], 'sub-accounts/{uuid}/status', [SubAccountController::class, 'updateStatus']);
-
     Route::delete('sub-accounts/{uuid}', [SubAccountController::class, 'destroy']);
+
+    // Co-Agent / Partner management
+    Route::get('agent/co-agents', [CoAgentController::class, 'index']);
+    Route::post('agent/co-agents', [CoAgentController::class, 'store']);
+    Route::delete('agent/co-agents/{uuid}', [CoAgentController::class, 'destroy']);
 
     // Order-Property relationship management
     Route::post('orders/add/properties', [PropertyController::class, 'orderStoreProperty']);

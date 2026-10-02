@@ -232,9 +232,10 @@ class AuthController extends Controller
             if (!$user && ($role === 'agent' || !$role)) {
                 $user = Agent::whereRaw('LOWER(email) = ?', [strtolower(trim($email))])->first();
                 if (!$user) {
-                    $user = SubAccount::whereRaw('LOWER(primary_email) = ?', [strtolower(trim($email))])
-                        ->orWhereRaw('LOWER(secondary_email) = ?', [strtolower(trim($email))])
-                        ->first();
+                    $user = SubAccount::where(function ($q) use ($email) {
+                        $q->whereRaw('LOWER(primary_email) = ?', [strtolower(trim($email))])
+                          ->orWhereRaw('LOWER(secondary_email) = ?', [strtolower(trim($email))]);
+                    })->first();
                 }
                 if ($user) {
                     $userType = 'agent';
@@ -286,12 +287,15 @@ class AuthController extends Controller
                 'message' => 'Validation error',
                 'errors' => $e->errors()
             ], 422);
-        } catch (\Exception $e) {
-            Log::error('Forgot password error: ' . $e->getMessage());
+        } catch (\Throwable $e) {
+            Log::error('Forgot password error: ' . $e->getMessage(), [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
             return response()->json([
                 'status' => false,
                 'message' => 'Failed to send reset link',
-                'error' => config('app.env') === 'production' ? null : $e->getMessage()
+                'error' => $e->getMessage()
             ], 500);
         }
     }
@@ -317,7 +321,10 @@ class AuthController extends Controller
                 $user = User::whereRaw('LOWER(email) = ?', [$email])->first();
             } elseif ($role === 'agent') {
                 $user = Agent::whereRaw('LOWER(email) = ?', [$email])->first() 
-                    ?? SubAccount::whereRaw('LOWER(primary_email) = ?', [$email])->orWhereRaw('LOWER(secondary_email) = ?', [$email])->first();
+                    ?? SubAccount::where(function ($q) use ($email) {
+                        $q->whereRaw('LOWER(primary_email) = ?', [$email])
+                          ->orWhereRaw('LOWER(secondary_email) = ?', [$email]);
+                    })->first();
             } elseif ($role === 'vendor') {
                 $user = Vendor::whereRaw('LOWER(email) = ?', [$email])->first();
             } else {
@@ -325,7 +332,10 @@ class AuthController extends Controller
                 $user = User::whereRaw('LOWER(email) = ?', [$email])->first();
                 if (!$user) {
                     $user = Agent::whereRaw('LOWER(email) = ?', [$email])->first() 
-                        ?? SubAccount::whereRaw('LOWER(primary_email) = ?', [$email])->orWhereRaw('LOWER(secondary_email) = ?', [$email])->first();
+                        ?? SubAccount::where(function ($q) use ($email) {
+                            $q->whereRaw('LOWER(primary_email) = ?', [$email])
+                              ->orWhereRaw('LOWER(secondary_email) = ?', [$email]);
+                        })->first();
                 }
                 if (!$user) {
                     $user = Vendor::whereRaw('LOWER(email) = ?', [$email])->first();
@@ -365,7 +375,7 @@ class AuthController extends Controller
                 'data' => [
                     'token' => $token,
                     'user' => $user->load('organization'),
-                    'type' => $role ?? ($user instanceof Agent ? 'agent' : ($user instanceof Vendor ? 'vendor' : 'user'))
+                    'type' => $role ?? (($user instanceof Agent || $user instanceof SubAccount) ? 'agent' : ($user instanceof Vendor ? 'vendor' : 'user'))
                 ]
             ]);
 
@@ -375,12 +385,15 @@ class AuthController extends Controller
                 'message' => 'Validation error',
                 'errors' => $e->errors()
             ], 422);
-        } catch (\Exception $e) {
-            Log::error('Reset password error: ' . $e->getMessage());
+        } catch (\Throwable $e) {
+            Log::error('Reset password error: ' . $e->getMessage(), [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
             return response()->json([
                 'status' => false,
                 'message' => 'Password reset failed',
-                'error' => config('app.env') === 'production' ? null : $e->getMessage()
+                'error' => $e->getMessage()
             ], 500);
         }
     }

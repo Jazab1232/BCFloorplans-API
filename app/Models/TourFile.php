@@ -51,22 +51,27 @@ class TourFile extends Model
 
     public function getIsPaidAttribute()
     {
-        $tour = $this->tour;
-        $order = $tour ? ($tour->order ?? $tour->orders) : null;
+        $tour = $this->relationLoaded('tour') ? $this->getRelation('tour') : null;
+        $order = null;
+        if ($tour) {
+            $order = $tour->relationLoaded('order') ? $tour->getRelation('order') : ($tour->relationLoaded('orders') ? $tour->getRelation('orders') : null);
+        }
 
         // If it's linked to a service, check the payment / media_access status
         if ($this->service_id) {
-            if ($tour) {
-                // Find the specific OrderService for this tour and service
-                $orderService = \App\Models\OrderService::where('order_id', $tour->order_id ?? 0)
+            $orderService = null;
+            if ($order && $order->relationLoaded('services')) {
+                $orderService = $order->services->firstWhere('service_id', $this->service_id);
+            } elseif ($tour && !empty($tour->order_id)) {
+                $orderService = \App\Models\OrderService::where('order_id', $tour->order_id)
                                                         ->where('service_id', $this->service_id)
                                                         ->first();
-                if ($orderService) {
-                    if ($orderService->media_access !== null) {
-                        return (bool) $orderService->media_access;
-                    }
-                    return $orderService->payment_status === 'PAID';
+            }
+            if ($orderService) {
+                if ($orderService->media_access !== null) {
+                    return (bool) $orderService->media_access;
                 }
+                return $orderService->payment_status === 'PAID';
             }
         }
 
@@ -217,7 +222,8 @@ class TourFile extends Model
 
         $user = request()->user();
         $isAdminOrVendor = $user && ($user instanceof \App\Models\User || $user instanceof \App\Models\Vendor);
-        $order = $this->tour ? ($this->tour->order ?? $this->tour->orders) : null;
+        $tour = $this->relationLoaded('tour') ? $this->getRelation('tour') : null;
+        $order = $tour ? ($tour->relationLoaded('order') ? $tour->getRelation('order') : ($tour->relationLoaded('orders') ? $tour->getRelation('orders') : null)) : null;
         $orderReleased = $order && (bool) $order->release_media_before_payment;
 
         // Expose url and file_path for videos if paid, complimentary, or requested by authenticated user

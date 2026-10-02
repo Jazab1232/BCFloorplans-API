@@ -106,6 +106,24 @@ class SubAccountController extends Controller
             }
 
             $data['organization_id'] = $agent->organization_id;
+
+            $role = \App\Models\Role::find($data['role_id']);
+            $isCoAgent = $role && str_contains(strtolower($role->name), 'co');
+
+            if ($isCoAgent) {
+                $coAgent = app(\App\Services\CoAgentService::class)->resolveOrCreateCoAgent(
+                    $data['primary_email'],
+                    $data['first_name'] . ' ' . $data['last_name'],
+                    $data['primary_phone'] ?? null,
+                    $agent
+                );
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Co-Agent created and linked successfully',
+                    'data' => $coAgent
+                ], 201);
+            }
+
             $subAccount = SubAccount::create($data);
 
             return response()->json([

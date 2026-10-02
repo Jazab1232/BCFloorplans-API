@@ -571,19 +571,19 @@ class GoogleCalendarService
     }
 
     /**
-     * Get all events for vendor with flexible filtering
+     * Get events from the authenticated user's Google calendar.
      */
-    public function getEvents(Vendor $vendor, Carbon $startDate, Carbon $endDate, array $options = []): array
+    public function getEvents(Model $model, Carbon $startDate, Carbon $endDate, array $options = []): array
     {
-        if (!$vendor->google_refresh_token && !$vendor->google_access_token) {
+        if (!$model->google_refresh_token && !$model->google_access_token) {
             return [];
         }
 
         try {
-            $this->setClientToken($vendor);
+            $this->setClientToken($model);
             $calendarService = new Calendar($this->client);
 
-            Log::info('Fetching ALL events for vendor ID: ' . $vendor->id . ' from ' . $startDate->toDateTimeString() . ' to ' . $endDate->toDateTimeString());
+            Log::info('Fetching all events for ' . class_basename($model) . ' ID: ' . $model->id . ' from ' . $startDate->toDateTimeString() . ' to ' . $endDate->toDateTimeString());
 
             $params = [
                 'timeMin' => $startDate->toRfc3339String(),
@@ -598,7 +598,7 @@ class GoogleCalendarService
                 $params['q'] = $options['search'];
             }
 
-            $calendarId = $vendor->google_calendar_id ?? 'primary';
+            $calendarId = $model->google_calendar_id ?? 'primary';
             $events = $calendarService->events->listEvents($calendarId, $params);
 
             $eventsList = [];
@@ -662,7 +662,7 @@ class GoogleCalendarService
                 $eventsList[] = $eventData;
             }
 
-            Log::info('Fetched ' . count($eventsList) . ' events from Google Calendar for vendor ID: ' . $vendor->id);
+            Log::info('Fetched ' . count($eventsList) . ' events from Google Calendar for ' . class_basename($model) . ' ID: ' . $model->id);
 
             return $eventsList;
         } catch (\Exception $e) {

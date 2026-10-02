@@ -25,6 +25,11 @@ class GoogleCalendarController extends Controller
      */
     protected function getAuthenticatedModel(Request $request)
     {
+        $user = $request->user();
+        if ($user instanceof Vendor || $user instanceof Agent) {
+            return $user;
+        }
+
         // 1. Prioritize explicit UUID parameters passed via payload or query string
         $agentUuid = $request->input('agent_uuid') ?? $request->query('agent_uuid') ?? $request->input('agent_id') ?? $request->query('agent_id');
         if ($agentUuid) {
@@ -39,13 +44,7 @@ class GoogleCalendarController extends Controller
         }
 
         // 2. Fallback to logged-in user guard resolution
-        $user = $request->user();
-        
         if ($user) {
-            if ($user instanceof Vendor || $user instanceof Agent) {
-                return $user;
-            }
-
             // Try to resolve based on common pattern if instance check fails
             if (!empty($user->uuid)) {
                 $vendor = Vendor::where('uuid', $user->uuid)->first();

@@ -90,6 +90,36 @@ class Property extends Model
         return $this->hasMany(Order::class);
     }
 
+    public function scopeForAgent($query, Agent $agent)
+    {
+        $email = strtolower(trim((string) $agent->email));
+        $sharedOrderPropertyIds = Order::forAgent($agent)->select('orders.property_id');
+        $agentHasPropertyAccess = function ($propertyQuery) use ($agent, $email, $sharedOrderPropertyIds) {
+            $propertyQuery->where('agent_id', $agent->id)
+                ->orWhereIn('id', $sharedOrderPropertyIds);
+
+            if ($email !== '') {
+                $propertyQuery->orWhereJsonContains('co_agents', $email)
+                    ->orWhere('co_agents', 'like', '%' . $email . '%');
+            }
+
+            if ($agent->uuid) {
+                $propertyQuery->orWhereJsonContains('co_agents', $agent->uuid)
+                    ->orWhere('co_agents', 'like', '%' . $agent->uuid . '%');
+            }
+        };
+
+        return $query->withoutGlobalScope('organization')
+            ->where(function ($tenantQuery) use ($agent, $agentHasPropertyAccess) {
+                $tenantQuery->where('organization_id', $agent->organization_id)
+                    ->orWhere(function ($unassignedQuery) use ($agentHasPropertyAccess) {
+                        $unassignedQuery->whereNull('organization_id')
+                            ->where($agentHasPropertyAccess);
+                    });
+            })
+            ->where($agentHasPropertyAccess);
+    }
+
     public function getStateAttribute(): ?string
     {
         return $this->province ?? null;

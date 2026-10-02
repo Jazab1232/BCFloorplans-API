@@ -20,7 +20,7 @@ class EmailDispatchService
      * @param mixed  $model        The primary model (Order, OrderSlot, etc.)
      * @param array  $options      Additional context (recipient overrides, custom data, etc.)
      */
-    public function dispatch(string $eventType, $model, array $options = []): void
+    public function dispatch(string $eventType, $model, array $options = []): bool
     {
         Log::info("EmailDispatchService: Dispatching event '{$eventType}'");
 
@@ -29,7 +29,7 @@ class EmailDispatchService
             $meta = is_array($model->meta) ? $model->meta : (json_decode($model->meta, true) ?? []);
             if (!empty($meta['email_dispatched_at'])) {
                 Log::info("EmailDispatchService: Email already dispatched for payment ID {$model->id} at {$meta['email_dispatched_at']}, skipping.");
-                return;
+                return true;
             }
         }
 
@@ -68,8 +68,9 @@ class EmailDispatchService
                 $mailable = $this->setFromAddress($mailable, $org);
                 
                 // Send & log
-                $this->sendAndLog($mailable, $recipient, $org, $eventType);
-                $dispatchedCount++;
+                if ($this->sendAndLog($mailable, $recipient, $org, $eventType)) {
+                    $dispatchedCount++;
+                }
             } catch (\Throwable $e) {
                 Log::error("EmailDispatchService: Error building or sending email for {$recipient['email']}", [
                     'error' => $e->getMessage(),
@@ -83,6 +84,8 @@ class EmailDispatchService
             $meta['email_dispatched_at'] = now()->toISOString();
             $model->update(['meta' => $meta]);
         }
+
+        return $dispatchedCount > 0;
     }
 
     /**
@@ -697,11 +700,15 @@ class EmailDispatchService
             // For whitelabel orgs: look up their custom domain for this portal type
             if ($org && $org->is_whitelabel) {
                 $domainRecord = $org->domains()->where('portal_type', $userType)->first();
-                if ($domainRecord) {
-                    $baseUrl = 'https://' . rtrim($domainRecord->domain, '/');
-                } else {
-                    $baseUrl = 'https://' . ltrim($org->domain ?? 'tojuco.com', '/');
+                if ($domainRecord && !empty($domainRecord->domain)) {
+                    $baseUrl = $domainRecord->domain;
+                } elseif (!empty($org->domain)) {
+                    $baseUrl = $org->domain;
                 }
+            }
+
+            if (!str_starts_with($baseUrl, 'http://') && !str_starts_with($baseUrl, 'https://')) {
+                $baseUrl = 'https://' . $baseUrl;
             }
 
             $baseUrl = rtrim($baseUrl, '/');
@@ -956,7 +963,7 @@ class EmailDispatchService
      * Set dynamic "From" address based on org whitelabel status.
      *
      * Non-Whitelabel:
-     *   From: "{Org Name} via Tojuco Solutions" <noreply@tojuco.com>
+    *   From: "{Org Name} via Tojuco Solutions" <noreply@tujoco.com>
      *
      * Whitelabel:
      *   From: "{org->from_name}" <{org->from_email}>
@@ -964,13 +971,16 @@ class EmailDispatchService
      */
     protected function setFromAddress($mailable, ?Organization $org)
     {
+        $defaultFromEmail = config('services.resend.from_address', 'noreply@tujoco.com');
+        $defaultFromName  = config('services.resend.from_name', 'Tojuco Solutions');
+
         // ── Non-Whitelabel (or no org context) ────────────────────────────────
         if (!$org || !$org->is_whitelabel) {
-            $orgName  = $org?->name ?? 'Tojuco Solutions';
-            $fromName = "{$orgName} (via Tojuco Solutions)";
+            $orgName  = $org?->name ?? $defaultFromName;
+            $fromName = $org ? "{$orgName} (via {$defaultFromName})" : $defaultFromName;
 
-            Log::info("EmailDispatchService: setFromAddress — non-whitelabel, sending from noreply@tojuco.com as '{$fromName}'");
-            return $mailable->from('noreply@tojuco.com', $fromName);
+            Log::info("EmailDispatchService: setFromAddress — non-whitelabel, sending from '{$defaultFromEmail}' as '{$fromName}'");
+            return $mailable->from($defaultFromEmail, $fromName);
         }
 
         // ── Whitelabel — use org's own from_email & from_name ─────────────────
@@ -978,10 +988,10 @@ class EmailDispatchService
         $fromName  = $org->from_name ?: $org->name;
 
         if (!$fromEmail) {
-            // Whitelabel org has no from_email configured — fallback to Tojuco
-            $fromName = ($org->name ?? 'Tojuco Solutions') . ' (via Tojuco Solutions)';
-            Log::warning("EmailDispatchService: Whitelabel org [{$org->id}] '{$org->name}' has no from_email set. Falling back to noreply@tojuco.com.");
-            return $mailable->from('noreply@tojuco.com', $fromName);
+            // Whitelabel org has no from_email configured — fallback to verified default
+            $fromName = ($org->name ?? $defaultFromName) . " (via {$defaultFromName})";
+            Log::warning("EmailDispatchService: Whitelabel org [{$org->id}] '{$org->name}' has no from_email set. Falling back to '{$defaultFromEmail}'.");
+            return $mailable->from($defaultFromEmail, $fromName);
         }
 
         Log::info("EmailDispatchService: setFromAddress — whitelabel org [{$org->id}], sending from '{$fromEmail}' as '{$fromName}'");
@@ -989,13 +999,26 @@ class EmailDispatchService
     }
 
     /**
+     * Send arbitrary mailable directly through EmailDispatchService (whitelabel & Resend aware).
+     */
+    public function sendDirectMailable($mailable, string $toEmail, string $recipientRole = 'agent', ?Organization $org = null, string $eventType = 'custom'): bool
+    {
+        $mailable = $this->setFromAddress($mailable, $org);
+        return $this->sendAndLog($mailable, [
+            'email' => $toEmail,
+            'role' => $recipientRole,
+            'name' => $mailable->recipientName ?? ($mailable->coAgent->first_name ?? 'Agent')
+        ], $org, $eventType);
+    }
+
+    /**
      * Send email and write audit log.
      */
-    protected function sendAndLog($mailable, array $recipient, ?Organization $org, string $eventType): void
+    protected function sendAndLog($mailable, array $recipient, ?Organization $org, string $eventType): bool
     {
         $toEmail = $recipient['email'];
-        $fromEmail = $mailable->from[0]['address'] ?? 'noreply@bcfloorplans.com';
-        $fromName = $mailable->from[0]['name'] ?? 'BC Floor Plans';
+        $fromEmail = $mailable->from[0]['address'] ?? config('services.resend.from_address', 'noreply@tujoco.com');
+        $fromName = $mailable->from[0]['name'] ?? config('services.resend.from_name', 'Tojuco Solutions');
         $subject = $mailable->envelope()->subject ?? 'Notification';
 
         $log = null;
@@ -1011,36 +1034,70 @@ class EmailDispatchService
                 'status' => 'queued',
             ]);
 
-            $sentMail = Mail::to($toEmail)->send($mailable);
-            
+            $resendApiKey = config('services.resend.key') ?: env('RESEND_API_KEY');
+            $mailer = config('mail.default');
             $resendId = null;
-            try {
-                if ($sentMail && method_exists($sentMail, 'getSymfonySentMessage')) {
-                    $symfonyMessage = $sentMail->getSymfonySentMessage();
-                    if ($symfonyMessage && method_exists($symfonyMessage, 'getHeaders')) {
-                        $headers = $symfonyMessage->getHeaders();
-                        if ($headers && $headers->has('X-Resend-Message-ID')) {
-                            $header = $headers->get('X-Resend-Message-ID');
-                            if ($header) {
-                                if (method_exists($header, 'getBodyAsString')) {
-                                    $resendId = $header->getBodyAsString();
-                                } elseif (method_exists($header, 'getValue')) {
-                                    $resendId = $header->getValue();
-                                } elseif (method_exists($header, 'getFieldBody')) {
-                                    $resendId = $header->getFieldBody();
-                                } else {
-                                    $resendId = (string) $header;
-                                    if (str_contains($resendId, ':')) {
-                                        $parts = explode(':', $resendId, 2);
-                                        $resendId = trim($parts[1]);
+
+            if ($mailer === 'resend' || (!empty($resendApiKey) && $mailer !== 'smtp' && $mailer !== 'log')) {
+                // Direct Resend REST API dispatch — render Blade HTML directly without invoking MailManager
+                $html = '';
+                if (method_exists($mailable, 'content')) {
+                    $content = $mailable->content();
+                    if ($content && !empty($content->view)) {
+                        $viewData = array_merge(get_object_vars($mailable), (array)($content->with ?? []));
+                        $html = view($content->view, $viewData)->render();
+                    }
+                }
+                if (empty($html)) {
+                    $html = method_exists($mailable, 'render') ? $mailable->render() : '';
+                }
+
+                $response = \Illuminate\Support\Facades\Http::withToken($resendApiKey)
+                    ->timeout(10)
+                    ->post('https://api.resend.com/emails', [
+                        'from' => "{$fromName} <{$fromEmail}>",
+                        'to' => [$toEmail],
+                        'subject' => $subject,
+                        'html' => $html,
+                    ]);
+
+                if (!$response->successful()) {
+                    throw new \Exception("Resend API error (" . $response->status() . "): " . $response->body());
+                }
+
+                $resendData = $response->json();
+                $resendId = $resendData['id'] ?? null;
+            } else {
+                $sentMail = Mail::to($toEmail)->send($mailable);
+
+                try {
+                    if ($sentMail && method_exists($sentMail, 'getSymfonySentMessage')) {
+                        $symfonyMessage = $sentMail->getSymfonySentMessage();
+                        if ($symfonyMessage && method_exists($symfonyMessage, 'getHeaders')) {
+                            $headers = $symfonyMessage->getHeaders();
+                            if ($headers && $headers->has('X-Resend-Message-ID')) {
+                                $header = $headers->get('X-Resend-Message-ID');
+                                if ($header) {
+                                    if (method_exists($header, 'getBodyAsString')) {
+                                        $resendId = $header->getBodyAsString();
+                                    } elseif (method_exists($header, 'getValue')) {
+                                        $resendId = $header->getValue();
+                                    } elseif (method_exists($header, 'getFieldBody')) {
+                                        $resendId = $header->getFieldBody();
+                                    } else {
+                                        $resendId = (string) $header;
+                                        if (str_contains($resendId, ':')) {
+                                            $parts = explode(':', $resendId, 2);
+                                            $resendId = trim($parts[1]);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                } catch (\Throwable $headerException) {
+                    Log::warning("EmailDispatchService: Failed to parse Resend Message ID header: " . $headerException->getMessage());
                 }
-            } catch (\Throwable $headerException) {
-                Log::warning("EmailDispatchService: Failed to parse Resend Message ID header: " . $headerException->getMessage());
             }
 
             $log->update([
@@ -1053,11 +1110,13 @@ class EmailDispatchService
                 'to' => $toEmail,
                 'log_id' => $log->id,
             ]);
+            return true;
         } catch (\Throwable $e) {
             Log::error("EmailDispatchService: Failed sending email", [
                 'event' => $eventType,
                 'to' => $toEmail,
-                'error' => $e->getMessage()
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
             ]);
 
             if ($log) {
@@ -1066,6 +1125,7 @@ class EmailDispatchService
                     'error_message' => $e->getMessage(),
                 ]);
             }
+            return false;
         }
     }
 }

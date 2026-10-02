@@ -11,16 +11,13 @@ use App\Models\Agent;
 use App\Models\Vendor;
 use App\Models\User;
 use App\Models\Organization;
-use App\Models\EmailLog;
 use App\Services\SettingsService;
 use Illuminate\Http\JsonResponse;
 use Carbon\Carbon;
 use App\Http\Controllers\Controller;
-use App\Notifications\SystemNotification;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\ValidationException;
 use App\Models\Notification as NotificationModel;
-use Illuminate\Support\Facades\Notification as NotificationFacade;
 
 class NotificationController extends Controller
 {
@@ -98,27 +95,7 @@ class NotificationController extends Controller
                 ], 401);
             }
 
-            $query = NotificationModel::query();
-
-            // Role-based filtering
-            if ($user instanceof Vendor) {
-                $query->where(function ($q) use ($user) {
-                    $q->where('vendor_uuids', 'ILIKE', "%{$user->uuid}%")
-                    ->orWhere('user_uuid', $user->uuid);
-                });
-            } elseif ($user instanceof Agent) {
-                $query->where(function ($q) use ($user) {
-                    $q->where('agent_uuid', $user->uuid)
-                    ->orWhere('user_uuid', $user->uuid)
-                    ->orWhere('role', 'agent');
-                })
-                ->whereNotNull('source_id');
-            } else {
-                $query->where(function ($q) use ($user) {
-                    $q->where('role', 'admin')
-                    ->orWhere('user_uuid', $user->uuid);
-                });
-            }
+            $query = $this->visibleNotificationsQuery($user);
 
             // Date window: default to last 1 month unless client explicitly requests a range
             $startDate = null;
@@ -159,10 +136,7 @@ class NotificationController extends Controller
             // Get ALL notifications for the period (no pagination - frontend handles it)
             $notifications = $query
                 ->with([
-                    'order.agent',
-                    'order.services.service',
-                    'order.services.option',
-                    'order.slots.vendor',
+                    'order:id,uuid,property_address,property_location,created_at',
                 ])
                 ->orderByDesc('created_at')
                 ->get();
@@ -199,7 +173,17 @@ class NotificationController extends Controller
 
     public function markAsRead($uuid)
     {
-        $notification = NotificationModel::where('uuid', $uuid)->first();
+        $user = Auth::user();
+        if (!$user) {
+            return response()->json([
+                'success' => false,
+                'message' => 'User not authenticated',
+            ], 401);
+        }
+
+        $notification = $this->visibleNotificationsQuery($user)
+            ->where('uuid', $uuid)
+            ->first();
 
         if (!$notification) {
             return response()->json([
@@ -215,6 +199,27 @@ class NotificationController extends Controller
             'data' => $notification,
             'message' => 'Notification marked as read',
         ]);
+    }
+
+    private function visibleNotificationsQuery($user)
+    {
+        $query = NotificationModel::query();
+
+        if ($user instanceof Vendor) {
+            return $query->where(function ($q) use ($user) {
+                $q->where('vendor_uuids', 'ILIKE', "%{$user->uuid}%")
+                    ->orWhere('user_uuid', $user->uuid);
+            });
+        }
+
+        if ($user instanceof Agent) {
+            return $query->visibleToAgent($user);
+        }
+
+        return $query->where(function ($q) use ($user) {
+            $q->where('role', 'admin')
+                ->orWhere('user_uuid', $user->uuid);
+        });
     }
 
 //      public function sendEmail(Request $request): JsonResponse
@@ -266,14 +271,28 @@ class NotificationController extends Controller
         $isAdminTarget = in_array($toInput, ['admin', 'admins', 'all_admins', 'info@bcfplatform.com'])
             || !filter_var($data['to'], FILTER_VALIDATE_EMAIL);
 
-        if ($isAdminTarget) {
-            // 1. Resolve Order and Organization context
-            $order = null;
-            $orderUuid = $request->input('order_uuid') ?: $request->input('source_id');
-            if ($orderUuid) {
-                $order = Order::withoutGlobalScopes()->where('uuid', $orderUuid)->first();
-            }
+        $order = null;
+        $orderUuid = $request->input('order_uuid') ?: $request->input('source_id');
+        if ($orderUuid) {
+            $order = Order::withoutGlobalScopes()->where('uuid', $orderUuid)->first();
+        }
 
+        $orgId = $order?->organization_id;
+        if (!$orgId) {
+            $orgId = Auth::user()?->organization_id;
+        }
+        if (!$orgId && app()->bound('current_organization_id')) {
+            $orgId = app('current_organization_id');
+        }
+
+        $organization = null;
+        if ($orgId) {
+            $organization = is_numeric($orgId)
+                ? Organization::find($orgId)
+                : Organization::where('uuid', $orgId)->first();
+        }
+
+        if ($isAdminTarget) {
             // Fallback: extract Order ID from subject or HTML if not provided directly
             if (!$order) {
                 if (preg_match('/Order\s*#?([0-9]+)/i', $data['subject'] . ' ' . $data['html'], $matches)) {
@@ -281,21 +300,9 @@ class NotificationController extends Controller
                 }
             }
 
-            $orgId = $order?->organization_id;
-
-            // Fallback to auth user organization or current organization context
-            if (!$orgId) {
-                $authUser = Auth::user();
-                $orgId = $authUser?->organization_id;
-            }
-
-            if (!$orgId && app()->bound('current_organization_id')) {
-                $orgId = app('current_organization_id');
-            }
-
-            $organization = null;
-            if ($orgId) {
-                $organization = is_numeric($orgId) ? Organization::find($orgId) : Organization::where('uuid', $orgId)->first();
+            if ($order && !$organization) {
+                $orgId = $order->organization_id;
+                $organization = $order->organization;
             }
 
             // 2. Resolve all active admins for this organization
@@ -352,31 +359,20 @@ class NotificationController extends Controller
             $sentCount = 0;
             foreach ($adminEmails as $email) {
                 try {
-                    NotificationFacade::route('mail', $email)
-                        ->notify(new SystemNotification(
-                            $data['subject'],
-                            $data['html']
-                        ));
-                    $sentCount++;
-
-                    // Log to EmailLog
-                    try {
-                        EmailLog::withoutGlobalScopes()->create([
-                            'organization_id' => $orgId,
-                            'event_type' => 'admin_approval_required',
-                            'recipient_role' => 'admin',
-                            'to_email' => $email,
-                            'from_email' => $organization?->from_email ?: config('mail.from.address'),
-                            'subject' => $data['subject'],
-                            'status' => 'sent',
-                            'metadata' => [
-                                'order_id' => $order?->id,
-                                'order_uuid' => $order?->uuid,
-                                'trigger' => 'vendor_media_approval',
-                            ],
-                        ]);
-                    } catch (\Throwable $logEx) {
-                        Log::warning("Failed to log EmailLog for admin {$email}: " . $logEx->getMessage());
+                    $mailable = new \App\Mail\DynamicMailable(
+                        $data['html'],
+                        $data['subject'],
+                        $organization,
+                        'admin'
+                    );
+                    if (app(\App\Services\EmailDispatchService::class)->sendDirectMailable(
+                        $mailable,
+                        $email,
+                        'admin',
+                        $organization,
+                        'admin_approval_required'
+                    )) {
+                        $sentCount++;
                     }
                 } catch (\Throwable $mailEx) {
                     Log::error("Failed to send approval email to admin {$email}: " . $mailEx->getMessage());
@@ -390,12 +386,26 @@ class NotificationController extends Controller
             ]);
         }
 
-        // Standard single recipient send
-        NotificationFacade::route('mail', $data['to'])
-            ->notify(new SystemNotification(
-                $data['subject'],
-                $data['html']
-            ));
+        $mailable = new \App\Mail\DynamicMailable(
+            $data['html'],
+            $data['subject'],
+            $organization,
+            'custom'
+        );
+        $sent = app(\App\Services\EmailDispatchService::class)->sendDirectMailable(
+            $mailable,
+            $data['to'],
+            'custom',
+            $organization,
+            'custom_notification'
+        );
+
+        if (!$sent) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Email could not be sent',
+            ], 500);
+        }
 
         return response()->json([
             'status' => true,

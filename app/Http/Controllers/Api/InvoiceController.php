@@ -213,16 +213,12 @@ class InvoiceController extends Controller
             ]);
 
             if ($isAgent) {
-                if ($user->agent_type === 'co_agent') {
-                    $query->where('agent_id', $user->id);
-                } else {
-                    $query->where(function($q) use ($user) {
-                        $q->where('agent_id', $user->id)
-                          ->orWhereHas('order', function($oq) use ($user) {
-                              $oq->where('agent_id', $user->id);
-                          });
-                    });
-                }
+                $query->where(function($q) use ($user) {
+                    $q->where('agent_id', $user->id)
+                      ->orWhereHas('order', function($oq) use ($user) {
+                          $oq->where('agent_id', $user->id);
+                      });
+                });
             } elseif ($isSubAccount) {
                 if ($user->canViewAllAgentOrders()) {
                     $query->where(function($q) use ($user) {
@@ -1175,7 +1171,7 @@ class InvoiceController extends Controller
     {
         $user = Auth::user();
         if ($user instanceof Agent) {
-            // Agent can see their own invoices OR invoices for orders they own (primary agent)
+            // Agent can see their own invoices OR invoices for orders they own as primary agent
             $isOwner = $invoice->agent_id === $user->id;
             $isOrderOwner = $invoice->order && $invoice->order->agent_id === $user->id;
 

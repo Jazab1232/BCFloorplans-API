@@ -172,18 +172,6 @@ class StripeAgentWebhookController extends Controller
                 // Dispatch QuickBooks Sync
                 \App\Jobs\SyncInvoiceToQuickBooks::dispatch($invoiceRecord->id);
 
-                // Propagate payment status to all tied services natively to handle repeat orders
-                // We always do this check even if already paid to ensure consistency
-                $isFullyPaid = (float)$invoiceRecord->paid_amount >= (float)$invoiceRecord->total;
-                if ($isFullyPaid) {
-                    $invoiceRecord->load('items.orderService');
-                    foreach ($invoiceRecord->items as $item) {
-                        if ($item->orderService) {
-                            $item->orderService->update(['payment_status' => 'PAID']);
-                        }
-                    }
-                }
-                
                 // Cascading sync: If one invoice is paid, others might be covered
                 if ($invoiceRecord->order) {
                     \App\Models\Invoice::syncOrderStatus($invoiceRecord->order);
@@ -237,7 +225,12 @@ class StripeAgentWebhookController extends Controller
                         Log::warning(' Order not found when updating after payment', ['order_id' => $orderId]);
                         return;
                     }
-                    if ($order->paid_amount >= $order->amount ) {
+                    $isSplitOrder = (bool) $order->split_invoice && !empty($order->co_agents);
+                    $allOrderServicesPaid = fn () => !$order->services()
+                        ->where('payment_status', '!=', 'PAID')
+                        ->exists();
+
+                    if ($order->paid_amount >= $order->amount && (!$isSplitOrder || $allOrderServicesPaid())) {
                         Log::warning("Order {$order->id} already fully paid. Skipping amount update.");
                         if($order->payment_status !== 'PAID'){
                             $order->update(['payment_status' => 'PAID']);
@@ -268,7 +261,8 @@ class StripeAgentWebhookController extends Controller
                     ]);
 
                     // Check if order is now fully paid
-                    $isOrderFullyPaid = $newPaidAmount >= (float)$order->amount;
+                    $isOrderFullyPaid = $newPaidAmount >= (float)$order->amount
+                        && (!$isSplitOrder || $allOrderServicesPaid());
 
                     if ($isOrderFullyPaid && $order->payment_status !== 'PAID') {
                         $order->update(['payment_status' => 'PAID']);
@@ -287,12 +281,15 @@ class StripeAgentWebhookController extends Controller
                             $query->where('uuid', $serviceUuid);
                         }
 
-                        $updatedCount = $query->update(['payment_status' => 'PAID']);
+                        $orderService = $query->where('order_id', $order->id)->first();
+                        if ($orderService) {
+                            \App\Models\Invoice::syncOrderServicePaymentStatus($order, $orderService);
+                        }
 
-                        Log::info(' Specific order service marked as PAID', [
+                        Log::info(' Reconciled order service status against all agent invoices', [
                             'order_id' => $order->id,
                             'service_identifier' => $serviceUuid,
-                            'updated_rows' => $updatedCount,
+                            'payment_status' => $orderService?->fresh()->payment_status,
                         ]);
                     } 
                     // Handle Full Payment - only if actually fully paid or if specifically intended as full

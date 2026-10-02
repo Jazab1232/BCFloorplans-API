@@ -39,7 +39,7 @@ class BillingController extends Controller
 
         if (!$isAdmin) {
             if ($isAgent) {
-                $query->where('agent_id', $user->id);
+                $query->forAgent($user);
             } elseif ($isSubAccount) {
                 $canViewAll = $user->canViewAllAgentOrders();
                 if ($canViewAll) {
@@ -76,16 +76,39 @@ class BillingController extends Controller
             ]);
         }
 
-        $billingData = $orders->map(function ($order) {
-            $payments = AgentPayment::where('order_id', $order->id)
-                ->orderBy('paid_at', 'desc')
-                ->get();
+        $billingData = $orders->map(function ($order) use ($user, $isAgent) {
+            // Check if current user is a co-agent on this order
+            $isCoAgentOnOrder = $isAgent && ($order->agent_id !== $user->id);
+            $coAgentMultiplier = 1.0;
+
+            if ($isCoAgentOnOrder && $order->split_invoice) {
+                $coAgents = is_array($order->co_agents) ? $order->co_agents : json_decode($order->co_agents ?? '[]', true) ?? [];
+                $myInfo = collect($coAgents)->first(function($ca) use ($user) {
+                    return (isset($ca['agent_id']) && (string) $ca['agent_id'] === (string) $user->id)
+                        || ($ca['agent_uuid'] ?? $ca['uuid'] ?? null) === $user->uuid
+                        || strtolower($ca['email'] ?? '') === strtolower($user->email ?? '');
+                });
+                $percent = (float)($myInfo['percentage'] ?? $myInfo['split'] ?? 100);
+                if ($percent > 0 && $percent < 100) {
+                    $coAgentMultiplier = $percent / 100;
+                }
+            }
+
+            $paymentsQuery = AgentPayment::where('order_id', $order->id)->orderBy('paid_at', 'desc');
+            if ($isCoAgentOnOrder) {
+                $paymentsQuery->where('agent_id', $user->id);
+            }
+            $payments = $paymentsQuery->get();
 
             // Order-level total, paid, and refunds
-            $totalAmount = (float)$order->services->sum('amount');
+            $totalAmount = (float)($order->services->sum('amount') * $coAgentMultiplier);
             
             // Retrieve invoices to calculate tax rate and refund/cancellation status
-            $orderInvoices = \App\Models\Invoice::where('order_id', $order->id)->where('status', '!=', 'void')->get();
+            $invoicesQuery = \App\Models\Invoice::where('order_id', $order->id)->where('status', '!=', 'void');
+            if ($isCoAgentOnOrder) {
+                $invoicesQuery->where('agent_id', $user->id);
+            }
+            $orderInvoices = $invoicesQuery->get();
             if ($orderInvoices->isEmpty()) {
                 $orderInvoices = \App\Models\Invoice::where('order_id', $order->id)->get();
             }
@@ -112,7 +135,7 @@ class BillingController extends Controller
             }
 
             // Service-level data
-            $services = $order->services->map(function ($service) use ($payments, $orderStatus) {
+            $services = $order->services->map(function ($service) use ($payments, $orderStatus, $coAgentMultiplier) {
                 // Check if any payment covered this service
                 $relatedPayments = $payments->filter(function ($p) use ($service) {
                     return $p->order_service_id == $service->id;
@@ -125,7 +148,7 @@ class BillingController extends Controller
                     if (in_array($osStatus, ['paid', 'refunded', 'cancelled'])) {
                         $status = $osStatus;
                     } else {
-                        $isPaid = $relatedPayments->sum('amount') >= $service->amount;
+                        $isPaid = $relatedPayments->sum('amount') >= ($service->amount * $coAgentMultiplier);
                         $status = $isPaid ? 'paid' : 'unpaid';
                     }
                 }
@@ -134,7 +157,7 @@ class BillingController extends Controller
                     'service_id' => $service->service_id,
                     'order_service_uuid' => $service->uuid ?? null,
                     'service_name' => $service->service->name ?? 'Unknown',
-                    'amount' => (float) $service->amount,
+                    'amount' => (float) ($service->amount * $coAgentMultiplier),
                     'status' => $status,
                     'media_access' => $service->media_access,
                     'related_invoices' => $relatedPayments->map(fn($p) => [

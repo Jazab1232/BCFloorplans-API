@@ -52,6 +52,7 @@ class Agent extends Authenticatable
         'notification_email',
         'agent_type',
         'parent_agent_id',
+        'linked_agent_uuids',
     ];
 
     protected $hidden = [
@@ -74,6 +75,7 @@ class Agent extends Authenticatable
         'google_token_expires_at' => 'datetime',
         'sync_google_calendar' => 'boolean',
         'notification_email' => 'boolean',
+        'linked_agent_uuids' => 'array',
     ];
 
     protected $appends = ['avatar_url', 'company_logo_url', 'company_banner_url', 'company_logos_urls', 'logo_url', 'banner_url'];
@@ -201,6 +203,80 @@ class Agent extends Authenticatable
     public function isCoAgent(): bool
     {
         return $this->agent_type === 'co_agent';
+    }
+
+    /**
+     * Link another agent as a co-agent/partner bidirectionally.
+     */
+    public function linkCoAgent(Agent $targetAgent): void
+    {
+        if ($this->id === $targetAgent->id) {
+            return;
+        }
+
+        // Link on this agent
+        $currentLinked = is_array($this->linked_agent_uuids) ? $this->linked_agent_uuids : [];
+        if (!in_array($targetAgent->uuid, $currentLinked, true)) {
+            $currentLinked[] = $targetAgent->uuid;
+            $this->update(['linked_agent_uuids' => array_values(array_unique($currentLinked))]);
+        }
+
+        // Link on target agent (bidirectional)
+        $targetLinked = is_array($targetAgent->linked_agent_uuids) ? $targetAgent->linked_agent_uuids : [];
+        if (!in_array($this->uuid, $targetLinked, true)) {
+            $targetLinked[] = $this->uuid;
+            $targetAgent->update(['linked_agent_uuids' => array_values(array_unique($targetLinked))]);
+        }
+    }
+
+    /**
+     * Unlink a co-agent partnership bidirectionally.
+     */
+    public function unlinkCoAgent(Agent $targetAgent): void
+    {
+        // Unlink on this agent
+        $currentLinked = is_array($this->linked_agent_uuids) ? $this->linked_agent_uuids : [];
+        if (in_array($targetAgent->uuid, $currentLinked, true)) {
+            $currentLinked = array_filter($currentLinked, fn($u) => $u !== $targetAgent->uuid);
+            $this->update(['linked_agent_uuids' => array_values($currentLinked)]);
+        }
+
+        // Unlink on target agent (bidirectional)
+        $targetLinked = is_array($targetAgent->linked_agent_uuids) ? $targetAgent->linked_agent_uuids : [];
+        if (in_array($this->uuid, $targetLinked, true)) {
+            $targetLinked = array_filter($targetLinked, fn($u) => $u !== $this->uuid);
+            $targetAgent->update(['linked_agent_uuids' => array_values($targetLinked)]);
+        }
+
+        // If parent_agent_id was linking them, clear that as well
+        if ($targetAgent->parent_agent_id === $this->id) {
+            $targetAgent->update(['parent_agent_id' => null]);
+        }
+        if ($this->parent_agent_id === $targetAgent->id) {
+            $this->update(['parent_agent_id' => null]);
+        }
+    }
+
+    /**
+     * Get all linked co-agents for this agent (bidirectional).
+     */
+    public function getLinkedAgents()
+    {
+        $linkedUuids = is_array($this->linked_agent_uuids) ? $this->linked_agent_uuids : [];
+        $currentUuid = $this->uuid;
+        $currentId = $this->id;
+
+        return Agent::where('id', '!=', $currentId)
+            ->where(function ($q) use ($linkedUuids, $currentUuid, $currentId) {
+                if (!empty($linkedUuids)) {
+                    $q->whereIn('uuid', $linkedUuids);
+                }
+                $q->orWhere('parent_agent_id', $currentId)
+                  ->orWhere('id', $this->parent_agent_id ?? 0)
+                  ->orWhereJsonContains('linked_agent_uuids', $currentUuid)
+                  ->orWhere('linked_agent_uuids', 'like', '%' . $currentUuid . '%');
+            })
+            ->get();
     }
 
     /**

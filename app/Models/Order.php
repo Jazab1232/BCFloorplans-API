@@ -88,6 +88,34 @@ class Order extends Model
         return $this->hasMany(OrderTotal::class);
     }
 
+    public function scopeForAgent($query, Agent $agent)
+    {
+        $email = strtolower(trim((string) $agent->email));
+
+        return $query->where(function ($query) use ($agent, $email) {
+            $query->where('agent_id', $agent->id)
+                ->orWhereJsonContains('co_agents', ['agent_id' => $agent->id])
+                ->orWhere('co_agents', 'like', '%"agent_id":' . (int) $agent->id . ',%')
+                ->orWhere('co_agents', 'like', '%"agent_id":' . (int) $agent->id . '}%');
+
+            if ($agent->uuid) {
+                $query->orWhereJsonContains('co_agents', ['agent_uuid' => $agent->uuid])
+                    ->orWhereJsonContains('co_agents', ['uuid' => $agent->uuid])
+                    ->orWhere('co_agents', 'like', '%"agent_uuid":"' . $agent->uuid . '"%')
+                    ->orWhere('co_agents', 'like', '%"uuid":"' . $agent->uuid . '"%')
+                    ->orWhere('co_agents', 'like', '%"' . $agent->uuid . '"%');
+            }
+
+            if ($email !== '') {
+                $query->orWhereJsonContains('co_agents', ['email' => $email])
+                    ->orWhereJsonContains('co_agents', $email)
+                    ->orWhere('co_agents', 'like', '%"email":"' . $email . '"%')
+                    ->orWhere('co_agents', 'like', '%"' . $email . '"%')
+                    ->orWhere('co_agents', 'like', '%' . $email . '%');
+            }
+        });
+    }
+
     public function areas(): HasMany
     {
         return $this->hasMany(OrderArea::class);

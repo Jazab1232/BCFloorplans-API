@@ -139,10 +139,11 @@ class CheckMatterportExpirations extends Command
                 $alreadySent = EmailLog::where('event_type', 'matterport_expiry_reminder')
                     ->where('subject', 'like', "%{$link->id}%")
                     ->whereDate('created_at', $today)
+                    ->where('status', '!=', 'failed')
                     ->exists();
 
                 if (!$alreadySent) {
-                    $emailDispatcher->dispatch('matterport_expiry_reminder', $tour, [
+                    $sent = $emailDispatcher->dispatch('matterport_expiry_reminder', $tour, [
                         'data' => [
                             'propertyAddress' => $propertyAddress,
                             'expiryDate' => $expiryDate->format('M d, Y'),
@@ -153,8 +154,10 @@ class CheckMatterportExpirations extends Command
                         ],
                     ]);
 
-                    $processedReminders++;
-                    $this->info("Sent {$daysRemaining}-day reminder for Tour Link #{$link->id} ({$propertyAddress})");
+                    if ($sent) {
+                        $processedReminders++;
+                        $this->info("Sent {$daysRemaining}-day reminder for Tour Link #{$link->id} ({$propertyAddress})");
+                    }
                 }
             }
 
@@ -212,10 +215,11 @@ class CheckMatterportExpirations extends Command
                 $alreadySentExpired = EmailLog::where('event_type', 'matterport_expired')
                     ->where('subject', 'like', "%{$link->id}%")
                     ->whereDate('created_at', $today)
+                    ->where('status', '!=', 'failed')
                     ->exists();
 
                 if (!$alreadySentExpired) {
-                    $emailDispatcher->dispatch('matterport_expired', $tour, [
+                    $sent = $emailDispatcher->dispatch('matterport_expired', $tour, [
                         'data' => [
                             'propertyAddress' => $propertyAddress,
                             'expiryDate' => $expiryDate->format('M d, Y'),
@@ -225,8 +229,10 @@ class CheckMatterportExpirations extends Command
                         ],
                     ]);
 
-                    $processedExpirations++;
-                    $this->info("Sent expiration notice for Tour Link #{$link->id} ({$propertyAddress})");
+                    if ($sent) {
+                        $processedExpirations++;
+                        $this->info("Sent expiration notice for Tour Link #{$link->id} ({$propertyAddress})");
+                    }
                 }
             }
         }

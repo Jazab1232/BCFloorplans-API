@@ -66,7 +66,7 @@ class OrderController extends Controller
             // Check if user is an agent
             else if ($user instanceof \App\Models\Agent) {
                 $agent = Agent::where('uuid', $user->uuid)->firstOrFail();
-                
+
                 $orders = Order::with([
                     'agent', 
                     'property',
@@ -77,18 +77,13 @@ class OrderController extends Controller
                     'services', 
                     'services.option', 
                     'logs'
-                ])->where(function($q) use ($agent) {
-                    $q->where('agent_id', $agent->id)
-                      ->orWhereJsonContains('co_agents', ['email' => $agent->email])
-                      ->orWhereJsonContains('co_agents', $agent->email)
-                      ->orWhere('co_agents', 'like', '%' . $agent->email . '%');
-                });
+                ])->forAgent($agent);
             } 
             // Check if user is a sub-account (co-agent or assistant)
             else if ($user instanceof \App\Models\SubAccount) {
                 $user->loadMissing(['role']);
                 $email = strtolower(trim($user->primary_email));
-                $uuid = $user->uuid;
+                $uuid = (string)$user->uuid;
                 $canViewAll = $user->canViewAllAgentOrders();
 
                 $orders = Order::with([
@@ -102,11 +97,7 @@ class OrderController extends Controller
                     'services.option', 
                     'logs'
                 ])->where(function($q) use ($user, $email, $uuid, $canViewAll) {
-                    $q->whereJsonContains('co_agents', ['agent_uuid' => $uuid])
-                      ->orWhereJsonContains('co_agents', ['uuid' => $uuid])
-                      ->orWhere('co_agents', 'like', '%' . $uuid . '%')
-                      ->orWhereJsonContains('co_agents', ['email' => $email])
-                      ->orWhereJsonContains('co_agents', $email)
+                    $q->where('co_agents', 'like', '%' . $uuid . '%')
                       ->orWhere('co_agents', 'like', '%' . $email . '%');
 
                     if ($canViewAll && !empty($user->agent_id)) {
@@ -182,6 +173,9 @@ class OrderController extends Controller
 
     public function store(Request $request): JsonResponse
     {
+        @ini_set('max_execution_time', '300');
+        @set_time_limit(300);
+
         if ($request->has('lock_materials')) {
             $lockVal = $request->input('lock_materials');
             if ($lockVal === 'true' || $lockVal === '1') {
@@ -217,6 +211,9 @@ class OrderController extends Controller
             'co_agents.*.email' => 'required_with:co_agents|email',
             'co_agents.*.number' => 'nullable',
             'co_agents.*.percentage' => 'nullable|numeric',
+            'co_agents.*.split' => 'nullable|numeric',
+            'co_agents.*.agent_id' => 'nullable',
+            'co_agents.*.agent_uuid' => 'nullable',
             'split_invoice' => 'nullable|boolean',
             'release_media_before_payment' => 'nullable|boolean',
             'notes' => 'nullable|array',
@@ -679,36 +676,40 @@ class OrderController extends Controller
                 // Non-blocking for the order creation response
             }
 
-        // Send email notifications after successful order creation
-        try {
-            $order->load(['agent', 'services.service', 'services.option', 'slots.service', 'slots.vendor']);
-            
-            // 1. Dispatch order created event (sent to admin, agent)
-            app(\App\Services\EmailDispatchService::class)->dispatch('order_created', $order);
+        // Send email notifications after response is sent (terminating lifecycle) to prevent request timeouts
+        app()->terminating(function () use ($order) {
+            @ini_set('max_execution_time', '300');
+            @set_time_limit(300);
+            try {
+                $order->load(['agent', 'services.service', 'services.option', 'slots.service', 'slots.vendor']);
 
-            // 2. Dispatch slot booked event for each slot assigned to a vendor
-            if ($order->slots && $order->slots->isNotEmpty()) {
-                foreach ($order->slots as $slot) {
-                    if ($slot->vendor_id) {
-                        app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot);
+                // 1. Dispatch order created event (sent to admin, agent, co-agent)
+                app(\App\Services\EmailDispatchService::class)->dispatch('order_created', $order);
+
+                // 2. Dispatch slot booked event for each slot assigned to a vendor
+                if ($order->slots && $order->slots->isNotEmpty()) {
+                    foreach ($order->slots as $slot) {
+                        if ($slot->vendor_id) {
+                            app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot);
+                        }
                     }
                 }
+            } catch (\Throwable $e) {
+                // Log email errors but don't fail the order creation
+                Log::error('Failed to send order creation emails via dispatch service', [
+                    'order_id' => $order->id,
+                    'error' => $e->getMessage(),
+                    'trace' => $e->getTraceAsString(),
+                ]);
             }
-        } catch (\Exception $e) {
-            // Log email errors but don't fail the order creation
-            Log::error('Failed to send order creation emails via dispatch service', [
-                'order_id' => $order->id,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-            ]);
-        }
+        });
 
-        // ✅ Immediate Google Calendar sync (only if slots exist)
+        // ✅ Google Calendar sync (only if slots exist)
         if (!empty($request->slots)) {
             try {
-                SyncOrderCalendarEvents::dispatchSync($order->id);
+                SyncOrderCalendarEvents::dispatch($order->id);
             } catch (\Throwable $e) {
-                Log::error('Failed to execute SyncOrderCalendarEvents job', [
+                Log::error('Failed to dispatch SyncOrderCalendarEvents job', [
                     'order_id' => $order->id,
                     'error' => $e->getMessage(),
                     'trace' => $e->getTraceAsString(),
@@ -722,7 +723,9 @@ class OrderController extends Controller
             'message' => 'Order created successfully',
         ]);
         } catch (\Throwable $e) {
-            DB::rollBack();
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
             Log::error('Order creation failed', [
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
@@ -1212,11 +1215,11 @@ class OrderController extends Controller
             }
         }
 
-        // ✅ Immediate Google Calendar sync
+        // ✅ Google Calendar sync
         try {
-            SyncOrderCalendarEvents::dispatchSync($order->id, $deletedSlotIds);
+            SyncOrderCalendarEvents::dispatch($order->id, $deletedSlotIds);
         } catch (\Throwable $e) {
-            Log::error('Failed to execute SyncOrderCalendarEvents job', [
+            Log::error('Failed to dispatch SyncOrderCalendarEvents job', [
                 'order_id' => $order->id,
                 'deleted_slots' => $deletedSlotIds,
                 'error' => $e->getMessage(),

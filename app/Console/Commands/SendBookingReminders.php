@@ -126,7 +126,14 @@ class SendBookingReminders extends Command
 
                     try {
                         // Dispatch reminders via unified EmailDispatchService
-                        app(\App\Services\EmailDispatchService::class)->dispatch('booking_reminder', $slot);
+                        $sent = app(\App\Services\EmailDispatchService::class)->dispatch('booking_reminder', $slot);
+                        if (!$sent) {
+                            Log::warning('Booking reminder was not sent; leaving it eligible for retry', [
+                                'slot_id' => $slot->id,
+                                'milestone' => $type,
+                            ]);
+                            continue;
+                        }
 
                         DB::table('booking_reminders')->insert([
                             'order_slot_id' => $slot->id,

@@ -115,6 +115,34 @@ class GlobalSettingsApiTest extends TestCase
     }
 
     /**
+     * Test saving tour_settings with always_enable_sorting
+     */
+    public function test_super_admin_can_save_tour_settings_with_always_enable_sorting()
+    {
+        $payload = [
+            'value' => [
+                'music_enabled' => true,
+                'default_song' => 'tell-me-what',
+                'transition_effect' => ['kenburns'],
+                'layout_option' => 'standard',
+                'video_slideshow_enabled' => true,
+                'letterbox_correction' => true,
+                'aspect_ratio' => '16:9',
+                'autoplay_enabled' => true,
+                'allow_print_download' => true,
+                'allow_client_upload' => true,
+                'always_enable_sorting' => true,
+            ]
+        ];
+
+        $response = $this->actingAs($this->superAdmin, 'api')
+            ->postJson('/api/settings/tour_settings', $payload);
+
+        $response->assertStatus(200)
+            ->assertJsonPath('setting.value.always_enable_sorting', true);
+    }
+
+    /**
      * Test saving global portal settings via POST /global-settings
      */
     public function test_super_admin_can_save_global_portal_settings()

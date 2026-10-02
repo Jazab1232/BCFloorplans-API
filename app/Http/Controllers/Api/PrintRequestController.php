@@ -102,6 +102,9 @@ class PrintRequestController extends Controller
                     $order = $featureSheet->order;
                     $agent = $order?->agent ?? \App\Models\Agent::where('uuid', $printRequest->agent_id)->first();
                     $orgId = $order?->organization_id ?? $agent?->organization_id ?? $printRequest->organization_id;
+                    $organization = $orgId
+                        ? \App\Models\Organization::find($orgId)
+                        : null;
 
                     // Query admins belonging to this organization
                     $adminQuery = \App\Models\User::whereHas('roles', function ($query) {
@@ -141,8 +144,19 @@ class PrintRequestController extends Controller
                         // 2. Email notification
                         if ($adminUser->notification_email && !empty($adminUser->email)) {
                             try {
-                                \Illuminate\Support\Facades\Mail::to($adminUser->email)
-                                    ->send(new \App\Mail\PrintRequestReady($printRequest, $featureSheet, $order, $adminUser->first_name ?: 'Admin'));
+                                $mailable = new \App\Mail\PrintRequestReady(
+                                    $printRequest,
+                                    $featureSheet,
+                                    $order,
+                                    $adminUser->first_name ?: 'Admin'
+                                );
+                                app(\App\Services\EmailDispatchService::class)->sendDirectMailable(
+                                    $mailable,
+                                    $adminUser->email,
+                                    'admin',
+                                    $organization,
+                                    'print_request_ready'
+                                );
                             } catch (\Throwable $mailEx) {
                                 \Illuminate\Support\Facades\Log::warning("Failed sending print ready email to {$adminUser->email}: " . $mailEx->getMessage());
                             }

@@ -11,7 +11,6 @@ use Illuminate\Support\Str;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Validation\ValidationException;
-use App\Notifications\PasswordUpdatedNotification;
 use Illuminate\Support\Facades\Hash;
 use App\Models\Organization;
 
@@ -347,8 +346,29 @@ class UserController extends Controller
             $user->password = Hash::make($newPassword);
             $user->save();
 
-            // Send notification with plain text password
-            $user->notify(new PasswordUpdatedNotification($newPassword));
+            $content = '<p>Your password has been updated.</p><p>Your new password is: <strong>'
+                . e($newPassword)
+                . '</strong></p>';
+            $mailable = new \App\Mail\DynamicMailable(
+                $content,
+                'Password Updated for BCFP Software',
+                $user->organization,
+                'admin'
+            );
+            $sent = app(\App\Services\EmailDispatchService::class)->sendDirectMailable(
+                $mailable,
+                $user->email,
+                'admin',
+                $user->organization,
+                'password_updated'
+            );
+
+            if (!$sent) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Password updated but notification email could not be sent',
+                ], 500);
+            }
 
             return response()->json([
                 'status' => true,

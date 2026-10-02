@@ -110,8 +110,8 @@ class Invoice extends Model
             if ($invoice->status === 'paid' && ($invoice->wasRecentlyCreated || $invoice->isDirty('status'))) {
                 $invoice->loadMissing('items.orderService');
                 foreach ($invoice->items as $item) {
-                    if ($item->orderService && $item->orderService->payment_status !== 'PAID') {
-                        $item->orderService->update(['payment_status' => 'PAID']);
+                    if ($item->orderService && !$item->is_extra && $invoice->order) {
+                        static::syncOrderServicePaymentStatus($invoice->order, $item->orderService);
                     }
                 }
             }
@@ -202,36 +202,38 @@ class Invoice extends Model
         foreach ($coAgents as $ca) {
             $percent = (float)($ca['percentage'] ?? 0);
             if ($percent > 0) {
-                $splits[] = ['name' => $ca['name'], 'email' => $ca['email'], 'percentage' => $percent, 'type' => 'co-agent'];
+                $splits[] = [
+                    'name' => $ca['name'] ?? 'Co-Agent',
+                    'email' => $ca['email'] ?? '',
+                    'percentage' => $percent,
+                    'type' => 'co-agent',
+                    'agent_id' => $ca['agent_id'] ?? null,
+                    'agent_uuid' => $ca['agent_uuid'] ?? null,
+                ];
                 $totalCoPercent += $percent;
             }
         }
         $primaryPercent = max(0, 100 - $totalCoPercent);
-        $splits[] = ['name' => "{$agent->first_name} {$agent->last_name}", 'email' => $agent->email, 'percentage' => $primaryPercent, 'type' => 'primary'];
+        $splits[] = ['name' => "{$agent->first_name} {$agent->last_name}", 'email' => $agent->email, 'percentage' => $primaryPercent, 'type' => 'primary', 'agent_id' => $agent->id];
 
         $resolvedSplits = [];
         foreach ($splits as $split) {
             $targetAgentId = $agent->id;
             if ($split['type'] === 'co-agent' && !empty($split['email'])) {
-                $coAgent = Agent::where('email', $split['email'])->first();
-                if (!$coAgent) {
-                    $roleId = \App\Models\Role::whereRaw('LOWER(name) LIKE ?', ['agent%'])->value('id');
-                    $nameParts = explode(' ', $split['name'] ?? 'Co Agent', 2);
-                    $coAgent = Agent::create([
-                        'uuid' => (string) \Illuminate\Support\Str::uuid(),
-                        'organization_id' => $agent->organization_id,
-                        'first_name' => $nameParts[0],
-                        'last_name' => $nameParts[1] ?? '',
-                        'email' => $split['email'],
-                        'password' => bcrypt(\Illuminate\Support\Str::random(16)),
-                        'role_id' => $roleId,
-                        'status' => true,
-                        'requires_payment' => true,
-                        'payment_status' => 'GOOD',
-                        'company_name' => $agent->company_name, // Sync with primary agent's company/org
-                    ]);
+                if (!empty($split['agent_id'])) {
+                    $targetAgentId = $split['agent_id'];
+                } else {
+                    $coAgent = app(\App\Services\CoAgentService::class)->resolveOrCreateCoAgent(
+                        $split['email'],
+                        $split['name'] ?? 'Co-Agent',
+                        null,
+                        $agent,
+                        $order->property->address ?? null,
+                        array_filter(['agent_uuid' => $split['agent_uuid'] ?? null]),
+                        false // Never send listing linked notification during invoice split generation
+                    );
+                    $targetAgentId = $coAgent->id;
                 }
-                $targetAgentId = $coAgent->id;
             }
             $resolvedSplits[] = array_merge($split, ['agent_id' => $targetAgentId]);
         }
@@ -500,10 +502,26 @@ class Invoice extends Model
              $paidSubtotal = 0;
              $allPaid = true;
              $hasItems = false;
+             $paidServiceIdsForAgent = collect();
+
+             if (!empty($invoice->split_details['splits'])) {
+                 $paidServiceIdsForAgent = InvoiceItem::where('is_extra', false)
+                     ->whereNotNull('order_service_id')
+                     ->whereHas('invoice', function ($query) use ($invoice) {
+                         $query->where('order_id', $invoice->order_id)
+                             ->where('agent_id', $invoice->agent_id)
+                             ->where('status', 'paid');
+                     })
+                     ->pluck('order_service_id');
+             }
  
              foreach ($invoice->items as $item) {
                  $hasItems = true;
-                 if ($item->orderService && $item->orderService->payment_status === 'PAID') {
+                 $servicePaidForInvoiceOwner = !empty($invoice->split_details['splits'])
+                     ? ($item->order_service_id && $paidServiceIdsForAgent->contains($item->order_service_id))
+                     : ($item->orderService && $item->orderService->payment_status === 'PAID');
+
+                 if ($servicePaidForInvoiceOwner) {
                      $paidSubtotal += (float)$item->amount;
                  } else {
                      $allPaid = false;
@@ -559,6 +577,48 @@ class Invoice extends Model
              $invoice->update($updateData);
          }
      }
+
+    /**
+     * Mark a shared order service paid only after each billed agent's share is paid.
+     */
+    public static function syncOrderServicePaymentStatus(Order $order, OrderService $orderService): void
+    {
+        \Illuminate\Support\Facades\DB::transaction(function () use ($order, $orderService): void {
+            $orderService = OrderService::whereKey($orderService->id)->lockForUpdate()->first();
+            if (!$orderService || $orderService->payment_status === 'REFUNDED') {
+                return;
+            }
+
+            $serviceInvoices = static::where('order_id', $order->id)
+                ->whereNotIn('status', ['void', 'refunded'])
+                ->whereHas('items', function ($query) use ($orderService) {
+                    $query->where('order_service_id', $orderService->id)
+                        ->where('is_extra', false);
+                })
+                ->get();
+
+            $agentIds = $serviceInvoices->pluck('agent_id')->filter()->unique();
+            if ($agentIds->isEmpty()) {
+                return;
+            }
+
+            $allAgentSharesPaid = $agentIds->every(function ($agentId) use ($order, $orderService) {
+                return static::where('order_id', $order->id)
+                    ->where('agent_id', $agentId)
+                    ->where('status', 'paid')
+                    ->whereHas('items', function ($query) use ($orderService) {
+                        $query->where('order_service_id', $orderService->id)
+                            ->where('is_extra', false);
+                    })
+                    ->exists();
+            });
+
+            $paymentStatus = $allAgentSharesPaid ? 'PAID' : 'UNPAID';
+            if ($orderService->payment_status !== $paymentStatus) {
+                $orderService->update(['payment_status' => $paymentStatus]);
+            }
+        });
+    }
 
     /**
      * Check if an OrderService uses a per-square-foot rate option (not range).

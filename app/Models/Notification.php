@@ -64,6 +64,47 @@ class Notification extends Model
         return $this->belongsTo(Order::class, 'source_id', 'uuid');
     }
 
+    public function property()
+    {
+        return $this->belongsTo(Property::class, 'source_id', 'uuid');
+    }
+
+    public function scopeVisibleToAgent($query, Agent $agent)
+    {
+        $isPostgres = \Illuminate\Support\Facades\DB::connection()->getDriverName() === 'pgsql';
+        $sharedOrderUuids = Order::forAgent($agent);
+        $sharedPropertyUuids = Property::forAgent($agent);
+        $sharedOrderUuidTexts = Order::forAgent($agent);
+        $sharedPropertyUuidTexts = Property::forAgent($agent);
+
+        if ($isPostgres) {
+            $sharedOrderUuids->select('orders.uuid');
+            $sharedPropertyUuids->select('properties.uuid');
+            $sharedOrderUuidTexts->selectRaw('orders.uuid::text');
+            $sharedPropertyUuidTexts->selectRaw('properties.uuid::text');
+        } else {
+            $sharedOrderUuids->select('orders.uuid');
+            $sharedPropertyUuids->select('properties.uuid');
+            $sharedOrderUuidTexts->select('orders.uuid');
+            $sharedPropertyUuidTexts->select('properties.uuid');
+        }
+
+        return $query->withoutGlobalScope('organization')
+            ->where(function ($query) use ($agent, $sharedOrderUuids, $sharedPropertyUuids, $sharedOrderUuidTexts, $sharedPropertyUuidTexts) {
+            $query->where('agent_uuid', $agent->uuid)
+                ->orWhere('user_uuid', $agent->uuid)
+                ->orWhere(function ($shared) use ($sharedOrderUuids, $sharedPropertyUuids, $sharedOrderUuidTexts, $sharedPropertyUuidTexts) {
+                    $shared->where('role', 'agent')
+                        ->where(function ($source) use ($sharedOrderUuids, $sharedPropertyUuids, $sharedOrderUuidTexts, $sharedPropertyUuidTexts) {
+                            $source->whereIn('source_id', $sharedOrderUuids)
+                                ->orWhereIn('meta_data->order_uuid', $sharedOrderUuidTexts)
+                                ->orWhereIn('source_id', $sharedPropertyUuids)
+                                ->orWhereIn('meta_data->property_uuid', $sharedPropertyUuidTexts);
+                        });
+                });
+            });
+    }
+
 }
 
 

@@ -31,6 +31,8 @@ return [
 
     'resend' => [
         'key' => env('RESEND_KEY'),
+        'from_address' => env('RESEND_FROM_ADDRESS', 'noreply@tujoco.com'),
+        'from_name' => env('RESEND_FROM_NAME', 'Tojuco Solutions'),
     ],
 
     'slack' => [

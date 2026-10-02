@@ -31,9 +31,10 @@ return new class extends Migration
         });
 
         // Step 2: update existing rows with UUIDs
-        \App\Models\User::whereNull('uuid')->get()->each(function ($user) {
-            $user->uuid = Str::uuid();
-            $user->save();
+        \Illuminate\Support\Facades\DB::table('users')->whereNull('uuid')->get()->each(function ($user) {
+            \Illuminate\Support\Facades\DB::table('users')->where('id', $user->id)->update([
+                'uuid' => (string) Str::uuid(),
+            ]);
         });
 
         // Step 3: make UUID column NOT NULL
