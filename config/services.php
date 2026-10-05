@@ -30,8 +30,8 @@ return [
     ],
 
     'resend' => [
-        'key' => env('RESEND_KEY'),
-        'from_address' => env('RESEND_FROM_ADDRESS', 'noreply@tujoco.com'),
+        'key' => env('RESEND_API_KEY', env('RESEND_KEY')),
+        'from_address' => env('RESEND_FROM_ADDRESS', 'noreply@tojuco.com'),
         'from_name' => env('RESEND_FROM_NAME', 'Tojuco Solutions'),
     ],
 

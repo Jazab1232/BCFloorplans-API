@@ -5,7 +5,7 @@
 @section('content')
 @php
     $org     = $organization ?? null;
-    $orgName = ($org && $org->is_whitelabel) ? $org->name : 'Tojuco';
+    $orgName = $org?->name ?: 'Tojuco';
     $primaryColor = ($org && $org->primary_color) ? $org->primary_color : '#2563EB';
 @endphp
 

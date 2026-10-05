@@ -35,7 +35,7 @@ class EmailDispatchService
 
         $org = $this->resolveOrganization($model);
         $recipients = $this->resolveRecipients($eventType, $model, $org, $options);
-        
+
         Log::info("EmailDispatchService: Found " . count($recipients) . " potential recipients");
 
         $dispatchedCount = 0;
@@ -45,28 +45,28 @@ class EmailDispatchService
                 Log::info("EmailDispatchService: Skipping email to {$recipient['email']} (role: {$recipient['role']}) - preference disabled");
                 continue;
             }
-            
+
             // Pre-seed options data so buildRoleData can access token/user_type (critical for password_reset URL builder)
             $preSeededData = [];
             if (!empty($options['data'])) {
                 $preSeededData = $options['data'];
             }
-            
+
             // Build role-specific data (filter sensitive info by role)
             $data = $this->buildRoleData($eventType, $model, $recipient, $org, $preSeededData);
-            
+
             // Merge options data again so any further overrides take effect (buildRoleData computed values win for known keys)
             if (!empty($options['data'])) {
                 $data = array_merge($options['data'], $data);
             }
-            
+
             try {
                 // Resolve template: org DB override → default Blade
                 $mailable = $this->buildMailable($eventType, $org, $recipient, $data);
-                
+
                 // Set whitelabel-aware from address
                 $mailable = $this->setFromAddress($mailable, $org);
-                
+
                 // Send & log
                 if ($this->sendAndLog($mailable, $recipient, $org, $eventType)) {
                     $dispatchedCount++;
@@ -102,15 +102,18 @@ class EmailDispatchService
         }
 
         if ($model instanceof \App\Models\OrderSlot) {
-            return $model->order ? $this->resolveOrganization($model->order) : null;
+            $order = $model->order ?: ($model->order_id ? \App\Models\Order::withoutGlobalScopes()->find($model->order_id) : null);
+            return $order ? $this->resolveOrganization($order) : null;
         }
 
         if ($model instanceof \App\Models\OrderService) {
-            return $model->order ? $this->resolveOrganization($model->order) : null;
+            $order = $model->order ?: ($model->order_id ? \App\Models\Order::withoutGlobalScopes()->find($model->order_id) : null);
+            return $order ? $this->resolveOrganization($order) : null;
         }
 
         if ($model instanceof \App\Models\Tour) {
-            return $model->orders ? $this->resolveOrganization($model->orders) : null;
+            $order = $model->orders ?: ($model->order ?: ($model->order_id ? \App\Models\Order::withoutGlobalScopes()->find($model->order_id) : null));
+            return $order ? $this->resolveOrganization($order) : null;
         }
 
         if ($model instanceof \App\Models\TourLink) {
@@ -120,15 +123,18 @@ class EmailDispatchService
         if ($model instanceof \App\Models\AgentPayment) {
             if ($model->order) {
                 $org = $this->resolveOrganization($model->order);
-                if ($org) return $org;
+                if ($org)
+                    return $org;
             }
             if ($model->invoice) {
                 $org = $this->resolveOrganization($model->invoice);
-                if ($org) return $org;
+                if ($org)
+                    return $org;
             }
             if ($model->agent) {
                 $org = $this->resolveOrganization($model->agent);
-                if ($org) return $org;
+                if ($org)
+                    return $org;
             }
         }
 
@@ -138,11 +144,13 @@ class EmailDispatchService
             }
             if ($model->order) {
                 $org = $this->resolveOrganization($model->order);
-                if ($org) return $org;
+                if ($org)
+                    return $org;
             }
             if ($model->agent) {
                 $org = $this->resolveOrganization($model->agent);
-                if ($org) return $org;
+                if ($org)
+                    return $org;
             }
         }
 
@@ -233,9 +241,9 @@ class EmailDispatchService
                 // Fetch active users belonging strictly to this organization (excluding platform super admins)
                 $users = \App\Models\User::withoutGlobalScopes()
                     ->where('organization_id', $org->id)
-                    ->where(function($q) {
+                    ->where(function ($q) {
                         $q->where('account_closed', false)
-                          ->orWhereNull('account_closed');
+                            ->orWhereNull('account_closed');
                     })
                     ->get();
 
@@ -259,7 +267,8 @@ class EmailDispatchService
                     $settingsService = app(SettingsService::class);
                     $portalSettings = $settingsService->get($org->uuid, 'portal_settings');
                     $adminEmail = $portalSettings['notification_email'] ?? null;
-                } catch (\Throwable $e) {}
+                } catch (\Throwable $e) {
+                }
 
                 if (!$adminEmail) {
                     $adminEmail = $org->contact_email;
@@ -361,15 +370,15 @@ class EmailDispatchService
                 $role = 'admin';
                 $recipients[] = [
                     'email' => $model->email,
-                    'name'  => trim(($model->first_name ?? $model->name ?? '') . ' ' . ($model->last_name ?? '')),
-                    'role'  => $role,
+                    'name' => trim(($model->first_name ?? $model->name ?? '') . ' ' . ($model->last_name ?? '')),
+                    'role' => $role,
                     'model' => $model,
                 ];
             } elseif ($model instanceof \App\Models\Agent) {
                 $recipients[] = [
                     'email' => $model->email,
-                    'name'  => trim($model->first_name . ' ' . $model->last_name),
-                    'role'  => 'agent',
+                    'name' => trim($model->first_name . ' ' . $model->last_name),
+                    'role' => 'agent',
                     'model' => $model,
                 ];
             } elseif ($model instanceof \App\Models\SubAccount) {
@@ -377,8 +386,8 @@ class EmailDispatchService
                 if ($email) {
                     $recipients[] = [
                         'email' => $email,
-                        'name'  => trim($model->first_name . ' ' . $model->last_name),
-                        'role'  => 'agent',
+                        'name' => trim($model->first_name . ' ' . $model->last_name),
+                        'role' => 'agent',
                         'model' => $model,
                     ];
                 }
@@ -387,8 +396,8 @@ class EmailDispatchService
                 foreach ($vendorEmails as $vEmail) {
                     $recipients[] = [
                         'email' => $vEmail,
-                        'name'  => trim($model->first_name . ' ' . $model->last_name),
-                        'role'  => 'vendor',
+                        'name' => trim($model->first_name . ' ' . $model->last_name),
+                        'role' => 'vendor',
                         'model' => $model,
                     ];
                     break; // Only first email for resets
@@ -443,7 +452,7 @@ class EmailDispatchService
 
         $role = $recipient['role'];
         $orgId = $org ? $org->id : null;
-        
+
         // Direct model toggle check (e.g. notification_email flag on Vendor or SubAccount)
         if (isset($recipient['model']) && isset($recipient['model']->notification_email)) {
             if (!(bool) $recipient['model']->notification_email) {
@@ -493,10 +502,10 @@ class EmailDispatchService
     {
         $role = $recipient['role'];
         $data = array_merge($preSeededData, [
-            'event_type'     => $eventType,
+            'event_type' => $eventType,
             'recipient_role' => $role,
             'recipient_name' => $recipient['name'],
-            'organization'   => $org,
+            'organization' => $org,
         ]);
 
         $order = null;
@@ -540,7 +549,7 @@ class EmailDispatchService
 
         if ($payment) {
             $data['payment'] = $payment;
-            $data['amount'] = '$' . number_format((float)$payment->amount, 2);
+            $data['amount'] = '$' . number_format((float) $payment->amount, 2);
             $data['currency'] = strtoupper($payment->currency ?? 'USD');
             $data['payment_method'] = ucfirst($payment->payment_method ?? 'Card');
             $data['payment_type'] = $payment->payment_type;
@@ -597,9 +606,9 @@ class EmailDispatchService
                 $data['invoice'] = $invoice;
                 $data['invoice_id'] = $invoice->id;
                 $data['invoice_number'] = $invoice->invoice_number ?? ('INV-' . $invoice->id);
-                $data['invoice_total'] = '$' . number_format((float)$invoice->total, 2);
-                $data['invoice_paid_amount'] = '$' . number_format((float)$invoice->paid_amount, 2);
-                $rem = max(0, (float)$invoice->total - (float)$invoice->paid_amount);
+                $data['invoice_total'] = '$' . number_format((float) $invoice->total, 2);
+                $data['invoice_paid_amount'] = '$' . number_format((float) $invoice->paid_amount, 2);
+                $rem = max(0, (float) $invoice->total - (float) $invoice->paid_amount);
                 $data['invoice_remaining_balance'] = '$' . number_format($rem, 2);
                 $data['is_invoice_fully_paid'] = ($rem <= 0);
             }
@@ -649,7 +658,7 @@ class EmailDispatchService
                 // Only show vendor's assigned services
                 $vendorModel = $recipient['model'] ?? null;
                 if ($vendorModel) {
-                    $data['services'] = $order->services()->whereHas('service.orderSlots', function($q) use ($vendorModel) {
+                    $data['services'] = $order->services()->whereHas('service.orderSlots', function ($q) use ($vendorModel) {
                         $q->where('vendor_id', $vendorModel->id);
                     })->get();
                 } else {
@@ -684,14 +693,15 @@ class EmailDispatchService
         }
 
         // ── Password Reset ─────────────────────────────────────────────────────
-        if ($eventType === 'password_reset' &&
+        if (
+            $eventType === 'password_reset' &&
             ($model instanceof \App\Models\User
-            || $model instanceof \App\Models\Agent
-            || $model instanceof \App\Models\SubAccount
-            || $model instanceof \App\Models\Vendor)
+                || $model instanceof \App\Models\Agent
+                || $model instanceof \App\Models\SubAccount
+                || $model instanceof \App\Models\Vendor)
         ) {
-            $token    = $data['token'] ?? null;
-            $email    = $recipient['email'] ?? '';
+            $token = $data['token'] ?? null;
+            $email = $recipient['email'] ?? '';
             $userType = $data['user_type'] ?? $role;
 
             // Resolve the correct platform base URL per portal type
@@ -714,21 +724,21 @@ class EmailDispatchService
             $baseUrl = rtrim($baseUrl, '/');
 
             // Path varies by role
-            $resetPath = match($userType) {
-                'agent'  => '/agent/new-password',
+            $resetPath = match ($userType) {
+                'agent' => '/agent/new-password',
                 'vendor' => '/vendor/new-password',
-                default  => '/new-password',
+                default => '/new-password',
             };
 
             $resetUrl = $baseUrl . $resetPath
                 . '?token=' . urlencode($token ?? '')
                 . '&email=' . urlencode($email)
-                . '&role='  . urlencode($userType);
+                . '&role=' . urlencode($userType);
 
-            $data['url']        = $resetUrl;
+            $data['url'] = $resetUrl;
             $data['reset_link'] = $resetUrl;
-            $data['token']      = $token;
-            $data['user_type']  = $userType;
+            $data['token'] = $token;
+            $data['user_type'] = $userType;
             $data['organization_name'] = ($org && $org->is_whitelabel) ? $org->name : 'Tojuco';
         }
         // ── End Password Reset ─────────────────────────────────────────────────
@@ -757,7 +767,7 @@ class EmailDispatchService
             })
             ->where(function ($q) use ($eventType) {
                 $q->where('event_type', $eventType)
-                  ->orWhere('type', $eventType);
+                    ->orWhere('type', $eventType);
             })
             ->where('is_active', true)
             ->orderByRaw('organization_id IS NULL ASC')
@@ -767,11 +777,11 @@ class EmailDispatchService
             $changesSummary = '';
             if (!empty($data['changes_summary'])) {
                 if (is_array($data['changes_summary'])) {
-                    $changesSummary = implode(', ', array_map(function($k, $v) {
-                        return is_numeric($k) ? (string)$v : "{$k}: {$v}";
+                    $changesSummary = implode(', ', array_map(function ($k, $v) {
+                        return is_numeric($k) ? (string) $v : "{$k}: {$v}";
                     }, array_keys($data['changes_summary']), $data['changes_summary']));
                 } else {
-                    $changesSummary = (string)$data['changes_summary'];
+                    $changesSummary = (string) $data['changes_summary'];
                 }
             }
 
@@ -788,11 +798,11 @@ class EmailDispatchService
                 'service_name' => $data['service_name'] ?? '',
                 'changes_summary' => $changesSummary,
                 // Password reset
-                'name'              => $data['recipient_name'] ?? '',
-                'reset_link'        => $data['reset_link'] ?? $data['url'] ?? '',
+                'name' => $data['recipient_name'] ?? '',
+                'reset_link' => $data['reset_link'] ?? $data['url'] ?? '',
                 'organization_name' => $data['organization_name'] ?? ($org?->name ?? ''),
-                'email'             => $recipient['email'] ?? '',
-                
+                'email' => $recipient['email'] ?? '',
+
                 // Dates & times (with backwards-compatible frontend aliases)
                 'date' => $data['date'] ?? '',
                 'schedule_date' => $data['date'] ?? '',
@@ -805,7 +815,7 @@ class EmailDispatchService
                 'end_time' => $data['end_time'] ?? '',
                 'old_date' => $data['old_date'] ?? '',
                 'old_time' => $data['old_time'] ?? '',
-                
+
                 // Recipient & Vendor
                 'recipient_name' => $data['recipient_name'] ?? $data['recipientName'] ?? '',
                 'user_name' => $data['recipient_name'] ?? $data['recipientName'] ?? '',
@@ -814,7 +824,7 @@ class EmailDispatchService
                 'vendor_phone' => $data['vendor_phone'] ?? $data['vendor_number'] ?? '',
                 'company_name' => $companyName,
                 'organization_name' => $companyName,
-                
+
                 // Invoices & Payments
                 'payment_scope' => $data['payment_scope_description'] ?? '',
                 'invoice_number' => $data['invoice_number'] ?? '',
@@ -822,25 +832,25 @@ class EmailDispatchService
                 'receipt_url' => $data['receipt_url'] ?? '',
                 'payment_method' => $data['payment_method'] ?? '',
                 'payer_name' => $data['payer_name'] ?? '',
-                
+
                 // Cancellation
                 'cancellation_reason' => $data['cancellation_reason'] ?? '',
                 'cancellation_fee' => $data['cancellation_fee'] ?? '',
-                
+
                 // Matterport / 3D Tours
                 'expiry_date' => $data['expiry_date'] ?? $data['expiryDate'] ?? '',
-                'days_remaining' => (string)($data['days_remaining'] ?? $data['daysRemaining'] ?? ''),
+                'days_remaining' => (string) ($data['days_remaining'] ?? $data['daysRemaining'] ?? ''),
                 'renewal_url' => $data['renewal_url'] ?? $data['renewalUrl'] ?? '',
                 'new_expiry_date' => $data['new_expiry_date'] ?? $data['newExpiryDate'] ?? '',
-                'duration_months' => (string)($data['duration_months'] ?? $data['durationMonths'] ?? ''),
+                'duration_months' => (string) ($data['duration_months'] ?? $data['durationMonths'] ?? ''),
             ];
 
             $parsedContent = $template->parseContent($placeholders);
-            
+
             // Also parse placeholders inside the template title (subject line)
             $subject = $template->title;
             foreach ($placeholders as $key => $val) {
-                $subject = str_replace('{{' . $key . '}}', (string)$val, $subject);
+                $subject = str_replace('{{' . $key . '}}', (string) $val, $subject);
             }
 
             return new \App\Mail\DynamicMailable($parsedContent, $subject, $org, $recipient['role']);
@@ -857,7 +867,7 @@ class EmailDispatchService
             case \App\Mail\OrderCreated::class:
                 $mailable = new $mailableClass($data['order'], $data['recipient_name'], $recipient['role'], $data['show_internal_notes'] ?? false);
                 break;
-                
+
             case \App\Mail\OrderUpdated::class:
                 $changes = $data['changes_summary'] ?? [];
                 $mailable = new $mailableClass(
@@ -868,9 +878,9 @@ class EmailDispatchService
                     $data['show_internal_notes'] ?? false
                 );
                 break;
-                
+
             case \App\Mail\OrderCancelled::class:
-                $fee = isset($data['cancellation_fee']) ? (float)$data['cancellation_fee'] : (isset($data['order']->cancellation_fee) ? (float)$data['order']->cancellation_fee : null);
+                $fee = isset($data['cancellation_fee']) ? (float) $data['cancellation_fee'] : (isset($data['order']->cancellation_fee) ? (float) $data['order']->cancellation_fee : null);
                 $reason = $data['cancellation_reason'] ?? $data['order']->cancellation_reason ?? null;
                 $mailable = new $mailableClass(
                     $data['order'],
@@ -881,11 +891,11 @@ class EmailDispatchService
                     $recipient['role'] === 'admin'
                 );
                 break;
-                
+
             case \App\Mail\BookingReminder::class:
                 $mailable = new $mailableClass($data['slot'], $recipient['role']);
                 break;
-                
+
             case \App\Mail\AgentPaymentReceived::class:
                 $payment = $data['payment'] ?? null;
                 $order = $data['order'] ?? null;
@@ -894,19 +904,19 @@ class EmailDispatchService
                 $recipientName = $recipient['name'] ?? $data['recipient_name'] ?? 'Customer';
                 $mailable = new $mailableClass($payment, $order, $orderService, $recipientName, $recipientRole, $data);
                 break;
-                
+
             case \App\Mail\VendorPaymentProcessed::class:
                 $mailable = new $mailableClass($data['payment'] ?? $data['services'], $data['services'], $data['recipient_name']);
                 break;
-                
+
             case \App\Mail\SlotBooked::class:
                 $mailable = new $mailableClass($data['slot'], $data['recipient_name'], $recipient['role']);
                 break;
-                
+
             case \App\Mail\SlotCancelled::class:
                 $mailable = new $mailableClass($data['slot'], $data['recipient_name'], $recipient['role']);
                 break;
-                
+
             case \App\Mail\SlotRescheduled::class:
                 $mailable = new $mailableClass(
                     $data['slot'],
@@ -916,7 +926,7 @@ class EmailDispatchService
                     $data['old_time'] ?? null
                 );
                 break;
-                
+
             case \App\Mail\InvoiceCreated::class:
                 $mailable = new $mailableClass($data['invoice'], $data['recipient_name'], $recipient['role']);
                 break;
@@ -932,7 +942,7 @@ class EmailDispatchService
                     $data
                 );
                 break;
-                
+
             case \App\Mail\PasswordReset::class:
                 $mailable = new $mailableClass(
                     $data['url'] ?? '',
@@ -963,7 +973,7 @@ class EmailDispatchService
      * Set dynamic "From" address based on org whitelabel status.
      *
      * Non-Whitelabel:
-    *   From: "{Org Name} via Tojuco Solutions" <noreply@tujoco.com>
+     *   From: "{Org Name} via Tojuco Solutions" <noreply@tojuco.com>
      *
      * Whitelabel:
      *   From: "{org->from_name}" <{org->from_email}>
@@ -971,12 +981,12 @@ class EmailDispatchService
      */
     protected function setFromAddress($mailable, ?Organization $org)
     {
-        $defaultFromEmail = config('services.resend.from_address', 'noreply@tujoco.com');
-        $defaultFromName  = config('services.resend.from_name', 'Tojuco Solutions');
+        $defaultFromEmail = config('services.resend.from_address', 'noreply@tojuco.com');
+        $defaultFromName = config('services.resend.from_name', 'Tojuco Solutions');
 
         // ── Non-Whitelabel (or no org context) ────────────────────────────────
         if (!$org || !$org->is_whitelabel) {
-            $orgName  = $org?->name ?? $defaultFromName;
+            $orgName = $org?->name ?? $defaultFromName;
             $fromName = $org ? "{$orgName} (via {$defaultFromName})" : $defaultFromName;
 
             Log::info("EmailDispatchService: setFromAddress — non-whitelabel, sending from '{$defaultFromEmail}' as '{$fromName}'");
@@ -985,7 +995,7 @@ class EmailDispatchService
 
         // ── Whitelabel — use org's own from_email & from_name ─────────────────
         $fromEmail = $org->from_email;
-        $fromName  = $org->from_name ?: $org->name;
+        $fromName = $org->from_name ?: $org->name;
 
         if (!$fromEmail) {
             // Whitelabel org has no from_email configured — fallback to verified default
@@ -1017,7 +1027,7 @@ class EmailDispatchService
     protected function sendAndLog($mailable, array $recipient, ?Organization $org, string $eventType): bool
     {
         $toEmail = $recipient['email'];
-        $fromEmail = $mailable->from[0]['address'] ?? config('services.resend.from_address', 'noreply@tujoco.com');
+        $fromEmail = $mailable->from[0]['address'] ?? config('services.resend.from_address', 'noreply@tojuco.com');
         $fromName = $mailable->from[0]['name'] ?? config('services.resend.from_name', 'Tojuco Solutions');
         $subject = $mailable->envelope()->subject ?? 'Notification';
 
@@ -1044,7 +1054,7 @@ class EmailDispatchService
                 if (method_exists($mailable, 'content')) {
                     $content = $mailable->content();
                     if ($content && !empty($content->view)) {
-                        $viewData = array_merge(get_object_vars($mailable), (array)($content->with ?? []));
+                        $viewData = array_merge(get_object_vars($mailable), (array) ($content->with ?? []));
                         $html = view($content->view, $viewData)->render();
                     }
                 }
@@ -1104,7 +1114,7 @@ class EmailDispatchService
                 'status' => 'sent',
                 'resend_email_id' => $resendId,
             ]);
-            
+
             Log::info("EmailDispatchService: Email successfully sent and logged", [
                 'event' => $eventType,
                 'to' => $toEmail,

@@ -43,11 +43,15 @@ class SendBookingReminders extends Command
             ->groupBy('organization_id');
 
         // Fetch all upcoming non-cancelled slots with vendors
-        $slots = OrderSlot::with(['vendor', 'order.organization', 'service'])
-            ->where('date', '>=', $now->toDateString())
+        $slots = OrderSlot::with(['vendor.workHours', 'order.organization', 'order.property', 'service'])
+            ->where('date', '>=', $now->subDay()->toDateString())
             ->whereNotNull('vendor_id')
-            ->where(function ($query) {
-                $query->whereNull('status')->orWhere('status', '!=', 'cancelled');
+            ->whereHas('order', function ($query) {
+                $query->whereNull('cancelled_at')
+                      ->where(function ($q) {
+                          $q->whereNull('order_status')
+                            ->orWhereRaw('LOWER(order_status) != ?', ['cancelled']);
+                      });
             })
             ->get();
 
@@ -59,8 +63,21 @@ class SendBookingReminders extends Command
         ];
 
         foreach ($slots as $slot) {
-            $slotDateTime = Carbon::parse($slot->date . ' ' . $slot->start_time);
-            $hoursDiff = $now->diffInMinutes($slotDateTime, false) / 60.0;
+            if (empty($slot->date) || empty($slot->start_time)) {
+                continue;
+            }
+
+            $province = $slot->order?->property?->province ?? $slot->order?->property_location;
+            $vendorTz = $slot->vendor?->workHours?->timezone;
+            $tz = \App\Services\GoogleCalendarService::resolveTimezoneFromProvince($province, $vendorTz ?: 'America/Vancouver');
+
+            try {
+                $slotDateTime = Carbon::parse("{$slot->date} {$slot->start_time}", $tz);
+                $nowInTz = Carbon::now($tz);
+                $hoursDiff = $nowInTz->diffInMinutes($slotDateTime, false) / 60.0;
+            } catch (\Throwable $e) {
+                continue;
+            }
 
             if ($hoursDiff <= 0) {
                 continue; // Skip past appointments

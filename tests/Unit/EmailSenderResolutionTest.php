@@ -13,7 +13,7 @@ class EmailSenderResolutionTest extends TestCase
     public function test_non_whitelabel_sender_ignores_legacy_mail_from_address(): void
     {
         config()->set('mail.from.address', 'noreply@bcfloorplans.com');
-        config()->set('services.resend.from_address', 'noreply@tujoco.com');
+        config()->set('services.resend.from_address', 'noreply@tojuco.com');
         config()->set('services.resend.from_name', 'Tojuco Solutions');
 
         $organization = new Organization();
@@ -21,13 +21,13 @@ class EmailSenderResolutionTest extends TestCase
         $organization->is_whitelabel = false;
         $mailable = $this->setSender($organization);
 
-        $this->assertSame('noreply@tujoco.com', $mailable->from[0]['address']);
+        $this->assertSame('noreply@tojuco.com', $mailable->from[0]['address']);
         $this->assertSame('Customer Organization (via Tojuco Solutions)', $mailable->from[0]['name']);
     }
 
     public function test_whitelabel_sender_uses_organization_address(): void
     {
-        config()->set('services.resend.from_address', 'noreply@tujoco.com');
+        config()->set('services.resend.from_address', 'noreply@tojuco.com');
         config()->set('services.resend.from_name', 'Tojuco Solutions');
 
         $organization = new Organization();

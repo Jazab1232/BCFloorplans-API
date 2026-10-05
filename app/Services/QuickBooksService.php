@@ -316,7 +316,10 @@ class QuickBooksService
             return $refreshedToken;
         } catch (\Exception $e) {
             Log::error('QuickBooks Token Refresh Error: ' . $e->getMessage());
-            throw new \Exception('Token refresh failed: ' . $e->getMessage());
+            if (str_contains($e->getMessage(), 'invalid_grant') || str_contains($e->getMessage(), 'Incorrect or invalid refresh token')) {
+                throw new \Exception('QuickBooks authorization has expired. Please reconnect QuickBooks in Global Settings.');
+            }
+            throw new \Exception('QuickBooks token refresh failed: ' . $e->getMessage());
         }
     }
 
@@ -326,8 +329,17 @@ class QuickBooksService
     public function getDataService(Organization $organization = null): DataService
     {
         if (!$organization) {
-            $user = Auth::user();
-            $organization = $user ? $user->organization : null;
+            $orgId = app()->bound('current_organization_id') ? app('current_organization_id') : null;
+            if ($orgId) {
+                $organization = is_numeric($orgId) 
+                    ? Organization::find($orgId) 
+                    : Organization::where('uuid', $orgId)->first();
+            }
+
+            if (!$organization) {
+                $user = Auth::user();
+                $organization = $user ? $user->organization : null;
+            }
             
             if (!$organization) {
                 $organization = Organization::whereNotNull('qb_access_token')
@@ -335,9 +347,20 @@ class QuickBooksService
                     ->first();
             }
         }
+
+        // If the requested organization has no QB tokens, fall back to the primary connected organization
+        if ($organization && !$organization->qb_access_token) {
+            $fallbackOrg = Organization::whereNotNull('qb_access_token')
+                ->whereNotNull('qb_refresh_token')
+                ->first();
+            if ($fallbackOrg) {
+                Log::info("QB getDataService: Organization {$organization->id} ({$organization->name}) has no QB credentials; falling back to Organization {$fallbackOrg->id} ({$fallbackOrg->name})");
+                $organization = $fallbackOrg;
+            }
+        }
             
         if (!$organization || !$organization->qb_access_token) {
-            throw new \Exception('QuickBooks not connected.');
+            throw new \Exception('QuickBooks is not connected. Please connect QuickBooks in Global Settings.');
         }
 
         $expiresAt = $organization->qb_access_expires_at 
@@ -627,10 +650,13 @@ class QuickBooksService
         ]);
 
         try {
-            $dataService = $this->getDataService($invoice->order->organization ?? null);
+            $org = $invoice->organization 
+                ?? $invoice->order?->organization 
+                ?? ($invoice->organization_id ? \App\Models\Organization::find($invoice->organization_id) : null);
+            $dataService = $this->getDataService($org);
 
             // 1. Ensure Customer
-            $customerId = $this->getOrCreateCustomer($invoice->agent, $invoice->order->organization ?? null);
+            $customerId = $this->getOrCreateCustomer($invoice->agent, $org);
 
             // 2. Build Lines with Tax Support
             $lines = [];
@@ -699,6 +725,7 @@ class QuickBooksService
             $log->update([
                 'status' => 'failed',
                 'error_message' => $e->getMessage(),
+                'attempts' => $log->attempts + 1,
             ]);
             Log::error('QuickBooks Sync Error: ' . $e->getMessage());
             return null;
@@ -768,8 +795,11 @@ class QuickBooksService
                 throw new \Exception('Cannot refund an unsynced invoice.');
             }
 
-            $dataService = $this->getDataService($invoice->order->organization ?? null);
-            $customerId = $this->getOrCreateCustomer($invoice->agent);
+            $org = $invoice->organization 
+                ?? $invoice->order?->organization 
+                ?? ($invoice->organization_id ? \App\Models\Organization::find($invoice->organization_id) : null);
+            $dataService = $this->getDataService($org);
+            $customerId = $this->getOrCreateCustomer($invoice->agent, $org);
 
             // Create CreditMemo
             $creditMemoObj = CreditMemo::create([
@@ -806,7 +836,9 @@ class QuickBooksService
             $log->update([
                 'status' => 'failed',
                 'error_message' => $e->getMessage(),
+                'attempts' => $log->attempts + 1,
             ]);
+            Log::error('QuickBooks Refund Sync Error: ' . $e->getMessage());
             return null;
         }
     }
@@ -886,7 +918,9 @@ class QuickBooksService
             $log->update([
                 'status' => 'failed',
                 'error_message' => $e->getMessage(),
+                'attempts' => $log->attempts + 1,
             ]);
+            Log::error('QuickBooks Bill Sync Error: ' . $e->getMessage());
             return null;
         }
     }
@@ -952,7 +986,9 @@ class QuickBooksService
             $log->update([
                 'status' => 'failed',
                 'error_message' => $e->getMessage(),
+                'attempts' => $log->attempts + 1,
             ]);
+            Log::error('QuickBooks BillPayment Sync Error: ' . $e->getMessage());
             return null;
         }
     }
