@@ -154,6 +154,20 @@ class EmailDispatchService
             }
         }
 
+        if ($model instanceof \App\Models\VendorPayment) {
+            if ($model->order) {
+                $org = $this->resolveOrganization($model->order);
+                if ($org) return $org;
+            }
+            if ($model->orderService && $model->orderService->order) {
+                $org = $this->resolveOrganization($model->orderService->order);
+                if ($org) return $org;
+            }
+            if ($model->vendor) {
+                $org = $this->resolveOrganization($model->vendor);
+                if ($org) return $org;
+            }
+        }
 
         if ($model instanceof \Illuminate\Database\Eloquent\Model) {
             if (method_exists($model, 'organization')) {
@@ -705,7 +719,7 @@ class EmailDispatchService
             $userType = $data['user_type'] ?? $role;
 
             // Resolve the correct platform base URL per portal type
-            $baseUrl = config('app.admin_app', 'https://app.bcfloorplans.com');
+            $baseUrl = config('app.frontend_url', config('app.admin_app', 'https://teams.tojuco.com'));
 
             // For whitelabel orgs: look up their custom domain for this portal type
             if ($org && $org->is_whitelabel) {
@@ -739,7 +753,7 @@ class EmailDispatchService
             $data['reset_link'] = $resetUrl;
             $data['token'] = $token;
             $data['user_type'] = $userType;
-            $data['organization_name'] = ($org && $org->is_whitelabel) ? $org->name : 'Tojuco';
+            $data['organization_name'] = $org?->name ?: 'Tojuco';
         }
         // ── End Password Reset ─────────────────────────────────────────────────
 

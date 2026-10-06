@@ -7,26 +7,51 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Stripe\Stripe;
+use Stripe\StripeClient;
 use App\Models\AgentPayment;
 use App\Models\OrderService;
 use App\Models\Agent;
+use App\Models\Organization;
 use App\Models\Service;
 use Illuminate\Support\Str;
 use App\Models\Order;
 use Stripe\Invoice;
 use Stripe\Webhook;
+use App\Services\StripeResolverService;
 class StripeAgentWebhookController extends Controller
 {
      public function handleWebhook(Request $request)
     {
         $payload = $request->getContent();
         $sigHeader = $request->header('Stripe-Signature');
-        $secret = config('services.stripe.webhook_secret')  ?? 'whsec_9okG7sf9uApkaQ3AI6aJDqTCVIcDQfPj';
+
+        // BYO Stripe: peek into the payload to identify the agent, then resolve
+        // their organization so we use the correct webhook signing secret.
+        $organization = null;
+        try {
+            $rawData = json_decode($payload, true);
+            $agentUuid = $rawData['data']['object']['metadata']['agent_uuid'] ?? null;
+            if ($agentUuid) {
+                $agent = Agent::where('uuid', $agentUuid)->first();
+                if ($agent && $agent->organization_id) {
+                    $organization = Organization::find($agent->organization_id);
+                }
+            }
+        } catch (\Throwable $peekError) {
+            // Non-fatal — fall back to platform key
+            Log::warning('BYO Stripe: could not resolve org from webhook payload, using platform key', [
+                'error' => $peekError->getMessage(),
+            ]);
+        }
+
+        $secret = StripeResolverService::webhookSecretForOrganization($organization)
+            ?? 'whsec_9okG7sf9uApkaQ3AI6aJDqTCVIcDQfPj';
 
         try {
-            Stripe::setApiKey(config('services.stripe.secret'));
+            // Set the API key for static Stripe calls (e.g., Invoice::retrieve)
+            Stripe::setApiKey(StripeResolverService::secretKeyForOrganization($organization));
 
-            $event =Webhook::constructEvent(
+            $event = Webhook::constructEvent(
                 $payload,
                 $sigHeader,
                 $secret

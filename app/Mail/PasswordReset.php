@@ -32,16 +32,16 @@ class PasswordReset extends Mailable
         string $userType = 'admin',
         ?Organization $organization = null
     ) {
-        $this->url           = $url;
+        $this->url = $url;
         $this->recipientName = $recipientName;
-        $this->userType      = $userType;
-        $this->organization  = $organization;
+        $this->userType = $userType;
+        $this->organization = $organization;
     }
 
     public function envelope(): Envelope
     {
-        $org     = $this->organization;
-        $orgName = ($org && $org->is_whitelabel) ? $org->name : 'Tojuco';
+        $org = $this->organization;
+        $orgName = $org?->name ?: 'Tojuco';
 
         return new Envelope(
             subject: "Reset Your Password – {$orgName}",
@@ -53,9 +53,9 @@ class PasswordReset extends Mailable
         return new Content(
             view: 'emails.reset-password',
             with: [
-                'url'          => $this->url,
-                'name'         => $this->recipientName,
-                'userType'     => $this->userType,
+                'url' => $this->url,
+                'name' => $this->recipientName,
+                'userType' => $this->userType,
                 'organization' => $this->organization,
             ],
         );

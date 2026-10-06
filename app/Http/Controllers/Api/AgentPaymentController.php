@@ -13,9 +13,11 @@ use App\Models\AgentPayment;
 use App\Models\Agent;
 use App\Models\Order;
 use App\Models\OrderService;
+use App\Models\Organization;
 use App\Models\Service;
 use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Api\StripeAgentWebhookController;
+use App\Services\StripeResolverService;
 class AgentPaymentController extends Controller
 {
     public function createCheckoutSession(Request $request)
@@ -43,8 +45,10 @@ class AgentPaymentController extends Controller
         $payerUuid = $request->payer_uuid; // Who is actually paying
         $url = $request->url;
 
-
-        $stripe = new StripeClient(config('services.stripe.secret'));
+        // BYO Stripe: resolve the organization from the order so we use the correct Stripe account
+        $order = Order::find($request->order_id);
+        $organization = $order ? Organization::find($order->organization_id) : null;
+        $stripe = StripeResolverService::clientForOrganization($organization);
         
         try {
             $authenticatedUser = auth()->user();
@@ -275,7 +279,16 @@ class AgentPaymentController extends Controller
     try {
         Log::info("Processing Stripe Session ID: " . $id);
 
-        $stripe = new StripeClient(config('services.stripe.secret'));
+        // BYO Stripe: resolve organization from the authenticated user's context.
+        // The session was originally created with this org's Stripe key, so we must
+        // use the same key to retrieve it. We re-verify against the order below.
+        $authenticatedUser = auth()->user();
+        $organization = null;
+        if ($authenticatedUser && $authenticatedUser->organization_id) {
+            $organization = Organization::find($authenticatedUser->organization_id);
+        }
+
+        $stripe = StripeResolverService::clientForOrganization($organization);
         $session = $stripe->checkout->sessions->retrieve($id);
 
         $metadata = $session->metadata ?? [];

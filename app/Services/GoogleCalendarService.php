@@ -23,7 +23,7 @@ class GoogleCalendarService
         $this->client->setClientId(config('google.client_id'));
         $this->client->setClientSecret(config('google.client_secret'));
         $this->client->setRedirectUri(config('google.redirect_uri'));
-        $this->client->setScopes([Calendar::CALENDAR]); // Changed to read/write
+        $this->client->setScopes([Calendar::CALENDAR_EVENTS]);
         $this->client->setAccessType('offline');
         $this->client->setPrompt('consent');
     }

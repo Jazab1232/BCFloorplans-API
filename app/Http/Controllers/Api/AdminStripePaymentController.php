@@ -10,11 +10,14 @@ use Exception;
 use App\Models\Vendor;
 use App\Models\VendorPayment;
 use App\Models\Notification;
+use App\Models\Organization;
+use App\Models\Order;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 use App\Mail\VendorPaymentProcessed;
+use App\Services\StripeResolverService;
 
 class AdminStripePaymentController extends Controller
 {
@@ -216,7 +219,20 @@ class AdminStripePaymentController extends Controller
         // ------------------------------
         // STRIPE TRANSFER
         // ------------------------------
-        Stripe::setApiKey(config('services.stripe.secret'));
+        // BYO Stripe: resolve org from the first order service's order so we
+        // use the correct Stripe account for this vendor transfer.
+        $firstService = DB::table('order_services')
+            ->whereIn('uuid', $orderServiceUuids)
+            ->first();
+        $organization = null;
+        if ($firstService && $firstService->order_id) {
+            $order = Order::find($firstService->order_id);
+            if ($order && $order->organization_id) {
+                $organization = Organization::find($order->organization_id);
+            }
+        }
+
+        Stripe::setApiKey(StripeResolverService::secretKeyForOrganization($organization));
 
         try {
             $transfer = Transfer::create([

@@ -13,6 +13,7 @@ use App\Models\User;
 use App\Models\OrganizationDomain;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Log;
+use App\Services\StripeResolverService;
 
 class OrganizationController extends Controller
 {
@@ -79,6 +80,10 @@ class OrganizationController extends Controller
                 'domains' => 'nullable|array',
                 'domains.*.domain' => 'required|string|max:255',
                 'domains.*.portal_type' => 'required|string|in:admin,agent,vendor,tours',
+                // BYO Stripe — optional at creation time
+                'stripe_publishable_key' => 'nullable|string|max:255',
+                'stripe_secret_key' => 'nullable|string|max:500',
+                'stripe_webhook_secret' => 'nullable|string|max:500',
             ]);
 
             if (empty($data['slug'])) {
@@ -230,6 +235,10 @@ class OrganizationController extends Controller
                 'domains' => 'nullable|array',
                 'domains.*.domain' => 'required|string|max:255',
                 'domains.*.portal_type' => 'required|string|in:admin,agent,vendor,tours',
+                // BYO Stripe — allow updating keys here too
+                'stripe_publishable_key' => 'nullable|string|max:255',
+                'stripe_secret_key' => 'nullable|string|max:500',
+                'stripe_webhook_secret' => 'nullable|string|max:500',
             ]);
 
             if (empty($data['slug']) && isset($data['name'])) {
@@ -369,5 +378,81 @@ class OrganizationController extends Controller
             'status' => true,
             'data' => $organizations
         ]);
+    }
+
+    // -------------------------------------------------------------------------
+    // BYO Stripe — dedicated endpoint to set/update Stripe keys for an org
+    // -------------------------------------------------------------------------
+
+    /**
+     * Update the Stripe credentials for an organization.
+     *
+     * Only returns whether keys are configured (not the keys themselves)
+     * so secrets are never echoed back in responses.
+     *
+     * PATCH /api/organizations/{uuid}/stripe-keys
+     */
+    public function updateStripeKeys(Request $request, string $uuid): JsonResponse
+    {
+        try {
+            $orgId = app()->bound('current_organization_id') ? app('current_organization_id') : null;
+            $query = Organization::where('uuid', $uuid);
+
+            if ($orgId !== null) {
+                $query->where('id', $orgId);
+            }
+
+            $organization = $query->firstOrFail();
+
+            $data = $request->validate([
+                'stripe_publishable_key' => 'nullable|string|max:255',
+                'stripe_secret_key'      => 'nullable|string|max:500',
+                'stripe_webhook_secret'  => 'nullable|string|max:500',
+            ]);
+
+            // Only update fields that were explicitly provided
+            $updatePayload = array_filter($data, fn ($v) => $v !== null);
+
+            // Support clearing keys by passing an empty string
+            foreach ($data as $key => $value) {
+                if ($value === '') {
+                    $updatePayload[$key] = null;
+                }
+            }
+
+            $organization->update($updatePayload);
+
+            Log::info('BYO Stripe keys updated for organization', [
+                'organization_id' => $organization->id,
+                'organization_slug' => $organization->slug,
+                'fields_updated' => array_keys($updatePayload),
+                'byo_mode' => $organization->fresh()->isUsingOwnStripe(),
+            ]);
+
+            return response()->json([
+                'status'  => true,
+                'message' => 'Stripe keys updated successfully.',
+                'data'    => [
+                    'uuid'                       => $organization->uuid,
+                    'has_stripe_publishable_key' => !empty($organization->fresh()->stripe_publishable_key),
+                    'has_stripe_secret_key'      => !empty($organization->fresh()->stripe_secret_key),
+                    'has_stripe_webhook_secret'  => !empty($organization->fresh()->stripe_webhook_secret),
+                    'byo_stripe_enabled'         => $organization->fresh()->isUsingOwnStripe(),
+                ],
+            ]);
+
+        } catch (ValidationException $e) {
+            return response()->json([
+                'status'  => false,
+                'message' => 'Validation failed',
+                'errors'  => $e->errors(),
+            ], 422);
+        } catch (\Exception $e) {
+            return response()->json([
+                'status'  => false,
+                'message' => 'Failed to update Stripe keys',
+                'error'   => config('app.env') === 'production' ? null : $e->getMessage(),
+            ], 500);
+        }
     }
 }

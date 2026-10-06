@@ -6,6 +6,8 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\Storage;
+use App\Services\StripeResolverService;
+use Stripe\StripeClient;
 
 class Organization extends Model
 {
@@ -37,6 +39,18 @@ class Organization extends Model
         'qb_refresh_token',
         'qb_access_expires_at',
         'qb_refresh_expires_at',
+        // BYO Stripe — Option A
+        'stripe_publishable_key',
+        'stripe_secret_key',
+        'stripe_webhook_secret',
+    ];
+
+    /**
+     * Never expose Stripe secrets in API responses.
+     */
+    protected $hidden = [
+        'stripe_secret_key',
+        'stripe_webhook_secret',
     ];
 
     protected $casts = [
@@ -76,6 +90,27 @@ class Organization extends Model
     public function owner()
     {
         return $this->belongsTo(User::class, 'owner_user_id');
+    }
+
+    // -------------------------------------------------------------------------
+    // BYO Stripe helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Return a StripeClient pre-configured with this organization's Stripe key
+     * (or the platform fallback if the org has no key set).
+     */
+    public function stripeClient(): StripeClient
+    {
+        return StripeResolverService::clientForOrganization($this);
+    }
+
+    /**
+     * Whether this org is operating in BYO Stripe mode.
+     */
+    public function isUsingOwnStripe(): bool
+    {
+        return StripeResolverService::isUsingOwnStripe($this);
     }
     public function settings()
     {

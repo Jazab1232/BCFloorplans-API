@@ -79,6 +79,9 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api
     Route::get('/organizations', [OrganizationController::class, 'index']);
     Route::get('/organizations/{uuid}', [OrganizationController::class, 'show']);
     Route::get('/organizations/{uuid}/branding', [BrandingController::class, 'show']);
+    // BYO Stripe — update per-org Stripe credentials (super admin only in practice)
+    Route::patch('/organizations/{uuid}/stripe-keys', [OrganizationController::class, 'updateStripeKeys']);
+
     Route::get('/settings', [SettingsController::class, 'index']);
     Route::get('/tax-settings', [TaxSettingsController::class, 'show']);
     Route::post('/tax-settings/calculate-preview', [TaxSettingsController::class, 'calculatePreview']);

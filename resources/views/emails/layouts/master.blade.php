@@ -1,5 +1,17 @@
 @php
-    $org = $organization ?? null;
+    $org = $organization 
+        ?? ($order?->organization ?? null)
+        ?? ($slot?->order?->organization ?? null)
+        ?? ($orderSlot?->order?->organization ?? null)
+        ?? ($payment?->order?->organization ?? null)
+        ?? ($payment?->orderService?->order?->organization ?? null)
+        ?? ($payment?->vendor?->organization ?? null)
+        ?? ($invoice?->organization ?? null)
+        ?? ($invoice?->order?->organization ?? null)
+        ?? ($tour?->orders?->organization ?? null)
+        ?? ($user?->organization ?? null)
+        ?? null;
+
     $orgName = $org?->name ?: 'Tojuco Solutions';
     $orgEmail = $org?->contact_email ?: 'support@tojuco.com';
     $orgPhone = $org?->contact_phone ?: '604-788-7783';
@@ -13,9 +25,6 @@
         $logos = collect($org->company_logos_urls);
         $primary = $logos->firstWhere('type', 'primary_logo') ?? $logos->first();
         $logoUrl = $primary['url'] ?? null;
-    }
-    if (!$logoUrl && !$isWhitelabel) {
-        $logoUrl = config('app.admin_app_img');
     }
 @endphp
 <!DOCTYPE html>

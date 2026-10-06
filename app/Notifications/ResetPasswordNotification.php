@@ -40,43 +40,52 @@ class ResetPasswordNotification extends Notification
      */
     public function toMail(object $notifiable): MailMessage
     {
-        $adminAppUrl = config('app.admin_app');
-        
-        // Resolve dynamic whitelabel domain if user belongs to a whitelabel organization
         $org = $notifiable->organization ?? null;
+        if (!$org && isset($notifiable->organization_id)) {
+            $org = \App\Models\Organization::find($notifiable->organization_id);
+        }
+
+        $baseUrl = config('app.frontend_url', config('app.admin_app', 'https://teams.tojuco.com'));
+
+        // Resolve dynamic whitelabel domain if user belongs to a whitelabel organization
         if ($org && $org->is_whitelabel) {
-            // Find custom subdomain mapped to this portal type
             $domainRecord = $org->domains()->where('portal_type', $this->userType)->first();
-            if ($domainRecord) {
-                $adminAppUrl = 'https://' . $domainRecord->domain . '/';
-            } else {
-                $adminAppUrl = 'https://' . ($org->domain ?? 'tojuco.com') . '/';
+            if ($domainRecord && !empty($domainRecord->domain)) {
+                $baseUrl = $domainRecord->domain;
+            } elseif (!empty($org->domain)) {
+                $baseUrl = $org->domain;
             }
         }
 
-        // Build reset URL based on user type
-        $resetPath = match($this->userType) {
-            'agent' => 'agent/new-password',
-            'vendor' => 'vendor/new-password',
-            default => 'new-password', // admin
-        };
-        
-        if (substr($adminAppUrl, -1) !== '/') {
-            $adminAppUrl .= '/';
+        if (!str_starts_with($baseUrl, 'http://') && !str_starts_with($baseUrl, 'https://')) {
+            $baseUrl = 'https://' . $baseUrl;
         }
-        
-        $resetUrl = $adminAppUrl . $resetPath . '?token=' . $this->token . '&email=' . urlencode($notifiable->email) . '&role=' . $this->userType;
+        $baseUrl = rtrim($baseUrl, '/');
+
+        // Build reset URL based on user type
+        $resetPath = match ($this->userType) {
+            'agent' => '/agent/new-password',
+            'vendor' => '/vendor/new-password',
+            default => '/new-password', // admin
+        };
+
+        $email = method_exists($notifiable, 'getEmailForPasswordReset')
+            ? $notifiable->getEmailForPasswordReset()
+            : ($notifiable->email ?? '');
+
+        $resetUrl = $baseUrl . $resetPath . '?token=' . urlencode($this->token) . '&email=' . urlencode($email) . '&role=' . urlencode($this->userType);
 
         // Get user name (handle different field names)
         $name = $notifiable->name ?? $notifiable->first_name ?? 'User';
 
-        $orgName = ($org && $org->is_whitelabel) ? $org->name : 'Tojuco';
+        $orgName = $org?->name ?: 'Tojuco';
 
         return (new MailMessage)
-            ->subject("Reset Password for {$orgName} Platform")
+            ->subject("Reset Password for {$orgName}")
             ->view('emails.reset-password', [
                 'url' => $resetUrl,
                 'name' => $name,
+                'organization' => $org,
             ]);
     }
 
