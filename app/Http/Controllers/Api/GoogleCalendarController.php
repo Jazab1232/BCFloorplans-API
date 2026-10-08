@@ -89,8 +89,9 @@ class GoogleCalendarController extends Controller
         // Generate a URL-safe Base64 self-contained state token
         $state = rtrim(strtr(base64_encode(json_encode($statePayload)), '+/', '-_'), '=');
         
-        // Store in cache for 30 minutes (handles local same-server fast lookup)
-        Cache::put("google_oauth_state_{$state}", $statePayload, now()->addMinutes(30));
+        // Store in cache for 30 minutes using MD5 hashed key to stay safely under VARCHAR(255) column limits
+        $cacheKey = "g_oauth_" . md5($state);
+        Cache::put($cacheKey, $statePayload, now()->addMinutes(30));
         
         $authUrl = $this->calendarService->getAuthUrl($state);
         
@@ -111,7 +112,8 @@ class GoogleCalendarController extends Controller
         $cachedData = null;
 
         if (!empty($state)) {
-            $cachedData = Cache::get("google_oauth_state_{$state}");
+            $cacheKey = "g_oauth_" . md5($state);
+            $cachedData = Cache::get($cacheKey);
 
             // If cache miss (cross-environment / separate API servers), decode directly from state payload
             if (!$cachedData) {
@@ -169,7 +171,7 @@ class GoogleCalendarController extends Controller
 
         // Clean up cache
         if (!empty($state)) {
-            Cache::forget("google_oauth_state_{$state}");
+            Cache::forget("g_oauth_" . md5($state));
         }
 
         $separator = parse_url($redirectBackUrl, PHP_URL_QUERY) ? '&' : '?';
