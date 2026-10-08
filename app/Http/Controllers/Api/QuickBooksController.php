@@ -37,21 +37,24 @@ class QuickBooksController extends Controller
                 ?? $request->header('referer')
                 ?? config('app.admin_app', 'https://teams.tojuco.com') . '/dashboard/global-settings';
 
-            // Use a short UUID as the state token (same pattern as Google Calendar which works)
-            $state = (string) Str::uuid();
-
+            // Use a self-contained URL-safe Base64 state token (with cache for fast lookup)
             $statePayload = [
                 'user_id' => $user?->id,
                 'user_uuid' => $user?->uuid,
                 'organization_id' => $user?->organization_id ?? $user?->organization?->id,
                 'redirect_back_url' => $redirectBackUrl,
+                'nonce' => (string) Str::random(16),
+                'ts' => time(),
             ];
 
-            // Short cache key: "qb_st_<uuid>" = ~42 chars, well within PostgreSQL varchar(255)
-            Cache::put("qb_st_{$state}", $statePayload, now()->addMinutes(15));
+            // Generate URL-safe Base64 state token
+            $state = rtrim(strtr(base64_encode(json_encode($statePayload)), '+/', '-_'), '=');
+
+            // Store in cache for 30 minutes using MD5 hashed key
+            $cacheKey = "qb_st_" . md5($state);
+            Cache::put($cacheKey, $statePayload, now()->addMinutes(30));
 
             Log::info('QB OAuth: connect() initiated', [
-                'state' => $state,
                 'user_id' => $user?->id,
                 'org_id' => $statePayload['organization_id'],
                 'redirect_back_url' => $redirectBackUrl,
@@ -62,6 +65,7 @@ class QuickBooksController extends Controller
             return response()->json([
                 'success' => true,
                 'auth_url' => $authUrl,
+                'state' => $state,
                 'message' => 'Redirect to this URL for QuickBooks authorization'
             ]);
         } catch (\Exception $e) {
@@ -86,28 +90,43 @@ class QuickBooksController extends Controller
         Log::info('QB OAuth: callback() hit', [
             'has_code' => !empty($code),
             'has_realmId' => !empty($realmId),
-            'state' => $state,
+            'has_state' => !empty($state),
             'has_error' => $request->has('error'),
             'all_params' => $request->all(),
         ]);
 
-        // Retrieve state data from cache using the short UUID key
-        $stateData = $state ? Cache::get("qb_st_{$state}") : null;
+        $cachedData = null;
+        if (!empty($state)) {
+            $cacheKey = "qb_st_" . md5($state);
+            $cachedData = Cache::get($cacheKey);
 
-        Log::info('QB OAuth: cache lookup result', [
-            'state' => $state,
-            'cache_key' => "qb_st_{$state}",
-            'found' => !is_null($stateData),
-            'stateData' => $stateData,
-        ]);
+            // Backward compatibility lookup
+            if (!$cachedData) {
+                $cachedData = Cache::get("qb_st_{$state}");
+            }
+
+            // Fallback: decode directly from self-contained state token
+            if (!$cachedData) {
+                try {
+                    $decodedJson = base64_decode(strtr($state, '-_', '+/'));
+                    $decoded = json_decode($decodedJson, true);
+                    if (is_array($decoded) && (!empty($decoded['organization_id']) || !empty($decoded['user_id']) || !empty($decoded['redirect_back_url']))) {
+                        $cachedData = $decoded;
+                        Log::info('QB OAuth: state successfully decoded from self-contained token', ['cachedData' => $cachedData]);
+                    }
+                } catch (\Exception $e) {
+                    Log::warning('QB OAuth: Failed to decode OAuth state payload: ' . $e->getMessage());
+                }
+            }
+        }
 
         $defaultUrl = config('app.admin_app', 'https://teams.tojuco.com') . '/dashboard/global-settings';
-        $redirectBackUrl = $stateData['redirect_back_url'] ?? $defaultUrl;
+        $redirectBackUrl = $cachedData['redirect_back_url'] ?? $defaultUrl;
         $separator = parse_url($redirectBackUrl, PHP_URL_QUERY) ? '&' : '?';
 
         Log::info('QB OAuth: redirect target resolved', [
             'redirect_back_url' => $redirectBackUrl,
-            'default_url' => $defaultUrl,
+            'has_stateData' => !is_null($cachedData),
         ]);
 
         if ($request->has('error') || $request->has('error_description')) {
@@ -116,10 +135,9 @@ class QuickBooksController extends Controller
             return redirect()->to($redirectBackUrl . $separator . 'qb_error=' . urlencode($errorMsg));
         }
 
-        if (!$stateData) {
-            Log::warning('QB OAuth: state not found in cache', [
+        if (!$cachedData) {
+            Log::warning('QB OAuth: state not found in cache or token', [
                 'state' => $state,
-                'cache_key' => "qb_st_{$state}",
             ]);
             return redirect()->to($redirectBackUrl . $separator . 'qb_error=invalid_state');
         }
@@ -131,12 +149,16 @@ class QuickBooksController extends Controller
 
         try {
             Log::info('QB OAuth: exchanging code for tokens', [
-                'org_id' => $stateData['organization_id'] ?? null,
-                'user_id' => $stateData['user_id'] ?? null,
+                'org_id' => $cachedData['organization_id'] ?? null,
+                'user_id' => $cachedData['user_id'] ?? null,
             ]);
 
-            $this->quickBooksService->handleCallback($code, $realmId, $stateData);
-            Cache::forget("qb_st_{$state}");
+            $this->quickBooksService->handleCallback($code, $realmId, $cachedData);
+            
+            if (!empty($state)) {
+                Cache::forget("qb_st_" . md5($state));
+                Cache::forget("qb_st_{$state}");
+            }
 
             Log::info('QB OAuth: SUCCESS — tokens stored, redirecting', [
                 'redirect_to' => $redirectBackUrl . $separator . 'qb_success=1',

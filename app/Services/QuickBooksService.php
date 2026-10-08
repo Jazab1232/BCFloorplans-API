@@ -144,9 +144,19 @@ class QuickBooksService
 
             if (!$organization && !empty($cachedData['user_id'])) {
                 $cachedUser = User::find($cachedData['user_id']);
-                $organization = $cachedUser ? $cachedUser->organization : null;
+                $organization = $cachedUser ? ($cachedUser->organization ?? ($cachedUser->organization_id ? Organization::find($cachedUser->organization_id) : null)) : null;
                 Log::info('QB handleCallback: resolved org from cachedData.user_id', [
                     'user_id' => $cachedData['user_id'],
+                    'found_user' => !is_null($cachedUser),
+                    'found_org' => !is_null($organization),
+                ]);
+            }
+
+            if (!$organization && !empty($cachedData['user_uuid'])) {
+                $cachedUser = User::where('uuid', $cachedData['user_uuid'])->first();
+                $organization = $cachedUser ? ($cachedUser->organization ?? ($cachedUser->organization_id ? Organization::find($cachedUser->organization_id) : null)) : null;
+                Log::info('QB handleCallback: resolved org from cachedData.user_uuid', [
+                    'user_uuid' => $cachedData['user_uuid'],
                     'found_user' => !is_null($cachedUser),
                     'found_org' => !is_null($organization),
                 ]);
@@ -193,17 +203,38 @@ class QuickBooksService
         }
     }
 
-   /**
- * ✅ FIXED: Store tokens with proper expiration calculation
- * SDK returns date strings like "2026/01/02 13:21:17", not seconds
- */
+    /**
+     * Store tokens with proper expiration calculation and exception safety
+     */
     protected function storeTokens(OAuth2AccessToken $token, string $realmId, Organization $organization): void
     {
-        $accessExpiresRaw = $token->getAccessTokenExpiresAt();
-        $refreshExpiresRaw = $token->getRefreshTokenExpiresAt();
+        $accessExpiresRaw = null;
+        try {
+            $accessExpiresRaw = $token->getAccessTokenExpiresAt();
+        } catch (\Throwable $e) {
+            Log::warning('QB: getAccessTokenExpiresAt not available: ' . $e->getMessage());
+        }
+
+        $refreshExpiresRaw = null;
+        try {
+            $refreshExpiresRaw = $token->getRefreshTokenExpiresAt();
+        } catch (\Throwable $e) {
+            Log::warning('QB: getRefreshTokenExpiresAt not available: ' . $e->getMessage());
+        }
         
-        $accessToken = $token->getAccessToken();
-        $refreshToken = $token->getRefreshToken();
+        $accessToken = null;
+        try {
+            $accessToken = $token->getAccessToken();
+        } catch (\Throwable $e) {
+            Log::error('QB: getAccessToken failed: ' . $e->getMessage());
+        }
+
+        $refreshToken = null;
+        try {
+            $refreshToken = $token->getRefreshToken();
+        } catch (\Throwable $e) {
+            Log::warning('QB: getRefreshToken failed: ' . $e->getMessage());
+        }
 
         // Encrypt if configured
         if (config('quickbooks.encrypt_tokens')) {
@@ -225,6 +256,9 @@ class QuickBooksService
         
         if ($refreshExpiresRaw) {
             $updateData['qb_refresh_expires_at'] = $this->parseTokenExpiration($refreshExpiresRaw);
+        } else {
+            // Default 100 days for QuickBooks refresh token if SDK did not parse it
+            $updateData['qb_refresh_expires_at'] = now()->addDays(100);
         }
         
         $organization->update($updateData);
@@ -234,6 +268,7 @@ class QuickBooksService
             'access_expires_at' => $updateData['qb_access_expires_at']->toDateTimeString(),
         ]);
     }
+
     /**
      * Parse token expiration from SDK date string
      */
@@ -468,7 +503,7 @@ class QuickBooksService
     {
         if (!$organization) {
             $user = Auth::user();
-            $organization = $user ? $user->organization : null;
+            $organization = $user ? ($user->organization ?? ($user->organization_id ? Organization::find($user->organization_id) : null)) : null;
         }
         
         if (!$organization || !$organization->qb_realm_id) {
