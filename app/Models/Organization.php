@@ -62,7 +62,27 @@ class Organization extends Model
         'qb_refresh_expires_at' => 'datetime',
     ];
 
-    protected $appends = ['company_logos_urls'];
+    protected $appends = [
+        'company_logos_urls',
+        'has_stripe_secret_key',
+        'has_stripe_webhook_secret',
+        'byo_stripe_enabled',
+    ];
+
+    public function getHasStripeSecretKeyAttribute(): bool
+    {
+        return !empty($this->attributes['stripe_secret_key']);
+    }
+
+    public function getHasStripeWebhookSecretAttribute(): bool
+    {
+        return !empty($this->attributes['stripe_webhook_secret']);
+    }
+
+    public function getByoStripeEnabledAttribute(): bool
+    {
+        return !empty($this->attributes['stripe_secret_key']) && !empty($this->attributes['stripe_publishable_key']);
+    }
 
     protected static function boot(): void
     {

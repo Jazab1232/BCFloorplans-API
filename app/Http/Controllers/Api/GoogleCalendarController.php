@@ -78,14 +78,19 @@ class GoogleCalendarController extends Controller
         $userType = class_basename($model);
         $redirectBackUrl = $request->query('redirect_back_url') ?? $request->header('referer') ?? config('app.frontend_url');
         
-        // Generate a clean, short unique state token
-        $state = (string) \Illuminate\Support\Str::uuid();
-        
-        Cache::put("google_oauth_state_{$state}", [
+        $statePayload = [
             'id' => $userUuid,
             'type' => $userType,
-            'redirect_back_url' => $redirectBackUrl
-        ], now()->addMinutes(10));
+            'redirect_back_url' => $redirectBackUrl,
+            'nonce' => (string) \Illuminate\Support\Str::random(16),
+            'ts' => time(),
+        ];
+        
+        // Generate a URL-safe Base64 self-contained state token
+        $state = rtrim(strtr(base64_encode(json_encode($statePayload)), '+/', '-_'), '=');
+        
+        // Store in cache for 30 minutes (handles local same-server fast lookup)
+        Cache::put("google_oauth_state_{$state}", $statePayload, now()->addMinutes(30));
         
         $authUrl = $this->calendarService->getAuthUrl($state);
         
@@ -103,7 +108,26 @@ class GoogleCalendarController extends Controller
     public function handleGoogleCallback(Request $request)
     {
         $state = $request->state;
-        $cachedData = Cache::get("google_oauth_state_{$state}");
+        $cachedData = null;
+
+        if (!empty($state)) {
+            $cachedData = Cache::get("google_oauth_state_{$state}");
+
+            // If cache miss (cross-environment / separate API servers), decode directly from state payload
+            if (!$cachedData) {
+                try {
+                    $decodedJson = base64_decode(strtr($state, '-_', '+/'));
+                    $decoded = json_decode($decodedJson, true);
+                    if (is_array($decoded) && !empty($decoded['id']) && !empty($decoded['type'])) {
+                        $cachedData = $decoded;
+                        Log::info("Google OAuth state successfully decoded from self-contained token for {$decoded['type']} ID: {$decoded['id']}");
+                    }
+                } catch (\Exception $e) {
+                    Log::warning("Failed to decode OAuth state payload: " . $e->getMessage());
+                }
+            }
+        }
+
         $redirectBackUrl = $cachedData['redirect_back_url'] ?? config('app.frontend_url');
 
         if ($request->has('error')) {
@@ -144,7 +168,9 @@ class GoogleCalendarController extends Controller
         );
 
         // Clean up cache
-        Cache::forget("google_oauth_state_{$state}");
+        if (!empty($state)) {
+            Cache::forget("google_oauth_state_{$state}");
+        }
 
         $separator = parse_url($redirectBackUrl, PHP_URL_QUERY) ? '&' : '?';
         if ($success) {
