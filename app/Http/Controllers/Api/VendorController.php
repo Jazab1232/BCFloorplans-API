@@ -16,6 +16,10 @@ use App\Models\VendorServiceOption;
 use App\Models\VendorPortfolioImage;
 use App\Models\ProductOption;
 use App\Models\Organization;
+use App\Models\Tour;
+use App\Models\TourFile;
+use App\Models\OrderService;
+use App\Models\OrderSlot;
 use Illuminate\Support\Str;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
@@ -106,6 +110,8 @@ class VendorController extends Controller
             $includeEvents = $request->boolean('include_google_events') || ($user instanceof Vendor);
 
             foreach ($vendors as $vendor) {
+                $this->populateFallbackPortfolioImages($vendor);
+
                 // Skip external events fetch for general vendor list queries (e.g. Agents)
                 if (!$includeEvents || ($user instanceof Vendor && $vendor->id !== $user->id && !$request->boolean('include_google_events'))) {
                     $vendor->calendar_events = [];
@@ -662,6 +668,8 @@ class VendorController extends Controller
                     }
                 }
             }
+
+            $this->populateFallbackPortfolioImages($vendor);
 
             return response()->json([
                 'success' => true,
@@ -1899,5 +1907,63 @@ class VendorController extends Controller
         }
     }
 
+    /**
+     * If vendor has not explicitly uploaded portfolio images, fallback to their recent tour photos.
+     */
+    protected function populateFallbackPortfolioImages(Vendor $vendor): void
+    {
+        if ($vendor->relationLoaded('portfolioImages') && $vendor->portfolioImages && $vendor->portfolioImages->isNotEmpty()) {
+            return;
+        }
 
+        try {
+            // Find orders assigned to this vendor
+            $orderIdsFromServices = OrderService::where('vendor_id', $vendor->uuid)
+                ->pluck('order_id');
+
+            $orderIdsFromSlots = OrderSlot::where('vendor_id', $vendor->id)
+                ->pluck('order_id');
+
+            $orderIds = $orderIdsFromServices->concat($orderIdsFromSlots)->unique()->filter()->values();
+
+            if ($orderIds->isEmpty()) {
+                return;
+            }
+
+            $tourIds = Tour::whereIn('order_id', $orderIds)->pluck('id');
+
+            if ($tourIds->isEmpty()) {
+                return;
+            }
+
+            $tourFiles = TourFile::whereIn('tour_id', $tourIds)
+                ->where('type', 'photo')
+                ->where('is_hidden', false)
+                ->whereNotNull('file_path')
+                ->latest()
+                ->take(20)
+                ->get();
+
+            if ($tourFiles->isNotEmpty()) {
+                $fallbackImages = $tourFiles->map(function ($file) use ($vendor) {
+                    $portfolioImage = new VendorPortfolioImage([
+                        'uuid' => $file->uuid,
+                        'vendor_id' => $vendor->id,
+                        'image_path' => $file->file_path,
+                        'image_type' => 'tour_reference',
+                        'is_processing' => false,
+                        'variants' => $file->variants,
+                    ]);
+                    $portfolioImage->id = $file->id;
+                    $portfolioImage->created_at = $file->created_at;
+                    $portfolioImage->updated_at = $file->updated_at;
+                    return $portfolioImage;
+                });
+
+                $vendor->setRelation('portfolioImages', $fallbackImages);
+            }
+        } catch (\Exception $e) {
+            Log::warning("Failed to populate fallback portfolio images for vendor {$vendor->id}: " . $e->getMessage());
+        }
+    }
 }

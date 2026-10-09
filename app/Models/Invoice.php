@@ -114,9 +114,13 @@ class Invoice extends Model
                         static::syncOrderServicePaymentStatus($invoice->order, $item->orderService);
                     }
                 }
+
+                // Auto-activate Matterport renewals if this invoice is paid
+                \App\Http\Controllers\Api\InvoiceController::activateMatterportRenewalForInvoice($invoice, 'payment');
             }
         });
     }
+
 
     public function getRouteKeyName()
     {

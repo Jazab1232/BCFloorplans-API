@@ -57,11 +57,6 @@ class CheckMatterportExpirations extends Command
                 continue;
             }
 
-            // Skip refunded or revoked tour links
-            if (!$link->is_paid) {
-                continue;
-            }
-
             $order = $tour->orders;
             $org = $order->organization;
             $agent = $order->agent;
@@ -75,15 +70,17 @@ class CheckMatterportExpirations extends Command
             $autoInvoiceEnabled = true;
             $autoInvoiceDays = 14;
             $renewalPlans = [
+                ['id' => '3_months', 'months' => 3, 'label' => '3 Months', 'price' => 35.00],
                 ['id' => '6_months', 'months' => 6, 'label' => '6 Months', 'price' => 60.00],
                 ['id' => '12_months', 'months' => 12, 'label' => '1 Year', 'price' => 100.00],
             ];
 
             if ($org) {
                 try {
-                    // Check notification preferences first, fallback to tour settings
+                    // Check notification preferences first (any role configured with intervals), fallback to tour settings
                     $pref = \App\Models\NotificationPreference::where('organization_id', $org->id)
                         ->where('event_type', 'matterport_expiry_reminder')
+                        ->whereNotNull('intervals')
                         ->whereNull('user_id')
                         ->first();
 
@@ -129,12 +126,32 @@ class CheckMatterportExpirations extends Command
                 }
             }
 
+            // Resolve Agent Portal Base URL (Whitelabel vs Default Agent Domain)
+            $agentDomain = env('NEXT_PUBLIC_DEFAULT_AGENT_DOMAIN', env('FRONTEND_URL', config('app.frontend_url', 'https://teams.tojuco.com')));
+            if ($org && $org->is_whitelabel) {
+                $domainRecord = $org->domains()->where('portal_type', 'agent')->first();
+                if ($domainRecord && !empty($domainRecord->domain)) {
+                    $agentDomain = $domainRecord->domain;
+                } elseif (!empty($org->domain)) {
+                    $agentDomain = $org->domain;
+                }
+            }
+            if (!str_starts_with($agentDomain, 'http://') && !str_starts_with($agentDomain, 'https://')) {
+                $agentDomain = 'https://' . $agentDomain;
+            }
+            $agentDomain = rtrim($agentDomain, '/');
+            $renewalUrl = $agentDomain . '/dashboard/matterport?tour=' . ($tour->uuid ?? '');
+
             $propertyAddress = $order->property_address ?? ($property ? $property->address : 'Property');
             $agentName = $agent ? trim($agent->first_name . ' ' . $agent->last_name) : 'Agent';
-            $frontendUrl = env('FRONTEND_URL', 'https://admin.bcfpsoftware.com');
-            $renewalUrl = rtrim($frontendUrl, '/') . '/dashboard/file-manager/' . $order->uuid;
 
-            // 1. Check for Upcoming Expiry Milestones
+            // 1. Auto-hide expired tour links from public views
+            if ($daysRemaining <= 0 && !$link->is_hidden) {
+                $link->update(['is_hidden' => true]);
+                $this->info("Auto-hidden expired Tour Link #{$link->id} for {$propertyAddress}");
+            }
+
+            // 2. Check for Upcoming Expiry Milestones
             if (in_array($daysRemaining, $intervals)) {
                 $alreadySent = EmailLog::where('event_type', 'matterport_expiry_reminder')
                     ->where('subject', 'like', "%{$link->id}%")
@@ -161,8 +178,9 @@ class CheckMatterportExpirations extends Command
                 }
             }
 
-            // 2. Check for Auto-Generating Draft Renewal Invoice
-            if ($autoInvoiceEnabled && $daysRemaining === $autoInvoiceDays && $agent) {
+            // 3. Check for Auto-Generating Draft Renewal Invoice
+            $firstReminderDay = !empty($intervals) ? max($intervals) : 30;
+            if ($autoInvoiceEnabled && $daysRemaining <= $firstReminderDay && $daysRemaining > 0 && $agent) {
                 $hasExistingInvoice = Invoice::where('order_id', $order->id)
                     ->where('notes', 'like', '%3D Tour Hosting Renewal%')
                     ->whereIn('status', ['draft', 'issued'])
@@ -171,7 +189,7 @@ class CheckMatterportExpirations extends Command
                 if (!$hasExistingInvoice) {
                     $selectedPlan = $renewalPlans[0] ?? ['months' => 6, 'price' => 60.00, 'label' => '6 Months'];
                     $amount = (float) ($selectedPlan['price'] ?? 60.00);
-                    $months = (int) ($selectedPlan['months'] ?? 6);
+                    $planLabel = $selectedPlan['label'] ?? ($selectedPlan['months'] ? "{$selectedPlan['months']} Months" : 'Renewal');
 
                     $province = $agent->headquarter_province ?? $order->property->province ?? 'BC';
                     $taxCalc = \App\Http\Controllers\Api\InvoiceController::calculateLineItemTax($province, $amount, true, false);
@@ -192,12 +210,12 @@ class CheckMatterportExpirations extends Command
                         'currency' => 'cad',
                         'due_date' => $expiryDate,
                         'issued_at' => now(),
-                        'notes' => "3D Tour Hosting Renewal ({$months} Months) - Auto-Draft Invoice",
+                        'notes' => "3D Tour Hosting Renewal ({$planLabel}) - Auto-Draft Invoice",
                         'agent_type' => 'primary',
                     ]);
 
                     $invoice->items()->create([
-                        'description' => "3D Tour / Matterport Hosting Renewal ({$months} Months) for {$propertyAddress}",
+                        'description' => "3D Tour / Matterport Hosting Renewal ({$planLabel}) for {$propertyAddress}",
                         'quantity' => 1,
                         'unit_price' => $amount,
                         'amount' => $amount,
@@ -210,7 +228,7 @@ class CheckMatterportExpirations extends Command
                 }
             }
 
-            // 3. Check for Expiration Day (Days Remaining == 0)
+            // 4. Check for Expiration Day (Days Remaining == 0)
             if ($daysRemaining === 0) {
                 $alreadySentExpired = EmailLog::where('event_type', 'matterport_expired')
                     ->where('subject', 'like', "%{$link->id}%")

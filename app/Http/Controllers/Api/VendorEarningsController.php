@@ -72,11 +72,7 @@ class VendorEarningsController extends Controller
         }
 
         // 1. Get all completed, invoiced, or paid order services for the vendor
-        $query = OrderService::where(function($q) use ($vendorUuid, $vendorId) {
-                $q->where('order_services.vendor_id', $vendorUuid)
-                  ->orWhere('order_services.vendor_id', (string)$vendorId)
-                  ->orWhere('order_services.vendor_id', (int)$vendorId);
-            })
+        $query = OrderService::where('order_services.vendor_id', $vendorUuid)
             ->leftJoin('orders', 'order_services.order_id', '=', 'orders.id')
             ->where(function($q) {
                 $q->where('order_services.is_completed', true)
@@ -88,14 +84,11 @@ class VendorEarningsController extends Controller
 
         // We filter by OrderSlot date if possible, otherwise updated_at
         // Left joining with OrderSlot to avoid discarding services that are missing slot assignments
-        $query->leftJoin('order_slots', function($join) use ($vendorId, $vendorUuid) {
+        $query->leftJoin('order_slots', function($join) use ($vendorId) {
             $join->on('order_services.order_id', '=', 'order_slots.order_id')
                  ->on('order_services.service_id', '=', 'order_slots.service_id');
             if ($vendorId) {
-                $join->where(function($sq) use ($vendorId, $vendorUuid) {
-                    $sq->where('order_slots.vendor_id', $vendorId)
-                       ->orWhere('order_slots.vendor_id', $vendorUuid);
-                });
+                $join->where('order_slots.vendor_id', $vendorId);
             }
         })->select('order_services.*', 'order_slots.date as slot_date', 'order_slots.distance', 'order_slots.km_price');
 

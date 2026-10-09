@@ -837,6 +837,12 @@ class InvoiceController extends Controller
                 'paid_at'     => $isFullyPaid ? now() : $invoice->paid_at,
             ]);
 
+            // If fully paid, activate any pending Matterport renewals attached to this invoice
+            if ($isFullyPaid) {
+                self::activateMatterportRenewalForInvoice($invoice, $request->payment_method ?? 'manual');
+            }
+
+
             // Sync with Order, in-portal notifications, email notifications, and other invoices
             \App\Http\Controllers\Api\StripeAgentWebhookController::updateOrderAfterPayment(
                 $invoice->order_id,
@@ -1196,4 +1202,158 @@ class InvoiceController extends Controller
             }
         }
     }
+
+    /**
+     * Activate Matterport Renewal, extend tour link expiry date, unhide links, and dispatch confirmation email.
+     */
+    public static function activateMatterportRenewalForInvoice($invoice, $paymentMethod = 'manual')
+    {
+        if (!$invoice) {
+            return;
+        }
+
+        if (is_numeric($invoice)) {
+            $invoice = Invoice::find($invoice);
+        }
+
+        if (!$invoice) {
+            return;
+        }
+
+        try {
+            // Check if this invoice was ALREADY processed and activated (idempotency)
+            $alreadyActivated = \App\Models\MatterportRenewal::where('invoice_id', $invoice->id)
+                ->where('payment_status', 'PAID')
+                ->exists();
+            if ($alreadyActivated) {
+                return;
+            }
+
+            // 1. First look for renewals explicitly tied to this invoice
+            $renewals = \App\Models\MatterportRenewal::where('invoice_id', $invoice->id)
+                ->where('payment_status', '!=', 'PAID')
+                ->get();
+
+
+            // 2. If no direct renewal found, check if this is specifically a renewal invoice
+            if ($renewals->isEmpty()) {
+                $notes = strtolower($invoice->notes ?? '');
+                $isRenewalInvoice = str_contains($notes, 'renewal') || str_contains($notes, 'hosting renewal');
+
+                if (!$isRenewalInvoice) {
+                    $invoice->loadMissing('items');
+                    foreach ($invoice->items as $item) {
+                        $desc = strtolower($item->description ?? '');
+                        if (str_contains($desc, 'hosting renewal') || (str_contains($desc, 'renewal') && (str_contains($desc, 'matterport') || str_contains($desc, '3d tour') || str_contains($desc, 'tour')))) {
+                            $isRenewalInvoice = true;
+                            break;
+                        }
+                    }
+                }
+
+
+                if ($isRenewalInvoice && $invoice->order_id) {
+                    $tour = \App\Models\Tour::where('order_id', $invoice->order_id)->first();
+                    if ($tour) {
+                        // Check if there is a pending renewal on this tour
+                        $pendingRenewal = \App\Models\MatterportRenewal::where('tour_id', $tour->id)
+                            ->where('payment_status', '!=', 'PAID')
+                            ->latest()
+                            ->first();
+
+                        if ($pendingRenewal) {
+                            $pendingRenewal->update(['invoice_id' => $invoice->id]);
+                            $renewals = collect([$pendingRenewal]);
+                        } else {
+                            // Determine duration from notes / items or subtotal
+                            $textToParse = ($invoice->notes ?? '') . ' ';
+                            foreach ($invoice->items as $item) {
+                                $textToParse .= ($item->description ?? '') . ' ';
+                            }
+
+                            $days = null;
+                            $months = 1;
+                            if (preg_match('/(\d+)\s*days?/i', $textToParse, $matches)) {
+                                $days = intval($matches[1]);
+                                $months = round($days / 30, 2);
+                            } elseif (preg_match('/(\d+)\s*months?/i', $textToParse, $matches)) {
+                                $months = intval($matches[1]);
+                                $days = $months * 30;
+                            } elseif (preg_match('/(\d+)\s*years?/i', $textToParse, $matches)) {
+                                $months = intval($matches[1]) * 12;
+                                $days = $months * 30;
+                            }
+
+                            $maxExpiry = $tour->links()->max('expiry_date');
+                            $baseDate = ($maxExpiry && \Carbon\Carbon::parse($maxExpiry)->isFuture())
+                                ? \Carbon\Carbon::parse($maxExpiry)
+                                : now();
+
+                            $newExpiryDate = ($days !== null && $days > 0)
+                                ? $baseDate->copy()->addDays($days)
+                                : $baseDate->copy()->addMonths($months > 0 ? $months : 1);
+
+                            $firstLink = $tour->links()->first();
+                            $createdRen = \App\Models\MatterportRenewal::create([
+                                'tour_id' => $tour->id,
+                                'tour_link_id' => $firstLink ? $firstLink->id : null,
+                                'agent_id' => $invoice->agent_id,
+                                'organization_id' => $invoice->organization_id,
+                                'invoice_id' => $invoice->id,
+                                'previous_expiry_date' => $maxExpiry ? \Carbon\Carbon::parse($maxExpiry)->toDateString() : null,
+                                'new_expiry_date' => $newExpiryDate->toDateString(),
+                                'duration_months' => $months,
+                                'amount' => $invoice->subtotal > 0 ? $invoice->subtotal : $invoice->total,
+                                'payment_status' => 'PAID',
+                                'payment_method' => $paymentMethod,
+                                'notes' => $invoice->notes,
+                            ]);
+                            $renewals = collect([$createdRen]);
+                        }
+                    }
+                }
+            }
+
+            // 3. Process each renewal found
+            foreach ($renewals as $ren) {
+                $ren->update([
+                    'payment_status' => 'PAID',
+                    'payment_method' => $paymentMethod,
+                    'invoice_id' => $invoice->id,
+                ]);
+
+                if ($ren->tour) {
+                    // Update all links belonging to this tour
+                    foreach ($ren->tour->links as $tl) {
+                        $tl->update([
+                            'expiry_date' => $ren->new_expiry_date,
+                            'is_hidden' => false,
+                        ]);
+                    }
+
+                    $ord = $ren->tour->orders;
+                    $ag = $ord ? $ord->agent : ($ren->agent ?? \App\Models\Agent::find($invoice->agent_id));
+                    $pAddress = $ord ? ($ord->property_address ?? ($ord->property ? $ord->property->address : 'Property')) : 'Property';
+                    $agName = $ag ? trim($ag->first_name . ' ' . $ag->last_name) : 'Agent';
+
+                    try {
+                        app(\App\Services\EmailDispatchService::class)->dispatch('matterport_renewed', $ren->tour, [
+                            'data' => [
+                                'propertyAddress' => $pAddress,
+                                'newExpiryDate' => \Carbon\Carbon::parse($ren->new_expiry_date)->format('M d, Y'),
+                                'durationMonths' => $ren->duration_months,
+                                'amount' => $ren->amount,
+                                'agentName' => $agName,
+                            ],
+                        ]);
+                    } catch (\Throwable $emailErr) {
+                        \Illuminate\Support\Facades\Log::warning('Failed to dispatch matterport_renewed email: ' . $emailErr->getMessage());
+                    }
+                }
+            }
+        } catch (\Throwable $renErr) {
+            \Illuminate\Support\Facades\Log::warning('Failed to complete Matterport renewal for invoice: ' . $renErr->getMessage());
+        }
+    }
 }
+

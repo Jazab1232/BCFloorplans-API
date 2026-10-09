@@ -115,6 +115,7 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api
     //mls data fetch route
     Route::get('/quickbooks/customers', [QuickBooksController::class, 'createCustomer']);
     Route::get('/vendor/fetch-mls-data', [VendorController::class, 'fetchMlsData']);
+    Route::get('/vendor/tour-media-settings', [TourController::class, 'getTourSettingsByVendor']);
 
     //vendor portfolio image routes
     Route::delete('/vendor/{vendorUuid}/portfolio-images', [VendorController::class, 'deleteAllPortfolioImages']);

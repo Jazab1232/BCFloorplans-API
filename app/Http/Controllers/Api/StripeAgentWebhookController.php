@@ -201,9 +201,13 @@ class StripeAgentWebhookController extends Controller
                 if ($invoiceRecord->order) {
                     \App\Models\Invoice::syncOrderStatus($invoiceRecord->order);
                 }
+
+                // Activate Matterport renewal if this invoice is for renewal
+                \App\Http\Controllers\Api\InvoiceController::activateMatterportRenewalForInvoice($invoiceRecord, 'stripe');
             }
 
             //  Update related order and order services after successful payment
+
             if (!empty($metadata->order_id)) {
                 $this->updateOrderAfterPayment(
                     $metadata->order_id,
@@ -250,6 +254,17 @@ class StripeAgentWebhookController extends Controller
                         Log::warning(' Order not found when updating after payment', ['order_id' => $orderId]);
                         return;
                     }
+
+                    // Activate any pending Matterport renewals attached to paid invoices for this order
+                    try {
+                        $orderInvoices = \App\Models\Invoice::where('order_id', $order->id)->where('status', 'paid')->get();
+                        foreach ($orderInvoices as $ordInv) {
+                            \App\Http\Controllers\Api\InvoiceController::activateMatterportRenewalForInvoice($ordInv, 'stripe');
+                        }
+                    } catch (\Throwable $renErr) {
+                        Log::warning('Failed to complete Matterport renewal in updateOrderAfterPayment: ' . $renErr->getMessage());
+                    }
+
                     $isSplitOrder = (bool) $order->split_invoice && !empty($order->co_agents);
                     $allOrderServicesPaid = fn () => !$order->services()
                         ->where('payment_status', '!=', 'PAID')
@@ -265,6 +280,7 @@ class StripeAgentWebhookController extends Controller
                         \App\Models\Invoice::syncOrderStatus($order);
                         return;
                     }
+
 
                     $previousPaidAmount = (float) $order->paid_amount;
                     $newPaidAmount = $previousPaidAmount + (float) $amount;
@@ -377,6 +393,17 @@ class StripeAgentWebhookController extends Controller
                         ]);
                     }
                     
+                    // Activate any pending Matterport renewals attached to paid invoices for this order
+                    try {
+                        $orderInvoices = \App\Models\Invoice::where('order_id', $order->id)->where('status', 'paid')->get();
+                        foreach ($orderInvoices as $ordInv) {
+                            \App\Http\Controllers\Api\InvoiceController::activateMatterportRenewalForInvoice($ordInv, 'stripe');
+                        }
+                    } catch (\Throwable $renErr) {
+                        Log::warning('Failed to complete Matterport renewal on webhook payment: ' . $renErr->getMessage());
+                    }
+
+
                     // If payment object is provided from webhook, create notification with creator context
                     if ($payment) {
                         self::createWebhookPaymentNotification($payment, $order);

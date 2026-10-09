@@ -14,6 +14,7 @@ use App\Models\Service;
 use App\Models\Agent;
 use App\Models\Vendor;
 use App\Models\SubAccount;
+use App\Models\OrderSlot;
 
 use App\Models\GlobalTourSetting;
 use App\Models\TourDailyStat;
@@ -35,6 +36,8 @@ use App\Services\ImageResizeService;
 use App\Models\MatterportRenewal;
 use App\Models\Invoice;
 use App\Models\Notification;
+use App\Models\Organization;
+use App\Services\StripeResolverService;
 use App\Services\EmailDispatchService;
 use App\Services\SettingsService;
 use Carbon\Carbon;
@@ -1697,20 +1700,25 @@ class TourController extends Controller
 
         Log::info('Fetching tour settings for vendor: ' . $validated['vendor_uuid']);
         try {
+            $vendor = Vendor::where('uuid', $validated['vendor_uuid'])->firstOrFail();
 
-            $orderServices = OrderService::where('vendor_id', $validated['vendor_uuid'])->get();
-            Log::info('Found ' . $orderServices->count() . ' order services for vendor: ' . $validated['vendor_uuid']);
-            $media = [];
+            $orderIdsFromServices = OrderService::where('vendor_id', $vendor->uuid)
+                ->pluck('order_id');
 
-            $media = Tour::whereIn('order_id', $orderServices->pluck('order_id'))->with('files')->get();
-            Log::info('Fetched tour settings for vendor: ' . $validated['vendor_uuid']);
-            Log::info('Media count: ' . $media->count());
-            $files = [];
-            foreach ($media as $tour) {
-                $tour->files->map(function ($file) use (&$files) {
-                    $files[] = $file;
-                });
-            }
+            $orderIdsFromSlots = OrderSlot::where('vendor_id', $vendor->id)
+                ->pluck('order_id');
+
+            $orderIds = $orderIdsFromServices->concat($orderIdsFromSlots)->unique()->filter()->values();
+
+            $tourIds = Tour::whereIn('order_id', $orderIds)->pluck('id');
+
+            $files = TourFile::whereIn('tour_id', $tourIds)
+                ->where('type', 'photo')
+                ->where('is_hidden', false)
+                ->whereNotNull('file_path')
+                ->latest()
+                ->get();
+
             $tourSettings = [
                 'media' => $files,
             ];
@@ -1794,7 +1802,7 @@ class TourController extends Controller
                 'orders.property:id,uuid,address,city,province',
                 'orders.organization:id,name,uuid',
                 'renewals.agent:id,uuid,first_name,last_name',
-                'renewals.invoice:id,uuid,invoice_number,status,total'
+                'renewals.invoice:id,uuid,invoice_number,status,total,subtotal,tax_amount,due_date'
             ])->orderBy('created_at', 'desc')->get();
 
             // Resolve organization-level or default renewal pricing settings
@@ -1865,7 +1873,9 @@ class TourController extends Controller
     public function renewMatterPort(Request $request, $uuid): JsonResponse
     {
         $validator = Validator::make($request->all(), [
-            'duration_months' => 'required|integer|min:1|max:36',
+            'duration_months' => 'nullable|integer|min:1|max:36',
+            'duration_days' => 'nullable|integer|min:1|max:1095',
+            'plan_id' => 'nullable|string',
             'amount' => 'nullable|numeric|min:0',
             'payment_method' => 'required|string|in:manual,stripe,card_on_file,invoice,cash,check',
             'notes' => 'nullable|string',
@@ -1906,7 +1916,12 @@ class TourController extends Controller
             $agent = $order ? $order->agent : null;
             $orgId = $order ? $order->organization_id : (app()->bound('current_organization_id') ? app('current_organization_id') : null);
 
-            $durationMonths = (int) $request->input('duration_months', 6);
+            $durationDays = $request->input('duration_days');
+            $durationMonths = $request->input('duration_months');
+            if (!$durationDays && !$durationMonths) {
+                $durationMonths = 6;
+            }
+
             $amount = (float) $request->input('amount', 60.00);
             $paymentMethod = $request->input('payment_method', 'manual');
             $notes = $request->input('notes', '');
@@ -1920,22 +1935,58 @@ class TourController extends Controller
             $firstLink = $links->first();
             $currentExpiry = $firstLink && $firstLink->expiry_date ? Carbon::parse($firstLink->expiry_date) : null;
             
+            // If active / future, add days onto current expiry; if expired, add days starting from today
             $baseDate = ($currentExpiry && $currentExpiry->isFuture()) ? $currentExpiry : Carbon::today();
-            $newExpiryDate = (clone $baseDate)->addMonths($durationMonths);
-
-            // Update all tour links
-            foreach ($links as $l) {
-                $l->update(['expiry_date' => $newExpiryDate]);
+            if ($durationDays) {
+                $newExpiryDate = (clone $baseDate)->addDays((int) $durationDays);
+                $durationMonths = (int) ceil($durationDays / 30);
+                $periodLabel = "{$durationDays} Days";
+            } else {
+                $newExpiryDate = (clone $baseDate)->addMonths((int) $durationMonths);
+                $periodLabel = "{$durationMonths} Months";
             }
 
-            // Create Invoice record
+            // Only mark as paid immediately if manual, cash, check, or card on file
+            $isPaid = in_array($paymentMethod, ['manual', 'card_on_file', 'cash', 'check']);
+
+            // Update all tour links and unhide them ONLY if already paid
+            if ($isPaid) {
+                foreach ($links as $l) {
+                    $l->update([
+                        'expiry_date' => $newExpiryDate,
+                        'is_hidden' => false,
+                    ]);
+                }
+            }
+
+            // 1. Check for existing pending renewal or unpaid renewal invoice to update in place
+            $existingRenewal = MatterportRenewal::where('tour_id', $tour->id)
+                ->where('payment_status', '!=', 'PAID')
+                ->latest()
+                ->first();
+
+            $existingInvoice = null;
+            if ($existingRenewal && $existingRenewal->invoice_id) {
+                $existingInvoice = Invoice::where('id', $existingRenewal->invoice_id)
+                    ->where('status', '!=', 'paid')
+                    ->first();
+            }
+
+            if (!$existingInvoice && $order) {
+                $existingInvoice = Invoice::where('order_id', $order->id)
+                    ->where('status', '!=', 'paid')
+                    ->where('notes', 'like', '%3D Tour Hosting Renewal%')
+                    ->latest()
+                    ->first();
+            }
+
+            // Create or update Invoice record
             $invoice = null;
             if ($order && $agent) {
                 $province = $agent->headquarter_province ?? $order->property->province ?? 'BC';
                 $taxCalc = \App\Http\Controllers\Api\InvoiceController::calculateLineItemTax($province, $amount, true, false);
-                $isPaid = in_array($paymentMethod, ['manual', 'stripe', 'card_on_file', 'cash', 'check']);
 
-                $invoice = Invoice::create([
+                $invoiceData = [
                     'organization_id' => $orgId,
                     'order_id' => $order->id,
                     'agent_id' => $agent->id,
@@ -1950,68 +2001,193 @@ class TourController extends Controller
                     'paid_amount' => $isPaid ? ($amount + $taxCalc['total_tax_amount']) : 0,
                     'currency' => 'cad',
                     'due_date' => $newExpiryDate,
-                    'issued_at' => now(),
                     'paid_at' => $isPaid ? now() : null,
-                    'notes' => "3D Tour Hosting Renewal ({$durationMonths} Months)" . ($notes ? " - {$notes}" : ""),
+                    'notes' => "3D Tour Hosting Renewal ({$periodLabel})" . ($notes ? " - {$notes}" : ""),
                     'agent_type' => 'primary',
-                ]);
+                ];
 
-                $propertyAddress = $order->property_address ?? ($order->property ? $order->property->address : '');
-                $invoice->items()->create([
-                    'description' => "3D Tour / Matterport Hosting Renewal ({$durationMonths} Months) for {$propertyAddress}",
-                    'quantity' => 1,
-                    'unit_price' => $amount,
-                    'amount' => $amount,
-                    'tax_amount' => $taxCalc['total_tax_amount'],
-                    'gst_amount' => $taxCalc['gst_amount'],
-                ]);
-            }
+                if ($existingInvoice) {
+                    $existingInvoice->update($invoiceData);
+                    $invoice = $existingInvoice;
 
-            // Record renewal audit entry
-            $user = auth()->user();
-            $renewal = MatterportRenewal::create([
-                'tour_id' => $tour->id,
-                'tour_link_id' => $firstLink ? $firstLink->id : null,
-                'agent_id' => $agent ? $agent->id : null,
-                'organization_id' => $orgId,
-                'invoice_id' => $invoice ? $invoice->id : null,
-                'previous_expiry_date' => $currentExpiry ? $currentExpiry->toDateString() : null,
-                'new_expiry_date' => $newExpiryDate->toDateString(),
-                'duration_months' => $durationMonths,
-                'amount' => $amount,
-                'payment_status' => in_array($paymentMethod, ['manual', 'stripe', 'card_on_file', 'cash', 'check']) ? 'PAID' : 'PENDING',
-                'payment_method' => $paymentMethod,
-                'renewed_by_type' => $user ? ($user->role ? $user->role->name : 'admin') : 'admin',
-                'renewed_by_id' => $user ? $user->id : null,
-                'notes' => $notes,
-            ]);
+                    // Update existing line item
+                    $item = $invoice->items()->first();
+                    $propertyAddress = $order->property_address ?? ($order->property ? $order->property->address : '');
+                    if ($item) {
+                        $item->update([
+                            'description' => "3D Tour / Matterport Hosting Renewal ({$periodLabel}) for {$propertyAddress}",
+                            'quantity' => 1,
+                            'unit_price' => $amount,
+                            'amount' => $amount,
+                            'tax_amount' => $taxCalc['total_tax_amount'],
+                            'gst_amount' => $taxCalc['gst_amount'],
+                        ]);
+                    } else {
+                        $invoice->items()->create([
+                            'description' => "3D Tour / Matterport Hosting Renewal ({$periodLabel}) for {$propertyAddress}",
+                            'quantity' => 1,
+                            'unit_price' => $amount,
+                            'amount' => $amount,
+                            'tax_amount' => $taxCalc['total_tax_amount'],
+                            'gst_amount' => $taxCalc['gst_amount'],
+                        ]);
+                    }
+                } else {
+                    $invoiceData['issued_at'] = now();
+                    $invoice = Invoice::create($invoiceData);
 
-            // Dispatch confirmation email
-            try {
-                $propertyAddress = $order ? ($order->property_address ?? ($order->property ? $order->property->address : 'Property')) : 'Property';
-                $agentName = $agent ? trim($agent->first_name . ' ' . $agent->last_name) : 'Agent';
-                app(EmailDispatchService::class)->dispatch('matterport_renewed', $tour, [
-                    'data' => [
-                        'propertyAddress' => $propertyAddress,
-                        'newExpiryDate' => $newExpiryDate->format('M d, Y'),
-                        'durationMonths' => $durationMonths,
+                    $propertyAddress = $order->property_address ?? ($order->property ? $order->property->address : '');
+                    $invoice->items()->create([
+                        'description' => "3D Tour / Matterport Hosting Renewal ({$periodLabel}) for {$propertyAddress}",
+                        'quantity' => 1,
+                        'unit_price' => $amount,
                         'amount' => $amount,
-                        'agentName' => $agentName,
-                    ],
-                ]);
-            } catch (\Throwable $e) {
-                Log::warning('Failed to dispatch matterport_renewed email: ' . $e->getMessage());
+                        'tax_amount' => $taxCalc['total_tax_amount'],
+                        'gst_amount' => $taxCalc['gst_amount'],
+                    ]);
+                }
             }
+
+            // Create Stripe Checkout Session if payment_method is stripe
+            $checkoutUrl = null;
+            if ($paymentMethod === 'stripe' && $invoice && $order && $agent) {
+                try {
+                    $organization = $orgId ? Organization::find($orgId) : null;
+                    $stripe = StripeResolverService::clientForOrganization($organization);
+
+                    $agentDomain = env('NEXT_PUBLIC_DEFAULT_AGENT_DOMAIN', env('FRONTEND_URL', config('app.frontend_url', 'https://teams.tojuco.com')));
+                    if ($organization && $organization->is_whitelabel) {
+                        $domainRecord = $organization->domains()->where('portal_type', 'agent')->first();
+                        if ($domainRecord && !empty($domainRecord->domain)) {
+                            $agentDomain = $domainRecord->domain;
+                        } elseif (!empty($organization->domain)) {
+                            $agentDomain = $organization->domain;
+                        }
+                    }
+                    if (!str_starts_with($agentDomain, 'http://') && !str_starts_with($agentDomain, 'https://')) {
+                        $agentDomain = 'https://' . $agentDomain;
+                    }
+                    $agentDomain = rtrim($agentDomain, '/');
+
+                    $returnUrl = $request->input('return_url');
+                    if (!empty($returnUrl)) {
+                        $connector = str_contains($returnUrl, '?') ? '&' : '?';
+                        $successUrl = $returnUrl . "{$connector}renewed=success&session_id={CHECKOUT_SESSION_ID}";
+                        $cancelUrl = $returnUrl . "{$connector}renewed=cancelled";
+                    } else {
+                        $successUrl = $agentDomain . "/dashboard/matterport?renewed=success&session_id={CHECKOUT_SESSION_ID}";
+                        $cancelUrl = $agentDomain . "/dashboard/matterport?renewed=cancelled";
+                    }
+
+                    $metadata = [
+                        'agent_uuid' => $agent->uuid,
+                        'order_id' => (string) $order->id,
+                        'invoice_uuid' => $invoice->uuid,
+                        'amount' => (string) $invoice->total,
+                        'currency' => 'cad',
+                        'payment_type' => 'full',
+                    ];
+
+                    $session = $stripe->checkout->sessions->create([
+                        'payment_method_types' => ['card'],
+                        'line_items' => [[
+                            'price_data' => [
+                                'currency' => 'cad',
+                                'product_data' => [
+                                    'name' => "3D Tour / Matterport Hosting Renewal ({$periodLabel})",
+                                ],
+                                'unit_amount' => intval(round($invoice->total * 100)),
+                            ],
+                            'quantity' => 1,
+                        ]],
+                        'mode' => 'payment',
+                        'success_url' => $successUrl,
+                        'cancel_url' => $cancelUrl,
+                        'metadata' => $metadata,
+                        'payment_intent_data' => [
+                            'metadata' => $metadata,
+                        ],
+                    ]);
+
+                    $checkoutUrl = $session->url;
+                } catch (\Throwable $stripeErr) {
+                    Log::error('Failed to create Stripe checkout session in renewMatterPort: ' . $stripeErr->getMessage());
+                }
+            }
+
+            // Record or update renewal audit entry
+            $user = auth()->user();
+            if ($existingRenewal) {
+                $existingRenewal->update([
+                    'tour_link_id' => $firstLink ? $firstLink->id : $existingRenewal->tour_link_id,
+                    'agent_id' => $agent ? $agent->id : $existingRenewal->agent_id,
+                    'organization_id' => $orgId ?? $existingRenewal->organization_id,
+                    'invoice_id' => $invoice ? $invoice->id : $existingRenewal->invoice_id,
+                    'previous_expiry_date' => $currentExpiry ? $currentExpiry->toDateString() : $existingRenewal->previous_expiry_date,
+                    'new_expiry_date' => $newExpiryDate->toDateString(),
+                    'duration_months' => $durationMonths,
+                    'amount' => $amount,
+                    'payment_status' => $isPaid ? 'PAID' : 'PENDING',
+                    'payment_method' => $paymentMethod,
+                    'notes' => $notes ?: $existingRenewal->notes,
+                ]);
+                $renewal = $existingRenewal;
+            } else {
+                $renewal = MatterportRenewal::create([
+                    'tour_id' => $tour->id,
+                    'tour_link_id' => $firstLink ? $firstLink->id : null,
+                    'agent_id' => $agent ? $agent->id : null,
+                    'organization_id' => $orgId,
+                    'invoice_id' => $invoice ? $invoice->id : null,
+                    'previous_expiry_date' => $currentExpiry ? $currentExpiry->toDateString() : null,
+                    'new_expiry_date' => $newExpiryDate->toDateString(),
+                    'duration_months' => $durationMonths,
+                    'amount' => $amount,
+                    'payment_status' => $isPaid ? 'PAID' : 'PENDING',
+                    'payment_method' => $paymentMethod,
+                    'renewed_by_type' => $user ? ($user->role ? $user->role->name : 'admin') : 'admin',
+                    'renewed_by_id' => $user ? $user->id : null,
+                    'notes' => $notes,
+                ]);
+            }
+
+            // Dispatch confirmation email if already paid
+            if ($isPaid) {
+                try {
+                    $propertyAddress = $order ? ($order->property_address ?? ($order->property ? $order->property->address : 'Property')) : 'Property';
+                    $agentName = $agent ? trim($agent->first_name . ' ' . $agent->last_name) : 'Agent';
+                    app(EmailDispatchService::class)->dispatch('matterport_renewed', $tour, [
+                        'data' => [
+                            'propertyAddress' => $propertyAddress,
+                            'newExpiryDate' => $newExpiryDate->format('M d, Y'),
+                            'durationMonths' => $durationMonths,
+                            'amount' => $amount,
+                            'agentName' => $agentName,
+                        ],
+                    ]);
+                } catch (\Throwable $e) {
+                    Log::warning('Failed to dispatch matterport_renewed email: ' . $e->getMessage());
+                }
+            }
+
+            $successMsg = $isPaid 
+                ? "Matterport hosting successfully renewed until {$newExpiryDate->format('M d, Y')}."
+                : ($checkoutUrl ? "Redirecting to Stripe checkout..." : "Renewal invoice created successfully. Hosting will be renewed upon payment.");
 
             return response()->json([
                 'success' => true,
-                'message' => "Matterport hosting successfully renewed until {$newExpiryDate->format('M d, Y')}.",
+                'message' => $successMsg,
                 'data' => [
-                    'new_expiry_date' => $newExpiryDate->toDateString(),
+                    'new_expiry_date' => $isPaid ? $newExpiryDate->toDateString() : ($currentExpiry ? $currentExpiry->toDateString() : null),
+                    'pending_expiry_date' => $newExpiryDate->toDateString(),
+                    'is_paid' => $isPaid,
                     'duration_months' => $durationMonths,
+                    'duration_days' => $durationDays,
                     'renewal' => $renewal,
                     'invoice' => $invoice,
+                    'checkout_url' => $checkoutUrl,
                 ],
+                'checkout_url' => $checkoutUrl,
             ]);
         } catch (\Exception $e) {
             return response()->json([
@@ -2039,26 +2215,41 @@ class TourController extends Controller
             }
 
             $order = $tour->orders;
+            $org = $order ? $order->organization : null;
             $agent = $order ? $order->agent : null;
-            $primaryLink = $tour->links->first();
-            if ($primaryLink && !$primaryLink->is_paid) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Cannot send renewal reminder: Media access for this Matterport tour has been revoked or unpaid.'
-                ], 422);
-            }
+            $primaryLink = $tour->links->first(function ($l) {
+                return in_array($l->type, ['branded', 'unbranded']) && !empty($l->link);
+            }) ?: $tour->links->first();
             $expiryDate = $primaryLink && $primaryLink->expiry_date ? Carbon::parse($primaryLink->expiry_date) : Carbon::today()->addDays(30);
             $daysRemaining = Carbon::today()->diffInDays($expiryDate, false);
 
             $propertyAddress = $order ? ($order->property_address ?? ($order->property ? $order->property->address : 'Property')) : 'Property';
             $agentName = $agent ? trim($agent->first_name . ' ' . $agent->last_name) : 'Agent';
-            $frontendUrl = env('FRONTEND_URL', 'https://admin.bcfpsoftware.com');
-            $renewalUrl = rtrim($frontendUrl, '/') . '/dashboard/file-manager/' . ($order ? $order->uuid : '');
+
+            // Resolve Agent Portal Base URL (Whitelabel vs Default Agent Domain)
+            $agentDomain = env('NEXT_PUBLIC_DEFAULT_AGENT_DOMAIN', env('FRONTEND_URL', config('app.frontend_url', 'https://teams.tojuco.com')));
+            if ($org && $org->is_whitelabel) {
+                $domainRecord = $org->domains()->where('portal_type', 'agent')->first();
+                if ($domainRecord && !empty($domainRecord->domain)) {
+                    $agentDomain = $domainRecord->domain;
+                } elseif (!empty($org->domain)) {
+                    $agentDomain = $org->domain;
+                }
+            }
+            if (!str_starts_with($agentDomain, 'http://') && !str_starts_with($agentDomain, 'https://')) {
+                $agentDomain = 'https://' . $agentDomain;
+            }
+            $agentDomain = rtrim($agentDomain, '/');
+            $renewalUrl = $agentDomain . '/dashboard/matterport?tour=' . ($tour->uuid ?? '');
+
             $formattedExpiryDate = $expiryDate->format('M d, Y');
             $remainingDays = max(0, $daysRemaining);
 
+            $isExpired = $daysRemaining < 0;
+            $eventType = $isExpired ? 'matterport_expired' : 'matterport_expiry_reminder';
+
             // 1. Dispatch email notification to Agent (and Admin if configured)
-            app(EmailDispatchService::class)->dispatch('matterport_expiry_reminder', $tour, [
+            app(EmailDispatchService::class)->dispatch($eventType, $tour, [
                 'data' => [
                     'propertyAddress' => $propertyAddress,
                     'property_address' => $propertyAddress,
@@ -2078,14 +2269,17 @@ class TourController extends Controller
                 try {
                     $currentUser = auth()->user();
                     $creatorName = $currentUser ? trim($currentUser->first_name . ' ' . $currentUser->last_name) : 'Admin';
+                    $notifDesc = $isExpired
+                        ? "Notice: Matterport 3D Tour hosting for '{$propertyAddress}' expired on {$formattedExpiryDate}"
+                        : "Reminder: Matterport 3D Tour hosting for '{$propertyAddress}' expires on {$formattedExpiryDate} ({$remainingDays} days remaining)";
 
                     Notification::create([
                         'uuid' => (string) Str::uuid(),
                         'organization_id' => $tour->organization_id ?? ($order ? $order->organization_id : null),
                         'source' => 'Tour',
                         'source_id' => $tour->uuid,
-                        'type' => 'matterport_expiry_reminder',
-                        'description' => "Reminder: Matterport 3D Tour hosting for '{$propertyAddress}' expires on {$formattedExpiryDate} ({$remainingDays} days remaining)",
+                        'type' => $eventType,
+                        'description' => $notifDesc,
                         'diff_data' => [],
                         'meta_data' => [
                             'order_id' => $order?->id,

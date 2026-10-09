@@ -413,8 +413,13 @@ class AgentPaymentController extends Controller
                             'status' => $isFullyPaid ? 'paid' : 'partially_paid',
                             'paid_at' => $isFullyPaid ? now() : $invoiceRecord->paid_at,
                         ]);
+
+                        if ($isFullyPaid) {
+                            \App\Http\Controllers\Api\InvoiceController::activateMatterportRenewalForInvoice($invoiceRecord, 'card');
+                        }
                     }
                 }
+
 
                 // Update order status, sync invoices, and dispatch in-portal & email notifications
                 StripeAgentWebhookController::updateOrderAfterPayment(

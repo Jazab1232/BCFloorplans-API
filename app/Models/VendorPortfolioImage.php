@@ -71,6 +71,12 @@ class VendorPortfolioImage extends Model
             if (filter_var($this->image_path, FILTER_VALIDATE_URL)) {
                 return $this->image_path;
             }
+            if (str_starts_with($this->image_path, 'tours/') || str_starts_with($this->image_path, 'orders/') || str_starts_with($this->image_path, 'vendors/')) {
+                if ($this->variants && isset($this->variants['slider'])) {
+                    return Storage::disk('s3')->url($this->variants['slider']);
+                }
+                return Storage::disk('s3')->url($this->image_path);
+            }
             return asset('storage/' . $this->image_path);
         }
 

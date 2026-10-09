@@ -25,7 +25,7 @@
             </tr>
             <tr>
                 <td style="padding: 6px 0; color: #166534; font-weight: bold;">Duration Added:</td>
-                <td style="padding: 6px 0; color: #111827;">{{ $durationMonths ?? '6' }} Months</td>
+                <td style="padding: 6px 0; color: #111827;">{{ $data['durationLabel'] ?? $data['duration_label'] ?? (($data['durationDays'] ?? $data['duration_days'] ?? null) ? ($data['durationDays'] ?? $data['duration_days']) . ' Days' : (($durationMonths ?? '6') . ' Months')) }}</td>
             </tr>
             @if(isset($amount))
             <tr>
