@@ -1213,7 +1213,7 @@ class InvoiceController extends Controller
         }
 
         if (is_numeric($invoice)) {
-            $invoice = Invoice::find($invoice);
+            $invoice = Invoice::withoutGlobalScopes()->find($invoice);
         }
 
         if (!$invoice) {
@@ -1222,18 +1222,33 @@ class InvoiceController extends Controller
 
         try {
             // Check if this invoice was ALREADY processed and activated (idempotency)
-            $alreadyActivated = \App\Models\MatterportRenewal::where('invoice_id', $invoice->id)
+            $alreadyActivated = \App\Models\MatterportRenewal::withoutGlobalScopes()
+                ->where('invoice_id', $invoice->id)
                 ->where('payment_status', 'PAID')
                 ->exists();
+
             if ($alreadyActivated) {
+                // Ensure all links for the tour are indeed set to the paid renewal's expiry date
+                $paidRenewals = \App\Models\MatterportRenewal::withoutGlobalScopes()
+                    ->where('invoice_id', $invoice->id)
+                    ->where('payment_status', 'PAID')
+                    ->get();
+                foreach ($paidRenewals as $pr) {
+                    if ($pr->tour) {
+                        $pr->tour->links()->update([
+                            'expiry_date' => $pr->new_expiry_date,
+                            'is_hidden' => false,
+                        ]);
+                    }
+                }
                 return;
             }
 
             // 1. First look for renewals explicitly tied to this invoice
-            $renewals = \App\Models\MatterportRenewal::where('invoice_id', $invoice->id)
+            $renewals = \App\Models\MatterportRenewal::withoutGlobalScopes()
+                ->where('invoice_id', $invoice->id)
                 ->where('payment_status', '!=', 'PAID')
                 ->get();
-
 
             // 2. If no direct renewal found, check if this is specifically a renewal invoice
             if ($renewals->isEmpty()) {
@@ -1251,12 +1266,12 @@ class InvoiceController extends Controller
                     }
                 }
 
-
                 if ($isRenewalInvoice && $invoice->order_id) {
-                    $tour = \App\Models\Tour::where('order_id', $invoice->order_id)->first();
+                    $tour = \App\Models\Tour::withoutGlobalScopes()->where('order_id', $invoice->order_id)->first();
                     if ($tour) {
                         // Check if there is a pending renewal on this tour
-                        $pendingRenewal = \App\Models\MatterportRenewal::where('tour_id', $tour->id)
+                        $pendingRenewal = \App\Models\MatterportRenewal::withoutGlobalScopes()
+                            ->where('tour_id', $tour->id)
                             ->where('payment_status', '!=', 'PAID')
                             ->latest()
                             ->first();
@@ -1323,16 +1338,14 @@ class InvoiceController extends Controller
                 ]);
 
                 if ($ren->tour) {
-                    // Update all links belonging to this tour
-                    foreach ($ren->tour->links as $tl) {
-                        $tl->update([
-                            'expiry_date' => $ren->new_expiry_date,
-                            'is_hidden' => false,
-                        ]);
-                    }
+                    // Update all links belonging to this tour directly via query builder
+                    $ren->tour->links()->update([
+                        'expiry_date' => $ren->new_expiry_date,
+                        'is_hidden' => false,
+                    ]);
 
                     $ord = $ren->tour->orders;
-                    $ag = $ord ? $ord->agent : ($ren->agent ?? \App\Models\Agent::find($invoice->agent_id));
+                    $ag = $ord ? $ord->agent : ($ren->agent ?? \App\Models\Agent::withoutGlobalScopes()->find($invoice->agent_id));
                     $pAddress = $ord ? ($ord->property_address ?? ($ord->property ? $ord->property->address : 'Property')) : 'Property';
                     $agName = $ag ? trim($ag->first_name . ' ' . $ag->last_name) : 'Agent';
 
@@ -1342,7 +1355,7 @@ class InvoiceController extends Controller
                                 'propertyAddress' => $pAddress,
                                 'newExpiryDate' => \Carbon\Carbon::parse($ren->new_expiry_date)->format('M d, Y'),
                                 'durationMonths' => $ren->duration_months,
-                                'amount' => $ren->amount,
+                                'amount' => (float) $ren->amount,
                                 'agentName' => $agName,
                             ],
                         ]);

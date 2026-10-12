@@ -30,7 +30,7 @@
             @if(isset($amount))
             <tr>
                 <td style="padding: 6px 0; color: #166534; font-weight: bold;">Amount Paid:</td>
-                <td style="padding: 6px 0; color: #111827; font-weight: bold;">${{ number_format($amount, 2) }} CAD</td>
+                <td style="padding: 6px 0; color: #111827; font-weight: bold;">${{ number_format((float)$amount, 2) }} CAD</td>
             </tr>
             @endif
         </table>

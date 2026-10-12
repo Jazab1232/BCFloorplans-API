@@ -534,6 +534,9 @@ Route::group(["middleware" => ["auth.any:api,vendor-api", "resolve.org"]], funct
 
     // Vendor Earnings (Self)
     Route::get('/vendor/earnings', [VendorEarningsController::class, 'index']);
+
+    // Vendor Stripe Connect (Vendor self & Admin on behalf of vendor)
+    Route::post('/vendor/stripe/connect', [VendorStripeConnectController::class, 'createOrGetAccountLink']);
 });
 
 // Presigned URL routes for direct S3 uploads (Admin & Vendors)

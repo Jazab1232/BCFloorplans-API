@@ -709,6 +709,23 @@ class QuickBooksService
                 );
             }
 
+            // Fallback line item if invoice has no items in BCF database
+            if (empty($lines)) {
+                $fallbackItemName = 'General Services';
+                $fallbackItemId = $this->getOrCreateServiceItem($dataService, null, $fallbackItemName);
+                $fallbackDesc = !empty($invoice->order_id)
+                    ? "Services for Order #{$invoice->order_id}"
+                    : "Services for Invoice #{$invoice->invoice_number}";
+                $totalAmount = (float)($invoice->total ?: ($invoice->paid_amount ?: 0));
+                
+                $lines[] = $this->createInvoiceLine(
+                    $fallbackItemId,
+                    1,
+                    $totalAmount,
+                    $fallbackDesc
+                );
+            }
+
             // 3. Resolve Tax Code
             $taxCodeId = $this->resolveTaxCodeId($dataService, $invoice);
 
@@ -716,7 +733,7 @@ class QuickBooksService
             $invoiceObj = Invoice::create([
                 'CustomerRef' => ['value' => $customerId],
                 'Line' => $lines,
-                'DocNumber' => $invoice->invoice_number,
+                'DocNumber' => $this->formatDocNumber($invoice->invoice_number),
                 'TxnDate' => $invoice->issued_at?->format('Y-m-d') ?? now()->format('Y-m-d'),
                 'PrivateNote' => "Order #{$invoice->order_id} - Property: " . ($invoice->order->property->address ?? 'N/A'),
                 'TxnTaxDetail' => $taxCodeId ? [
@@ -923,10 +940,21 @@ class QuickBooksService
                 ];
             }
 
+            if (empty($lines)) {
+                $lines[] = [
+                    'Amount' => (float)($vInvoice->total_amount ?: 0),
+                    'DetailType' => 'AccountBasedExpenseLineDetail',
+                    'AccountBasedExpenseLineDetail' => [
+                        'AccountRef' => ['value' => $expenseAccountId],
+                        'Description' => "Vendor Invoice for Cycle: {$vInvoice->cycle_start} to {$vInvoice->cycle_end}",
+                    ]
+                ];
+            }
+
             $billObj = Bill::create([
                 'VendorRef' => ['value' => $vendorId],
                 'Line' => $lines,
-                'DocNumber' => $vInvoice->invoice_number,
+                'DocNumber' => $this->formatDocNumber($vInvoice->invoice_number),
                 'PrivateNote' => "Vendor Invoice for Cycle: {$vInvoice->cycle_start} to {$vInvoice->cycle_end}",
             ]);
 
@@ -1351,6 +1379,31 @@ class QuickBooksService
         $line->Amount = round($total, 2);
 
         return $line;
+    }
+
+    /**
+     * Format DocNumber to ensure it never exceeds QuickBooks limit of 21 characters.
+     */
+    protected function formatDocNumber(?string $docNumber): ?string
+    {
+        if (empty($docNumber)) {
+            return null;
+        }
+
+        if (strlen($docNumber) <= 21) {
+            return $docNumber;
+        }
+
+        // If prefixed with 'INV-', remove it first
+        if (str_starts_with($docNumber, 'INV-')) {
+            $shortened = substr($docNumber, 4);
+            if (strlen($shortened) <= 21) {
+                return $shortened;
+            }
+        }
+
+        // If still over 21 characters, take the last 21 characters
+        return substr($docNumber, -21);
     }
 
 

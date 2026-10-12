@@ -314,7 +314,7 @@ class AgentPaymentController extends Controller
         $payerAgentId = $payerUuid ? Agent::where('uuid', $payerUuid)->value('id') : null;
 
         // Resolve invoice ID from UUID
-        $invoiceId = $invoiceUuid ? \App\Models\Invoice::where('uuid', $invoiceUuid)->value('id') : null;
+        $invoiceId = $invoiceUuid ? \App\Models\Invoice::withoutGlobalScopes()->where('uuid', $invoiceUuid)->value('id') : null;
 
         // Determine the effective agent_id for the payment record based on payment_mode
         // 'self' = payer takes ownership of the expense (agent's money)
@@ -331,6 +331,15 @@ class AgentPaymentController extends Controller
 
         if ($existingPayment) {
             Log::info('Payment already processed for session: ' . $session->id);
+
+            // Even if payment was already recorded, ensure renewal and invoice sync are executed
+            if ($invoiceId) {
+                $invoiceRecord = \App\Models\Invoice::withoutGlobalScopes()->find($invoiceId);
+                if ($invoiceRecord && $invoiceRecord->status === 'paid') {
+                    \App\Http\Controllers\Api\InvoiceController::activateMatterportRenewalForInvoice($invoiceRecord, 'card');
+                }
+            }
+
             return response()->json([
                 'success' => true,
                 'message' => 'Payment already processed.',
@@ -399,12 +408,9 @@ class AgentPaymentController extends Controller
 
                 // Update internal Invoice record if present
                 if ($invoiceId && $session->payment_status === 'paid') {
-                    $invoiceRecord = \App\Models\Invoice::find($invoiceId);
-                    // Check if this payment was already processed via webhook
-                    // If we just created the payment record now, or it wasn't paid yet, we should update the invoice
-                    $isNewPayment = $payment->wasRecentlyCreated || $payment->status !== 'succeeded';
+                    $invoiceRecord = \App\Models\Invoice::withoutGlobalScopes()->find($invoiceId);
 
-                    if ($invoiceRecord && $isNewPayment) {
+                    if ($invoiceRecord) {
                         $newPaid = (float)$invoiceRecord->paid_amount + $amount;
                         $isFullyPaid = $newPaid >= (float)$invoiceRecord->total;
 

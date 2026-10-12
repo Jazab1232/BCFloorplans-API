@@ -257,7 +257,7 @@ class StripeAgentWebhookController extends Controller
 
                     // Activate any pending Matterport renewals attached to paid invoices for this order
                     try {
-                        $orderInvoices = \App\Models\Invoice::where('order_id', $order->id)->where('status', 'paid')->get();
+                        $orderInvoices = \App\Models\Invoice::withoutGlobalScopes()->where('order_id', $order->id)->where('status', 'paid')->get();
                         foreach ($orderInvoices as $ordInv) {
                             \App\Http\Controllers\Api\InvoiceController::activateMatterportRenewalForInvoice($ordInv, 'stripe');
                         }
