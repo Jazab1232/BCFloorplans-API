@@ -1083,7 +1083,7 @@ class TourController extends Controller
             $isPaidOrder = $order && ($order->payment_status === 'PAID' || (bool) $order->release_media_before_payment);
 
             // Add downloadable URLs to files and snapshots
-            $tours->transform(function ($tour) use ($isAdminOrVendor, $isPaidOrder) {
+            $tours->transform(function ($tour) use ($isAdminOrVendor, $isPaidOrder, $order) {
                 $tour->files->transform(function ($file) use ($isAdminOrVendor, $isPaidOrder) {
                     $isFloorPlan = $file->type === 'pdf' || 
                         ($file->service && (
@@ -1114,8 +1114,28 @@ class TourController extends Controller
                     return $snapshot;
                 });
 
-                $tour->links->transform(function ($link) use ($isAdminOrVendor, $isPaidOrder) {
+                $tour->links->transform(function ($link) use ($isAdminOrVendor, $isPaidOrder, $order) {
                     $isPaid = $link->service_id ? $link->is_paid : ($link->is_paid || $isPaidOrder);
+
+                    $link->has_link = !empty($link->link);
+
+                    // If service_id is not set on the link, attempt to associate it with the order's 3D/Matterport service
+                    if (!$link->service_id && $order) {
+                        $orderService = \App\Models\OrderService::where('order_id', $order->id)
+                            ->whereHas('service', function ($q) {
+                                $q->where('name', 'like', '%matterport%')
+                                  ->orWhere('name', 'like', '%3d tour%')
+                                  ->orWhere('name', 'like', '%3d floor%')
+                                  ->orWhere('name', 'like', '%virtual tour%');
+                            })
+                            ->first();
+                        if ($orderService) {
+                            $link->service_id = $orderService->service_id;
+                            if (!$link->relationLoaded('service') || !$link->service) {
+                                $link->setRelation('service', $orderService->service);
+                            }
+                        }
+                    }
 
                     if (!$isAdminOrVendor && !$isPaid) {
                         // Protect link from unpaid or access-revoked agents

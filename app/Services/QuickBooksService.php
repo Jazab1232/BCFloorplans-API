@@ -615,12 +615,13 @@ class QuickBooksService
 
             $createdCustomer = $dataService->Add($customer);
 
-            if (!$createdCustomer) {
+            if (!$createdCustomer || $createdCustomer instanceof \Exception) {
                 $error = $dataService->getLastError();
-                $errorBody = $error ? $error->getResponseBody() : '';
+                $sdkMsg = ($createdCustomer instanceof \Exception) ? $createdCustomer->getMessage() : null;
+                $errorBody = $sdkMsg ?? ($error ? $error->getResponseBody() : '');
 
                 // Handle Duplicate Name Exists gracefully (e.g. existing client's QB already has this name)
-                if (strpos($errorBody, 'Duplicate Name Exists Error') !== false) {
+                if (strpos($errorBody, 'Duplicate Name Exists Error') !== false || strpos($errorBody, '6240') !== false) {
                     Log::info('QB customer creation returned Duplicate Name, attempting to find existing or use disambiguated name', [
                         'agent_id' => $agent->id,
                         'name' => $uniqueDisplayName,
@@ -639,8 +640,9 @@ class QuickBooksService
                     $createdCustomer = $dataService->Add($customer);
                 }
 
-                if (!$createdCustomer) {
-                    throw new \Exception('QB customer creation failed: ' . ($error ? $error->getResponseBody() : 'Unknown error'));
+                if (!$createdCustomer || $createdCustomer instanceof \Exception) {
+                    $retryMsg = ($createdCustomer instanceof \Exception) ? $createdCustomer->getMessage() : null;
+                    throw new \Exception('QB customer creation failed: ' . ($retryMsg ?? ($errorBody ?: 'Unknown error')));
                 }
             }
 
@@ -661,126 +663,156 @@ class QuickBooksService
      */
     public function syncInvoiceToQB(\App\Models\Invoice $invoice): ?array
     {
-        // Idempotency: skip if already synced to avoid duplicate QB invoices
-        if ($invoice->quickbooks_invoice_id) {
-            Log::info('QB sync skipped: invoice already synced', [
+        // Atomic lock to prevent duplicate concurrent syncs (e.g. Stripe webhook + manual retry)
+        $lockKey = "qb_sync_invoice_lock_{$invoice->id}";
+        $lock = Cache::lock($lockKey, 120);
+
+        if (!$lock->get()) {
+            Log::info('QB sync skipped: invoice is currently being synced by another process', [
                 'invoice_id' => $invoice->id,
-                'qb_invoice_id' => $invoice->quickbooks_invoice_id,
-                'doc_number' => $invoice->invoice_number,
             ]);
-            return [
-                'invoice_id' => $invoice->quickbooks_invoice_id,
-                'payment_id' => null,
-                'doc_number' => $invoice->invoice_number,
-            ];
+            return null;
         }
 
-        $log = QbSyncLog::create([
-            'organization_id' => $invoice->organization_id ?? $invoice->order?->organization_id,
-            'entity_type' => 'invoice',
-            'entity_id' => $invoice->id,
-            'action' => 'create',
-            'status' => 'pending',
-            'request_id' => (string) Str::uuid(),
-        ]);
-
         try {
-            $org = $invoice->organization 
-                ?? $invoice->order?->organization 
-                ?? ($invoice->organization_id ? \App\Models\Organization::find($invoice->organization_id) : null);
-            $dataService = $this->getDataService($org);
+            $invoice->refresh();
 
-            // 1. Ensure Customer
-            $customerId = $this->getOrCreateCustomer($invoice->agent, $org);
-
-            // 2. Build Lines with Tax Support
-            $lines = [];
-            foreach ($invoice->items as $item) {
-                // Ensure the QB item exists and is valid in the currently connected QB company
-                $service = $item->orderService?->service;
-                $fallbackName = !empty($item->description) ? trim(explode("\n", $item->description)[0]) : 'Service';
-                $itemId = $this->getOrCreateServiceItem($dataService, $service, $fallbackName);
-                
-                $lines[] = $this->createInvoiceLine(
-                    $itemId,
-                    $item->quantity,
-                    $item->unit_price,
-                    $item->description
-                );
+            // Idempotency: skip if already synced to avoid duplicate QB invoices
+            if ($invoice->quickbooks_invoice_id) {
+                Log::info('QB sync skipped: invoice already synced', [
+                    'invoice_id' => $invoice->id,
+                    'qb_invoice_id' => $invoice->quickbooks_invoice_id,
+                    'doc_number' => $invoice->invoice_number,
+                ]);
+                return [
+                    'invoice_id' => $invoice->quickbooks_invoice_id,
+                    'payment_id' => null,
+                    'doc_number' => $invoice->invoice_number,
+                ];
             }
 
-            // Fallback line item if invoice has no items in BCF database
-            if (empty($lines)) {
-                $fallbackItemName = 'General Services';
-                $fallbackItemId = $this->getOrCreateServiceItem($dataService, null, $fallbackItemName);
-                $fallbackDesc = !empty($invoice->order_id)
-                    ? "Services for Order #{$invoice->order_id}"
-                    : "Services for Invoice #{$invoice->invoice_number}";
-                $totalAmount = (float)($invoice->total ?: ($invoice->paid_amount ?: 0));
-                
-                $lines[] = $this->createInvoiceLine(
-                    $fallbackItemId,
-                    1,
-                    $totalAmount,
-                    $fallbackDesc
-                );
+            $log = QbSyncLog::create([
+                'organization_id' => $invoice->organization_id ?? $invoice->order?->organization_id,
+                'entity_type' => 'invoice',
+                'entity_id' => $invoice->id,
+                'action' => 'create',
+                'status' => 'pending',
+                'request_id' => (string) Str::uuid(),
+            ]);
+
+            try {
+                $org = $invoice->organization 
+                    ?? $invoice->order?->organization 
+                    ?? ($invoice->organization_id ? \App\Models\Organization::find($invoice->organization_id) : null);
+                $dataService = $this->getDataService($org);
+
+                // 1. Ensure Customer
+                $customerId = $this->getOrCreateCustomer($invoice->agent, $org);
+
+                // 2. Build Lines with Tax Support
+                $lines = [];
+                foreach ($invoice->items as $item) {
+                    // Ensure the QB item exists and is valid in the currently connected QB company
+                    $service = $item->orderService?->service;
+                    $fallbackName = !empty($item->description) ? trim(explode("\n", $item->description)[0]) : 'Service';
+                    $itemId = $this->getOrCreateServiceItem($dataService, $service, $fallbackName);
+                    
+                    $lines[] = $this->createInvoiceLine(
+                        $itemId,
+                        $item->quantity,
+                        $item->unit_price,
+                        $item->description
+                    );
+                }
+
+                // Fallback line item if invoice has no items in BCF database
+                if (empty($lines)) {
+                    $fallbackItemName = 'General Services';
+                    $fallbackItemId = $this->getOrCreateServiceItem($dataService, null, $fallbackItemName);
+                    $fallbackDesc = !empty($invoice->order_id)
+                        ? "Services for Order #{$invoice->order_id}"
+                        : "Services for Invoice #{$invoice->invoice_number}";
+                    $totalAmount = (float)($invoice->total ?: ($invoice->paid_amount ?: 0));
+                    
+                    $lines[] = $this->createInvoiceLine(
+                        $fallbackItemId,
+                        1,
+                        $totalAmount,
+                        $fallbackDesc
+                    );
+                }
+
+                // 3. Resolve Tax Code
+                $taxCodeId = $this->resolveTaxCodeId($dataService, $invoice);
+
+                // 4. Create QB Invoice
+                $invoiceObj = Invoice::create([
+                    'CustomerRef' => ['value' => $customerId],
+                    'Line' => $lines,
+                    'DocNumber' => $this->formatDocNumber($invoice->invoice_number),
+                    'TxnDate' => $invoice->issued_at?->format('Y-m-d') ?? now()->format('Y-m-d'),
+                    'PrivateNote' => "Order #{$invoice->order_id} - Property: " . ($invoice->order->property->address ?? 'N/A'),
+                    'TxnTaxDetail' => $taxCodeId ? [
+                        'TxnTaxCodeRef' => ['value' => $taxCodeId]
+                    ] : null,
+                ]);
+
+                $qbInvoice = $dataService->Add($invoiceObj);
+
+                // The QB SDK can return an Exception object instead of null on failure.
+                // A truthy check (!$qbInvoice) misses this case, so we check explicitly.
+                if (!$qbInvoice || $qbInvoice instanceof \Exception) {
+                    $error = $dataService->getLastError();
+                    $sdkMsg = ($qbInvoice instanceof \Exception) ? $qbInvoice->getMessage() : null;
+                    throw new \Exception('QB invoice creation failed: ' . ($sdkMsg ?? $error?->getResponseBody() ?? 'Unknown'));
+                }
+
+                // 5. If paid, create payment
+                $qbPaymentId = null;
+                if ($invoice->status === 'paid' || $invoice->paid_amount > 0) {
+                    $qbPayment = $this->createPaymentForInvoice($dataService, $qbInvoice, $invoice->paid_amount);
+                    $qbPaymentId = $qbPayment?->Id;
+                }
+
+                $invoice->update([
+                    'quickbooks_invoice_id' => $qbInvoice->Id,
+                    'quickbooks_synced_at' => now(),
+                ]);
+
+                // Update linked AgentPayment records so getSyncQueue and payment lists reflect synced status
+                AgentPayment::where('invoice_id', $invoice->id)
+                    ->whereNull('quickbooks_invoice_id')
+                    ->update([
+                        'quickbooks_invoice_id' => $qbInvoice->Id,
+                        'quickbooks_payment_id' => $qbPaymentId,
+                        'quickbooks_txn_id'     => $qbInvoice->DocNumber,
+                        'quickbooks_synced_at'  => now(),
+                    ]);
+
+                $log->update([
+                    'status' => 'success',
+                    'qb_entity_id' => $qbInvoice->Id,
+                    'qb_doc_number' => $qbInvoice->DocNumber,
+                    'response' => (array)$qbInvoice,
+                ]);
+
+                return [
+                    'invoice_id' => $qbInvoice->Id,
+                    'payment_id' => $qbPaymentId,
+                    'doc_number' => $qbInvoice->DocNumber,
+                ];
+
+            } catch (\Exception $e) {
+                $log->update([
+                    'status' => 'failed',
+                    'error_message' => $e->getMessage(),
+                    'attempts' => $log->attempts + 1,
+                ]);
+                Log::error('QuickBooks Sync Error: ' . $e->getMessage());
+                return null;
             }
-
-            // 3. Resolve Tax Code
-            $taxCodeId = $this->resolveTaxCodeId($dataService, $invoice);
-
-            // 4. Create QB Invoice
-            $invoiceObj = Invoice::create([
-                'CustomerRef' => ['value' => $customerId],
-                'Line' => $lines,
-                'DocNumber' => $this->formatDocNumber($invoice->invoice_number),
-                'TxnDate' => $invoice->issued_at?->format('Y-m-d') ?? now()->format('Y-m-d'),
-                'PrivateNote' => "Order #{$invoice->order_id} - Property: " . ($invoice->order->property->address ?? 'N/A'),
-                'TxnTaxDetail' => $taxCodeId ? [
-                    'TxnTaxCodeRef' => ['value' => $taxCodeId]
-                ] : null,
-            ]);
-
-            $qbInvoice = $dataService->Add($invoiceObj);
-
-            if (!$qbInvoice) {
-                $error = $dataService->getLastError();
-                throw new \Exception('QB invoice creation failed: ' . ($error?->getResponseBody() ?? 'Unknown'));
-            }
-
-            // 5. If paid, create payment
-            $qbPaymentId = null;
-            if ($invoice->status === 'paid' || $invoice->paid_amount > 0) {
-                $qbPayment = $this->createPaymentForInvoice($dataService, $qbInvoice, $invoice->paid_amount);
-                $qbPaymentId = $qbPayment?->Id;
-            }
-
-            $invoice->update([
-                'quickbooks_invoice_id' => $qbInvoice->Id,
-                'quickbooks_synced_at' => now(),
-            ]);
-
-            $log->update([
-                'status' => 'success',
-                'qb_entity_id' => $qbInvoice->Id,
-                'qb_doc_number' => $qbInvoice->DocNumber,
-                'response' => (array)$qbInvoice,
-            ]);
-
-            return [
-                'invoice_id' => $qbInvoice->Id,
-                'payment_id' => $qbPaymentId,
-                'doc_number' => $qbInvoice->DocNumber,
-            ];
-
-        } catch (\Exception $e) {
-            $log->update([
-                'status' => 'failed',
-                'error_message' => $e->getMessage(),
-                'attempts' => $log->attempts + 1,
-            ]);
-            Log::error('QuickBooks Sync Error: ' . $e->getMessage());
-            return null;
+        } finally {
+            $lock->release();
         }
     }
 
@@ -871,9 +903,10 @@ class QuickBooksService
 
             $qbCreditMemo = $dataService->Add($creditMemoObj);
 
-            if (!$qbCreditMemo) {
+            if (!$qbCreditMemo || $qbCreditMemo instanceof \Exception) {
                 $error = $dataService->getLastError();
-                throw new \Exception('QB CreditMemo creation failed: ' . ($error?->getResponseBody() ?? 'Unknown'));
+                $sdkMsg = ($qbCreditMemo instanceof \Exception) ? $qbCreditMemo->getMessage() : null;
+                throw new \Exception('QB CreditMemo creation failed: ' . ($sdkMsg ?? $error?->getResponseBody() ?? 'Unknown'));
             }
 
             $log->update([
@@ -960,9 +993,10 @@ class QuickBooksService
 
             $qbBill = $dataService->Add($billObj);
 
-            if (!$qbBill) {
+            if (!$qbBill || $qbBill instanceof \Exception) {
                 $error = $dataService->getLastError();
-                throw new \Exception('QB Bill creation failed: ' . ($error?->getResponseBody() ?? 'Unknown'));
+                $sdkMsg = ($qbBill instanceof \Exception) ? $qbBill->getMessage() : null;
+                throw new \Exception('QB Bill creation failed: ' . ($sdkMsg ?? $error?->getResponseBody() ?? 'Unknown'));
             }
 
             $vInvoice->update([
@@ -1032,9 +1066,10 @@ class QuickBooksService
 
             $qbBillPayment = $dataService->Add($billPaymentObj);
 
-            if (!$qbBillPayment) {
+            if (!$qbBillPayment || $qbBillPayment instanceof \Exception) {
                 $error = $dataService->getLastError();
-                throw new \Exception('QB BillPayment failed: ' . ($error?->getResponseBody() ?? 'Unknown'));
+                $sdkMsg = ($qbBillPayment instanceof \Exception) ? $qbBillPayment->getMessage() : null;
+                throw new \Exception('QB BillPayment failed: ' . ($sdkMsg ?? $error?->getResponseBody() ?? 'Unknown'));
             }
 
             $log->update([
@@ -1103,17 +1138,21 @@ class QuickBooksService
         ]);
 
         $qbVendor = $dataService->Add($vendorObj);
-        if (!$qbVendor) {
-            // Check if display name exists
+        if (!$qbVendor || $qbVendor instanceof \Exception) {
             $error = $dataService->getLastError();
-            if (strpos($error->getResponseBody(), 'Duplicate Name Exists Error') !== false) {
-                $vendors = $dataService->Query("SELECT * FROM Vendor WHERE DisplayName = '{$displayName}'");
+            $sdkMsg = ($qbVendor instanceof \Exception) ? $qbVendor->getMessage() : null;
+            $errorBody = $sdkMsg ?? ($error ? $error->getResponseBody() : '');
+
+            // Check if display name exists
+            if ($errorBody && (strpos($errorBody, 'Duplicate Name Exists Error') !== false || strpos($errorBody, '6240') !== false)) {
+                $escapedName = str_replace("'", "''", $displayName);
+                $vendors = $dataService->Query("SELECT * FROM Vendor WHERE DisplayName = '{$escapedName}'");
                 if (!empty($vendors)) {
                     $vendor->update(['quickbooks_vendor_id' => $vendors[0]->Id]);
                     return $vendors[0]->Id;
                 }
             }
-            throw new \Exception('Failed to create QB Vendor: ' . ($error?->getResponseBody() ?? 'Unknown'));
+            throw new \Exception('Failed to create QB Vendor: ' . ($errorBody ?: 'Unknown'));
         }
 
         $vendor->update(['quickbooks_vendor_id' => $qbVendor->Id]);
@@ -1323,12 +1362,13 @@ class QuickBooksService
 
         $createdItem = $dataService->Add($item);
 
-        if (!$createdItem) {
+        if (!$createdItem || $createdItem instanceof \Exception) {
             $error = $dataService->getLastError();
-            $errorBody = $error ? $error->getResponseBody() : '';
+            $sdkMsg = ($createdItem instanceof \Exception) ? $createdItem->getMessage() : null;
+            $errorBody = $sdkMsg ?? ($error ? $error->getResponseBody() : '');
 
             // Handle duplicate name collision if it exists in QB
-            if (strpos($errorBody, 'Duplicate Name Exists Error') !== false) {
+            if ($errorBody && (strpos($errorBody, 'Duplicate Name Exists Error') !== false || strpos($errorBody, '6240') !== false)) {
                 $escapedName = str_replace("'", "''", $itemName);
                 $existing = $dataService->Query("SELECT * FROM Item WHERE Name = '{$escapedName}' MAXRESULTS 1");
                 if (!empty($existing) && is_array($existing)) {
@@ -1339,7 +1379,7 @@ class QuickBooksService
                 }
             }
 
-            throw new \Exception('QB item creation failed: ' . ($error?->getResponseBody() ?? 'Unknown error'));
+            throw new \Exception('QB item creation failed: ' . ($errorBody ?: 'Unknown error'));
         }
 
         if ($service) {
@@ -1432,9 +1472,10 @@ class QuickBooksService
 
         $invoice = $dataService->Add($invoiceObj);
 
-        if (!$invoice) {
+        if (!$invoice || $invoice instanceof \Exception) {
             $error = $dataService->getLastError();
-            throw new \Exception('QB invoice creation failed: ' . ($error?->getResponseBody() ?? 'Unknown'));
+            $sdkMsg = ($invoice instanceof \Exception) ? $invoice->getMessage() : null;
+            throw new \Exception('QB invoice creation failed: ' . ($sdkMsg ?? $error?->getResponseBody() ?? 'Unknown'));
         }
 
         return $invoice;
@@ -1470,11 +1511,11 @@ class QuickBooksService
 
         $qbPayment = $dataService->Add($paymentObj);
 
-        if (!$qbPayment) {
+        if (!$qbPayment || $qbPayment instanceof \Exception) {
             $error = $dataService->getLastError();
             Log::error('QB payment creation failed', [
                 'invoice_id' => $qbInvoice->Id,
-                'error' => $error ? $error->getResponseBody() : null,
+                'error' => ($qbPayment instanceof \Exception) ? $qbPayment->getMessage() : ($error ? $error->getResponseBody() : null),
             ]);
             return null;
         }
@@ -1515,78 +1556,38 @@ class QuickBooksService
     }
 
     /**
-     * Retry failed syncs — uses the modern syncInvoiceToQB() path.
-     * Finds paid invoices missing quickbooks_invoice_id and synchronizes them.
+     * Retry failed syncs — dispatches queued jobs to avoid HTTP timeout.
+     * Finds paid invoices missing quickbooks_invoice_id and queues them for sync.
      */
     public function retryFailedSyncs()
     {
-        Log::info('Starting QB retry for failed syncs...');
-        
+        Log::info('Starting QB retry for failed syncs (queued)...');
+
         $user = Auth::user();
         $orgId = $user ? ($user->organization_id ?? $user->organization?->id) : null;
 
         $query = \App\Models\Invoice::whereNull('quickbooks_invoice_id')
             ->whereIn('status', ['paid', 'partially_paid'])
             ->where('total', '>', 0)
-            ->with(['order.property', 'items.orderService.service', 'agent', 'order.organization']);
+            ->select('id'); // Only fetch IDs — jobs load the full model themselves
 
         if ($orgId) {
             $query->where('organization_id', $orgId);
         }
 
-        $unsyncedInvoices = $query->limit(50)->get();
+        $invoiceIds = $query->limit(50)->pluck('id');
 
-        Log::info('Found ' . $unsyncedInvoices->count() . ' invoices to sync');
+        Log::info('QB retry: dispatching ' . $invoiceIds->count() . ' invoice jobs to queue');
 
-        $successCount = 0;
-        $failCount = 0;
-
-        foreach ($unsyncedInvoices as $invoice) {
-            try {
-                Log::info('Retrying QB sync for invoice', [
-                    'invoice_id' => $invoice->id,
-                    'invoice_number' => $invoice->invoice_number,
-                ]);
-                
-                $result = $this->syncInvoiceToQB($invoice);
-                
-                if ($result) {
-                    $successCount++;
-                    Log::info('Successfully synced invoice: ' . $invoice->id);
-
-                    // Update any linked AgentPayment records so getSyncQueue shows them as synced
-                    AgentPayment::where('invoice_id', $invoice->id)
-                        ->whereNull('quickbooks_invoice_id')
-                        ->update([
-                            'quickbooks_invoice_id' => $result['invoice_id'],
-                            'quickbooks_payment_id' => $result['payment_id'],
-                            'quickbooks_txn_id' => $result['doc_number'],
-                            'quickbooks_synced_at' => now(),
-                        ]);
-                } else {
-                    $failCount++;
-                    Log::warning('Failed to sync invoice: ' . $invoice->id);
-                }
-                
-            } catch (\Exception $e) {
-                $failCount++;
-                Log::error('Retry failed for invoice', [
-                    'invoice_id' => $invoice->id,
-                    'error' => $e->getMessage(),
-                ]);
-            }
+        foreach ($invoiceIds as $invoiceId) {
+            \App\Jobs\SyncInvoiceToQuickBooks::dispatch($invoiceId);
         }
 
-        Log::info("QB retry completed", [
-            'success' => $successCount,
-            'failed' => $failCount,
-            'total' => $unsyncedInvoices->count(),
-        ]);
-        
+        Log::info('QB retry: all jobs dispatched', ['total' => $invoiceIds->count()]);
+
         return [
-            'success' => $successCount,
-            'failed' => $failCount,
-            'total' => $unsyncedInvoices->count()
+            'queued' => $invoiceIds->count(),
+            'total'  => $invoiceIds->count(),
         ];
     }
 

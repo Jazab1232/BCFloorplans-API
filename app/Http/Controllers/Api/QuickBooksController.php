@@ -451,17 +451,29 @@ class QuickBooksController extends Controller
     public function getSyncQueue(): JsonResponse
     {
         try {
-            $pending = AgentPayment::where('status', 'succeeded')
-                ->whereNotNull('paid_at')
-                ->whereNull('quickbooks_invoice_id')
-                ->count();
+            $user = Auth::user();
+            $orgId = $user ? ($user->organization_id ?? $user->organization?->id) : null;
 
-            $synced = AgentPayment::whereNotNull('quickbooks_invoice_id')
-                ->count();
-
-            $recentUnsynced = AgentPayment::where('status', 'succeeded')
+            $pendingQuery = AgentPayment::where('status', 'succeeded')
                 ->whereNotNull('paid_at')
-                ->whereNull('quickbooks_invoice_id')
+                ->whereNull('quickbooks_invoice_id');
+
+            $syncedQuery = AgentPayment::whereNotNull('quickbooks_invoice_id');
+
+            $recentQuery = AgentPayment::where('status', 'succeeded')
+                ->whereNotNull('paid_at')
+                ->whereNull('quickbooks_invoice_id');
+
+            if ($orgId) {
+                $pendingQuery->whereHas('order', fn($q) => $q->where('organization_id', $orgId));
+                $syncedQuery->whereHas('order', fn($q) => $q->where('organization_id', $orgId));
+                $recentQuery->whereHas('order', fn($q) => $q->where('organization_id', $orgId));
+            }
+
+            $pending = $pendingQuery->count();
+            $synced = $syncedQuery->count();
+
+            $recentUnsynced = $recentQuery
                 ->with('order')
                 ->orderBy('created_at', 'desc')
                 ->limit(10)
@@ -502,13 +514,13 @@ class QuickBooksController extends Controller
 
             return response()->json([
                 'success' => true,
-                'message' => 'Retry process completed',
-                'data' => $result
+                'message' => "Sync queued: {$result['queued']} invoice(s) dispatched to background queue.",
+                'data'    => $result
             ]);
         } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
-                'error' => $e->getMessage()
+                'error'   => $e->getMessage()
             ], 500);
         }
     }

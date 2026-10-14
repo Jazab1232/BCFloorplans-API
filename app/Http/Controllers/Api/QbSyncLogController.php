@@ -12,18 +12,23 @@ class QbSyncLogController extends Controller
     {
         try {
             $limit = $request->query('limit', 100);
-            
+
             $orgId = app()->bound('current_organization_id') ? app('current_organization_id') : null;
             $user = auth()->user();
             if ($orgId === null && $user) {
                 $orgId = $user->organization_id;
             }
 
-            $query = \App\Models\QbSyncLog::orderBy('created_at', 'desc');
-
-            if ($orgId) {
-                $query->where('organization_id', $orgId);
+            // Safety guard: never expose all orgs' logs if we can't resolve the org
+            if (!$orgId) {
+                return response()->json([
+                    'success' => true,
+                    'data'    => [],
+                ]);
             }
+
+            $query = \App\Models\QbSyncLog::orderBy('created_at', 'desc')
+                ->where('organization_id', $orgId);
 
             if ($request->has('status')) {
                 $query->where('status', $request->query('status'));
@@ -37,29 +42,29 @@ class QbSyncLogController extends Controller
 
             $formattedData = $logs->map(function ($log) {
                 return [
-                    'uuid' => $log->uuid,
-                    'entity_type' => $log->entity_type,
-                    'entity_id' => $log->entity_id,
-                    'qb_entity_id' => $log->qb_entity_id,
+                    'uuid'          => $log->uuid,
+                    'entity_type'   => $log->entity_type,
+                    'entity_id'     => $log->entity_id,
+                    'qb_entity_id'  => $log->qb_entity_id,
                     'qb_doc_number' => $log->qb_doc_number,
-                    'action' => $log->action,
-                    'status' => $log->status,
+                    'action'        => $log->action,
+                    'status'        => $log->status,
                     'error_message' => $log->error_message,
-                    'error_code' => $log->error_code,
-                    'attempts' => $log->attempts,
-                    'created_at' => $log->created_at->toIso8601String(),
+                    'error_code'    => $log->error_code,
+                    'attempts'      => $log->attempts,
+                    'created_at'    => $log->created_at->toIso8601String(),
                 ];
             });
 
             return response()->json([
                 'success' => true,
-                'data' => $formattedData,
+                'data'    => $formattedData,
             ]);
         } catch (Exception $e) {
             return response()->json([
                 'success' => false,
                 'message' => 'Failed to fetch sync logs.',
-                'error' => $e->getMessage()
+                'error'   => $e->getMessage()
             ], 500);
         }
     }
@@ -115,14 +120,17 @@ class QbSyncLogController extends Controller
             $orgId = app()->bound('current_organization_id') ? app('current_organization_id') : null;
             $user = auth()->user();
             if ($orgId === null && $user) {
-                $orgId = $user->organization_id;
+                $orgId = $user->organization_id ?? $user->organization?->id;
             }
 
-            $query = \App\Models\QbSyncLog::where('uuid', $uuid);
-
-            if ($orgId) {
-                $query->where('organization_id', $orgId);
+            if (!$orgId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unable to determine organization.',
+                ], 403);
             }
+
+            $query = \App\Models\QbSyncLog::where('uuid', $uuid)->where('organization_id', $orgId);
 
             $log = $query->firstOrFail();
 
