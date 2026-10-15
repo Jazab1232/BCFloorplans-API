@@ -485,18 +485,24 @@ class AuthController extends Controller
             return false;
         }
 
+        $requestedSlug = $request->input('organization_slug');
+
         // Find the requested organization
-        // Use conditional query to avoid Postgres UUID comparison errors
-        $organization = Organization::when(is_numeric($requestedOrgId), function ($q) use ($requestedOrgId) {
-            return $q->where('id', $requestedOrgId);
-        }, function ($q) use ($requestedOrgId) {
-            // Only check UUID if it looks like a UUID to avoid SQL errors in Postgres
-            if (is_string($requestedOrgId) && \Illuminate\Support\Str::isUuid($requestedOrgId)) {
-                return $q->where('uuid', $requestedOrgId);
-            }
-            // Return a query that will find nothing if it's neither numeric nor UUID
-            return $q->whereRaw('1 = 0');
-        })->first();
+        $organization = null;
+        if ($requestedSlug) {
+            $organization = Organization::where('slug', $requestedSlug)->first();
+        }
+
+        if (!$organization && $requestedOrgId) {
+            $organization = Organization::when(is_numeric($requestedOrgId), function ($q) use ($requestedOrgId) {
+                return $q->where('id', $requestedOrgId);
+            }, function ($q) use ($requestedOrgId) {
+                if (is_string($requestedOrgId) && \Illuminate\Support\Str::isUuid($requestedOrgId)) {
+                    return $q->where('uuid', $requestedOrgId);
+                }
+                return $q->where('slug', $requestedOrgId);
+            })->first();
+        }
 
         if (!$organization) {
             return false;

@@ -1760,13 +1760,46 @@ class TourController extends Controller
     public function getMatterPortData(Request $request): JsonResponse
     {
         try {
+            $user = auth()->user() ?: $request->user();
             $orgId = app()->bound('current_organization_id') ? app('current_organization_id') : null;
             $query = Tour::whereHas('links');
 
-            if ($orgId) {
-                $query->whereHas('orders', function ($q) use ($orgId) {
-                    $q->where('organization_id', $orgId);
+            if ($user instanceof Agent) {
+                $query->whereHas('orders', function ($q) use ($user) {
+                    $q->forAgent($user);
                 });
+            } elseif ($user instanceof SubAccount) {
+                $user->loadMissing(['role']);
+                $email = strtolower(trim((string) $user->primary_email));
+                $uuid = (string) $user->uuid;
+                $canViewAll = method_exists($user, 'canViewAllAgentOrders') && $user->canViewAllAgentOrders();
+
+                $query->whereHas('orders', function ($q) use ($user, $email, $uuid, $canViewAll) {
+                    $q->where(function ($sub) use ($user, $email, $uuid, $canViewAll) {
+                        $sub->where('co_agents', 'like', '%' . $uuid . '%')
+                            ->orWhere('co_agents', 'like', '%' . $email . '%');
+
+                        if ($canViewAll && !empty($user->agent_id)) {
+                            $sub->orWhere('agent_id', $user->agent_id);
+                        }
+                    });
+                });
+            } elseif ($user instanceof Vendor) {
+                $query->whereHas('orders', function ($q) use ($user) {
+                    $q->where(function ($sub) use ($user) {
+                        $sub->whereHas('slots', function ($sq) use ($user) {
+                            $sq->where('vendor_id', $user->id);
+                        })->orWhereHas('services', function ($sq) use ($user) {
+                            $sq->where('vendor_id', $user->uuid);
+                        });
+                    });
+                });
+            } else {
+                if ($orgId && !($user?->is_super_admin ?? false)) {
+                    $query->whereHas('orders', function ($q) use ($orgId) {
+                        $q->where('organization_id', $orgId);
+                    });
+                }
             }
 
             // Status filtering (all, active, expiring_soon, expired, inactive)
@@ -1935,6 +1968,29 @@ class TourController extends Controller
             $order = $tour->orders;
             $agent = $order ? $order->agent : null;
             $orgId = $order ? $order->organization_id : (app()->bound('current_organization_id') ? app('current_organization_id') : null);
+
+            $user = auth()->user() ?: $request->user();
+            if ($user instanceof Agent) {
+                $isAllowed = $order && ($order->agent_id === $user->id || str_contains((string) json_encode($order->co_agents), (string) $user->uuid));
+                if (!$isAllowed) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Unauthorized: This tour does not belong to you.',
+                    ], 403);
+                }
+            } elseif ($user instanceof SubAccount) {
+                $isAllowed = $order && (
+                    str_contains((string) json_encode($order->co_agents), (string) $user->uuid) ||
+                    str_contains((string) json_encode($order->co_agents), (string) $user->primary_email) ||
+                    (method_exists($user, 'canViewAllAgentOrders') && $user->canViewAllAgentOrders() && !empty($user->agent_id) && $order->agent_id === $user->agent_id)
+                );
+                if (!$isAllowed) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Unauthorized: You do not have access to renew this tour.',
+                    ], 403);
+                }
+            }
 
             $durationDays = $request->input('duration_days');
             $durationMonths = $request->input('duration_months');
@@ -2232,6 +2288,11 @@ class TourController extends Controller
             }
             if (!$tour) {
                 return response()->json(['success' => false, 'message' => 'Tour not found'], 404);
+            }
+
+            $user = auth()->user() ?: $request->user();
+            if ($user instanceof Agent || $user instanceof SubAccount) {
+                return response()->json(['success' => false, 'message' => 'Unauthorized action.'], 403);
             }
 
             $order = $tour->orders;

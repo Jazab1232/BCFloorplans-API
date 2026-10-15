@@ -86,9 +86,9 @@ class AgentController extends Controller
                 'co_agents.*.primary_phone' => 'required_with:co_agents|string|max:20',
                 'co_agents.*.split' => 'nullable|string|max:255',
 
-                'company_logos' => 'nullable|array',
+                'company_logos' => 'nullable',
                 'company_logos.*.file' => 'nullable|image|mimes:jpg,jpeg,png,webp|max:2048',
-                'company_logos.*.type' => 'required_with:company_logos|string|max:50',
+                'company_logos.*.type' => 'nullable|string|max:50',
 
                 'agent_discount' => 'nullable|array',
                 'agent_discount.uuid' => 'nullable|uuid',
@@ -166,25 +166,28 @@ class AgentController extends Controller
             // Process multiple logos
             if ($request->has('company_logos')) {
                 $logos = [];
-                foreach ($request->input('company_logos') as $index => $logoData) {
-                    $type = $logoData['type'];
-                    $path = null;
+                $requestedLogos = $request->input('company_logos');
+                if (is_array($requestedLogos)) {
+                    foreach ($requestedLogos as $index => $logoData) {
+                        $type = $logoData['type'] ?? 'General';
+                        $path = null;
 
-                    if ($request->hasFile("company_logos.{$index}.file")) {
-                        $file = $request->file("company_logos.{$index}.file");
-                        $filename = Str::uuid() . '.' . $file->getClientOriginalExtension();
-                        $path = "agents/{$uuid}/logos/{$filename}";
-                        Storage::disk('s3')->put($path, file_get_contents($file), [
-                            'visibility' => 'public',
-                            'ContentType' => $file->getMimeType() ?: 'image/png'
-                        ]);
-                        Log::info("Uploaded multiple logo type {$type} to S3: {$path}");
+                        if ($request->hasFile("company_logos.{$index}.file")) {
+                            $file = $request->file("company_logos.{$index}.file");
+                            $filename = Str::uuid() . '.' . $file->getClientOriginalExtension();
+                            $path = "agents/{$uuid}/logos/{$filename}";
+                            Storage::disk('s3')->put($path, file_get_contents($file), [
+                                'visibility' => 'public',
+                                'ContentType' => $file->getMimeType() ?: 'image/png'
+                            ]);
+                            Log::info("Uploaded multiple logo type {$type} to S3: {$path}");
+                        }
+
+                        $logos[] = [
+                            'type' => $type,
+                            'path' => $path
+                        ];
                     }
-
-                    $logos[] = [
-                        'type' => $type,
-                        'path' => $path
-                    ];
                 }
                 $data['company_logos'] = $logos;
             }
@@ -194,10 +197,6 @@ class AgentController extends Controller
                 ?? Organization::where('uuid', 'fbd6e3a5-4b2c-4de1-ab73-e677b54c4b8a')->value('id');
             
             $data['organization_id'] = $orgId;
-            
-            if (empty($data['company_name'])) {
-                $data['company_name'] = Organization::where('id', $orgId)->value('name');
-            }
 
             $agent = Agent::create($data);
 
@@ -294,9 +293,9 @@ class AgentController extends Controller
                 'co_agents.*.primary_phone' => 'required_with:co_agents|string|max:20',
                 'co_agents.*.split' => 'nullable|string|max:255',
 
-                'company_logos' => 'nullable|array',
+                'company_logos' => 'nullable',
                 'company_logos.*.file' => 'nullable|image|mimes:jpg,jpeg,png,webp|max:2048',
-                'company_logos.*.type' => 'required_with:company_logos|string|max:50',
+                'company_logos.*.type' => 'nullable|string|max:50',
                 'company_logos.*.path' => 'nullable|string',
 
                 'agent_discount' => 'nullable|array',
@@ -378,41 +377,43 @@ class AgentController extends Controller
             }
 
             // Process multiple logos
-            if ($request->has('company_logos')) {
+            if ($request->has('company_logos') || array_key_exists('company_logos', $request->all())) {
                 $existingLogos = $agent->company_logos ?: [];
                 $newLogos = [];
                 $requestedLogos = $request->input('company_logos');
 
-                foreach ($requestedLogos as $index => $logoData) {
-                    $type = $logoData['type'] ?? 'General';
-                    $path = $logoData['path'] ?? null;
+                if (is_array($requestedLogos)) {
+                    foreach ($requestedLogos as $index => $logoData) {
+                        $type = $logoData['type'] ?? 'General';
+                        $path = $logoData['path'] ?? null;
 
-                    if ($request->hasFile("company_logos.{$index}.file")) {
-                        // Delete old file if path exists
-                        if ($path) {
-                            Storage::disk('s3')->delete($path);
+                        if ($request->hasFile("company_logos.{$index}.file")) {
+                            // Delete old file if path exists
+                            if ($path) {
+                                Storage::disk('s3')->delete($path);
+                            }
+                            $file = $request->file("company_logos.{$index}.file");
+                            $filename = Str::uuid() . '.' . $file->getClientOriginalExtension();
+                            $path = "agents/{$agent->uuid}/logos/{$filename}";
+                            Storage::disk('s3')->put($path, file_get_contents($file), [
+                                'visibility' => 'public',
+                                'ContentType' => $file->getMimeType() ?: 'image/png'
+                            ]);
+                        } elseif (empty($path)) {
+                            // If path was empty, try to match by index in existingLogos or fallback to agent's company_logo
+                            if (isset($existingLogos[$index]['path']) && !empty($existingLogos[$index]['path'])) {
+                                $path = $existingLogos[$index]['path'];
+                            } elseif ($agent->company_logo) {
+                                $path = "agents/{$agent->uuid}/{$agent->company_logo}";
+                            }
                         }
-                        $file = $request->file("company_logos.{$index}.file");
-                        $filename = Str::uuid() . '.' . $file->getClientOriginalExtension();
-                        $path = "agents/{$agent->uuid}/logos/{$filename}";
-                        Storage::disk('s3')->put($path, file_get_contents($file), [
-                            'visibility' => 'public',
-                            'ContentType' => $file->getMimeType() ?: 'image/png'
-                        ]);
-                    } elseif (empty($path)) {
-                        // If path was empty, try to match by index in existingLogos or fallback to agent's company_logo
-                        if (isset($existingLogos[$index]['path']) && !empty($existingLogos[$index]['path'])) {
-                            $path = $existingLogos[$index]['path'];
-                        } elseif ($agent->company_logo) {
-                            $path = "agents/{$agent->uuid}/{$agent->company_logo}";
-                        }
-                    }
 
-                    if (!empty($path)) {
-                        $newLogos[] = [
-                            'type' => $type,
-                            'path' => $path
-                        ];
+                        if (!empty($path)) {
+                            $newLogos[] = [
+                                'type' => $type,
+                                'path' => $path
+                            ];
+                        }
                     }
                 }
 
@@ -429,6 +430,11 @@ class AgentController extends Controller
                 // Sync top-level company_logo with the first logo in company_logos if available
                 if (!empty($newLogos[0]['path'])) {
                     $data['company_logo'] = basename($newLogos[0]['path']);
+                } else {
+                    if ($agent->company_logo) {
+                        Storage::disk('s3')->delete("agents/{$agent->uuid}/{$agent->company_logo}");
+                    }
+                    $data['company_logo'] = null;
                 }
             }
 
@@ -584,61 +590,85 @@ class AgentController extends Controller
     }
 
     public function signup(Request $request): JsonResponse
-{
-    Log::info('Agent signup request');
+    {
+        Log::info('Agent signup request');
 
-    try {
-        $validator = Validator::make($request->all(), [
-            'first_name'   => 'required|string|max:255',
-            'last_name'    => 'required|string|max:255',
-            'email'        => 'required|email|unique:agents,email',
-            'password'     => 'required|string|min:8|confirmed',
-            'organization_id' => 'nullable|exists:organizations,id',
-            'company_name' => 'nullable|string|max:255',
-        ]);
+        try {
+            $validator = Validator::make($request->all(), [
+                'first_name'        => 'required|string|max:255',
+                'last_name'         => 'required|string|max:255',
+                'email'             => 'required|email|unique:agents,email',
+                'password'          => 'required|string|min:8|confirmed',
+                'organization_slug' => 'nullable|string',
+                'organization_id'   => 'nullable|exists:organizations,id',
+                'company_name'      => 'nullable|string|max:255',
+                'primary_phone'     => 'nullable|string|max:50',
+            ]);
 
-        if ($validator->fails()) {
+            if ($validator->fails()) {
+                return response()->json([
+                    'status'  => false,
+                    'message' => 'Validation error',
+                    'errors'  => $validator->errors(),
+                ], 422);
+            }
+
+            $data = $validator->validated();
+            $roleId = Role::whereRaw('LOWER(name) LIKE ?', ['agent%'])
+                  ->value('id');
+
+            $orgId = null;
+            if (!empty($data['organization_slug'])) {
+                $slugVal = $data['organization_slug'];
+                $org = Organization::where('slug', $slugVal)
+                    ->when(Str::isUuid($slugVal), function ($q) use ($slugVal) {
+                        return $q->orWhere('uuid', $slugVal);
+                    })
+                    ->first();
+                if ($org) {
+                    $orgId = $org->id;
+                }
+            } elseif (!empty($data['organization_id'])) {
+                $orgId = $data['organization_id'];
+            } elseif (app()->bound('current_organization_id') && app('current_organization_id')) {
+                $orgId = app('current_organization_id');
+            }
+
+            if (!$orgId) {
+                return response()->json([
+                    'status'  => false,
+                    'message' => 'Organization is required for agent signup',
+                    'errors'  => [
+                        'organization' => ['A valid organization is required for signup.']
+                    ],
+                ], 422);
+            }
+
+            $agent = Agent::create([
+                'uuid'             => (string) Str::uuid(),
+                'organization_id'  => $orgId,
+                'first_name'       => $data['first_name'],
+                'last_name'        => $data['last_name'],
+                'email'            => strtolower(trim($data['email'])),
+                'password'         => bcrypt($data['password']),
+                'company_name'     => $data['company_name'] ?? null,
+                'primary_phone'    => $data['primary_phone'] ?? null,
+
+                // sensible defaults
+                'role_id'          => $roleId, // example: AGENT role
+                'requires_payment' => true,
+                'payment_status'   => 'GOOD',
+                'status'           => true,
+            ]);
+
             return response()->json([
-                'status'  => false,
-                'message' => 'Validation error',
-                'errors'  => $validator->errors(),
-            ], 422);
-        }
+                'status'  => true,
+                'message' => 'Signup successful',
+                'data'    => $agent->load('organization'),
+                'token'   => $agent->createToken('agent_auth_token')->accessToken,
+            ], 201);
 
-        $data = $validator->validated();
-        $roleId = Role::whereRaw('LOWER(name) LIKE ?', ['agent%'])
-              ->value('id');
-
-
-        $orgId = $data['organization_id'] 
-            ?? (app()->bound('current_organization_id') ? app('current_organization_id') : null)
-            ?? Organization::where('uuid', 'fbd6e3a5-4b2c-4de1-ab73-e677b54c4b8a')->value('id');
-        $orgName = Organization::where('id', $orgId)->value('name');
-
-        $agent = Agent::create([
-            'uuid'             => (string) Str::uuid(),
-            'organization_id'  => $orgId,
-            'first_name'       => $data['first_name'],
-            'last_name'        => $data['last_name'],
-            'email'            => $data['email'],
-            'password'         => bcrypt($data['password']),
-            'company_name'     => $orgName ?? $data['company_name'] ?? null,
-
-            // sensible defaults
-            'role_id'          => $roleId, // example: AGENT role
-            'requires_payment' => true,
-            'payment_status'   => 'GOOD',
-            'status'           => true,
-        ]);
-
-        return response()->json([
-            'status'  => true,
-            'message' => 'Signup successful',
-            'data'    => $agent,
-            'token'   => $agent->createToken('agent_auth_token')->accessToken,
-        ], 201);
-
-    } catch (\Exception $e) {
+        } catch (\Exception $e) {
         Log::error('Agent signup failed: '.$e->getMessage());
 
         return response()->json([

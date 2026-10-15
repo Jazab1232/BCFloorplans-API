@@ -380,6 +380,80 @@ class OrganizationController extends Controller
         ]);
     }
 
+    /**
+     * Get organization public details and branding by slug (or uuid).
+     */
+    public function publicShowBySlug(string $slug): JsonResponse
+    {
+        $organization = Organization::with(['settings'])
+            ->where(function ($query) use ($slug) {
+                $query->where('slug', $slug);
+                if (Str::isUuid($slug)) {
+                    $query->orWhere('uuid', $slug);
+                }
+            })
+            ->where('is_active', true)
+            ->first();
+
+        if (!$organization) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Organization not found'
+            ], 404);
+        }
+
+        // Parse settings into a key-value array with global fallback
+        $settingsDict = [];
+
+        $globalSettings = \App\Models\Setting::whereNull('org_id')->get();
+        foreach ($globalSettings as $setting) {
+            $val = $setting->value;
+            if (is_array($val) && isset($val['value'])) {
+                $val = $val['value'];
+            }
+            $settingsDict[$setting->key] = $val;
+        }
+
+        if ($organization->settings) {
+            foreach ($organization->settings as $setting) {
+                $val = $setting->value;
+                if (is_array($val) && isset($val['value'])) {
+                    $val = $val['value'];
+                }
+                $settingsDict[$setting->key] = $val;
+            }
+        }
+
+        $logoUrl = null;
+        if (!empty($organization->company_logos_urls)) {
+            $logos = collect($organization->company_logos_urls);
+            $primary = $logos->firstWhere('type', 'primary_logo') ?? $logos->first();
+            $logoUrl = $primary['url'] ?? null;
+        }
+
+        return response()->json([
+            'status' => true,
+            'data' => [
+                'id' => $organization->id,
+                'org_id' => $organization->id,
+                'uuid' => $organization->uuid,
+                'name' => $organization->name,
+                'slug' => $organization->slug,
+                'from_name' => $organization->from_name,
+                'from_email' => $organization->from_email,
+                'is_whitelabel' => (bool)$organization->is_whitelabel,
+                'branding' => [
+                    'primary_color' => $settingsDict['primary_color'] ?? '#6BAE41',
+                    'secondary_color' => $settingsDict['secondary_color'] ?? '#DC9600',
+                    'logo' => $logoUrl,
+                    'white_label_styles' => isset($settingsDict['white_label_styles']) ?
+                        (is_string($settingsDict['white_label_styles']) ? json_decode($settingsDict['white_label_styles'], true) : $settingsDict['white_label_styles'])
+                        : null
+                ]
+            ]
+        ], 200);
+    }
+
     // -------------------------------------------------------------------------
     // BYO Stripe — dedicated endpoint to set/update Stripe keys for an org
     // -------------------------------------------------------------------------

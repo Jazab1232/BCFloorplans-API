@@ -139,7 +139,7 @@ class Agent extends Authenticatable
             }
         }
 
-        // If no valid logo found, fallback to primary company logo or organization logos
+        // If no valid logo found, fallback to primary company logo if present
         if (empty($result)) {
             if ($this->company_logo && $this->company_logo_url) {
                 $result[] = [
@@ -147,8 +147,6 @@ class Agent extends Authenticatable
                     'path' => 'agents/' . $this->uuid . '/' . $this->company_logo,
                     'url' => $this->company_logo_url,
                 ];
-            } elseif ($this->organization_id) {
-                return $this->organization?->company_logos_urls ?? [];
             }
         }
 

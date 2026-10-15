@@ -183,8 +183,8 @@ class SubAccount extends Authenticatable
 
     public function getCompanyLogosUrlsAttribute()
     {
-        if ($this->organization_id) {
-            return $this->organization?->company_logos_urls ?? [];
+        if ($this->agent_id && $this->agent) {
+            return $this->agent->company_logos_urls ?? [];
         }
 
         return [];

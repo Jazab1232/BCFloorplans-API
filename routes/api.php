@@ -62,6 +62,7 @@ Route::post("forgot-password", [AuthController::class, 'forgotPassword'])->middl
 Route::post("reset-password", [AuthController::class, 'resetPassword'])->name('password.reset')->middleware(['resolve.org', 'throttle:5,1']);
 Route::post('agent/signup', [AgentController::class, 'signup']);
 Route::get('public/organizations', [OrganizationController::class, 'publicIndex'])->middleware('throttle:30,1');
+Route::get('public/organizations/{slug}', [OrganizationController::class, 'publicShowBySlug'])->middleware('throttle:60,1');
 Route::get('packages', [PackageController::class, 'index'])->middleware(['resolve.org', 'throttle:30,1']);
 Route::get('services', [ServiceController::class, 'index'])->middleware(['resolve.org', 'throttle:30,1']);
 Route::get('vendors', [VendorController::class, 'index'])->middleware(['resolve.org', 'throttle:30,1']);
