@@ -97,36 +97,49 @@ class NotificationController extends Controller
 
             $query = $this->visibleNotificationsQuery($user);
 
-            // Date window: default to last 1 month unless client explicitly requests a range
+            // Date window: default to last 1 month unless client explicitly requests a range or all
             $startDate = null;
             $endDate = null;
 
-            // Accept explicit start/end or a relative month count (e.g., months=3)
+            // Accept explicit start/end, a relative month count (e.g., months=3), or all=true
             $request->validate([
                 'start_date' => 'sometimes|date',
                 'end_date' => 'sometimes|date',
-                'months' => 'sometimes|integer|min:1|max:12',
+                'months' => 'sometimes',
+                'all' => 'sometimes',
             ]);
 
-            if ($request->filled('start_date') || $request->filled('end_date')) {
-                $startDate = $request->filled('start_date')
-                    ? Carbon::parse($request->input('start_date'))->startOfDay()
-                    : null;
-                $endDate = $request->filled('end_date')
-                    ? Carbon::parse($request->input('end_date'))->endOfDay()
-                    : Carbon::now();
-            } elseif ($request->filled('months')) {
-                $months = (int) $request->input('months');
-                $startDate = Carbon::now()->subMonths($months)->startOfDay();
-                $endDate = Carbon::now();
-            } else {
-                // Default: restrict to last 1 month
-                $startDate = Carbon::now()->subMonth()->startOfDay();
-                $endDate = Carbon::now();
-            }
+            $isAll = $request->boolean('all')
+                || $request->input('all') === 'true'
+                || $request->input('all') === '1'
+                || $request->input('all') === 'all'
+                || $request->input('months') === 'all';
 
-            if ($startDate && $endDate) {
-                $query->whereBetween('created_at', [$startDate, $endDate]);
+            if (!$isAll) {
+                if ($request->filled('start_date') || $request->filled('end_date')) {
+                    $startDate = $request->filled('start_date')
+                        ? Carbon::parse($request->input('start_date'))->startOfDay()
+                        : null;
+                    $endDate = $request->filled('end_date')
+                        ? Carbon::parse($request->input('end_date'))->endOfDay()
+                        : Carbon::now();
+                } elseif ($request->filled('months') && is_numeric($request->input('months'))) {
+                    $months = (int) $request->input('months');
+                    $startDate = Carbon::now()->subMonths($months)->startOfDay();
+                    $endDate = Carbon::now();
+                } else {
+                    // Default: restrict to last 1 month
+                    $startDate = Carbon::now()->subMonth()->startOfDay();
+                    $endDate = Carbon::now();
+                }
+
+                if ($startDate && $endDate) {
+                    $query->whereBetween('created_at', [$startDate, $endDate]);
+                } elseif ($startDate) {
+                    $query->where('created_at', '>=', $startDate);
+                } elseif ($endDate) {
+                    $query->where('created_at', '<=', $endDate);
+                }
             }
 
             // Get counts before fetching (using cloned query)
@@ -152,11 +165,18 @@ class NotificationController extends Controller
                 'date_range' => [
                     'start' => $startDate ? $startDate->toDateTimeString() : null,
                     'end' => $endDate ? $endDate->toDateTimeString() : null,
-                    'months' => $request->input('months', 1),
+                    'months' => $isAll ? 'all' : (int) $request->input('months', 1),
+                    'all' => $isAll,
                 ],
                 'message' => 'Notifications fetched successfully',
             ]);
 
+        } catch (ValidationException $e) {
+            return response()->json([
+                'success' => false,
+                'data' => null,
+                'message' => $e->validator->errors()->first(),
+            ], 422);
         } catch (\Throwable $e) {
             Log::error('Notification index failed', [
                 'error' => $e->getMessage(),

@@ -411,7 +411,7 @@ class OrderController extends Controller
                 ])->toArray(),
             ]);
             
-            $bestPackage = $packageDetectionService->getBestPackage($applicablePackages);
+            $bestPackage = $packageDetectionService->getBestPackage($applicablePackages, $totalAmount);
 
             // Log package detection results and apply if found
             if ($bestPackage) {
@@ -911,7 +911,7 @@ class OrderController extends Controller
                 ] : null,
             ]);
             
-            $packageEvaluation = $packageDetectionService->evaluatePackageForUpdate($newServiceIds, $existingPackageInfo);
+            $packageEvaluation = $packageDetectionService->evaluatePackageForUpdate($newServiceIds, $existingPackageInfo, $order->organization_id, $totalAmount);
             
             Log::info('Package evaluation results', [
                 'evaluation_result' => $packageEvaluation,

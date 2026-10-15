@@ -184,6 +184,7 @@ class QbSyncLogController extends Controller
                 $invoice = \App\Models\Invoice::with([
                     'order.property',
                     'order.organization',
+                    'order.services.service',
                     'items.orderService.service',
                     'agent',
                 ])->find($log->entity_id);

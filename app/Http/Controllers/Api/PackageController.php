@@ -131,7 +131,19 @@ class PackageController extends Controller
     {
         $validator = Validator::make($request->all(), [
             'name' => 'required|string|max:255',
-            'discount' => 'required|integer|min:0|max:100',
+            'description' => 'nullable|string',
+            'discount_type' => 'nullable|in:percentage,dollar',
+            'discount' => [
+                'required',
+                'numeric',
+                'min:0',
+                function ($attribute, $value, $fail) use ($request) {
+                    $type = $request->input('discount_type', 'percentage');
+                    if ($type === 'percentage' && $value > 100) {
+                        $fail('The discount percentage cannot exceed 100%.');
+                    }
+                },
+            ],
             'status' => 'required|boolean',
             'service_ids' => 'required|array',
             'service_ids.*' => 'required'
@@ -146,6 +158,7 @@ class PackageController extends Controller
 
         $data = $validator->validated();
         $data['uuid'] = Str::uuid();
+        $data['discount_type'] = $data['discount_type'] ?? 'percentage';
 
         // Assign organization_id if present
         $orgId = app()->bound('current_organization_id') ? app('current_organization_id') : null;
@@ -189,7 +202,19 @@ class PackageController extends Controller
 
         $validator = Validator::make($request->all(), [
             'name' => 'sometimes|string|max:255',
-            'discount' => 'sometimes|integer|min:0|max:100',
+            'description' => 'nullable|string',
+            'discount_type' => 'nullable|in:percentage,dollar',
+            'discount' => [
+                'sometimes',
+                'numeric',
+                'min:0',
+                function ($attribute, $value, $fail) use ($request, $package) {
+                    $type = $request->input('discount_type', $package->discount_type ?? 'percentage');
+                    if ($type === 'percentage' && $value > 100) {
+                        $fail('The discount percentage cannot exceed 100%.');
+                    }
+                },
+            ],
             'status' => 'sometimes|boolean',
             'service_ids' => 'sometimes|array',
             'service_ids.*' => 'required'
@@ -203,6 +228,9 @@ class PackageController extends Controller
         }
 
         $data = $validator->validated();
+        if (isset($data['discount_type']) && empty($data['discount_type'])) {
+            $data['discount_type'] = 'percentage';
+        }
         $package->update($data);
 
         if (isset($data['service_ids'])) {

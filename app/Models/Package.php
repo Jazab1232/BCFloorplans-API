@@ -16,13 +16,16 @@ class Package extends Model
         'uuid',
         'organization_id',
         'name',
+        'description',
         'discount',
+        'discount_type',
         'status',
     ];
 
     protected $casts = [
         'status' => 'boolean',
-        'discount' => 'integer',
+        'discount' => 'float',
+        'discount_type' => 'string',
         'organization_id' => 'integer',
     ];
 

@@ -52,24 +52,8 @@ class QuickBooksService
         ];
 
         // Decrypt if necessary
-        $token = $accessToken;
-        if ($token && config('quickbooks.encrypt_tokens')) {
-            try {
-                $token = Crypt::decryptString($token);
-            } catch (\Exception $e) {
-                // If decryption fails, assume it's already plain (for migration period)
-                Log::warning('QB Access Token decryption failed, using as-is.');
-            }
-        }
-
-        $refresh = $refreshToken;
-        if ($refresh && config('quickbooks.encrypt_tokens')) {
-            try {
-                $refresh = Crypt::decryptString($refresh);
-            } catch (\Exception $e) {
-                Log::warning('QB Refresh Token decryption failed, using as-is.');
-            }
-        }
+        $token = $this->decryptTokenSafely($accessToken, 'access token');
+        $refresh = $this->decryptTokenSafely($refreshToken, 'refresh token');
 
         if ($token) {
             $config['accessTokenKey'] = $token;
@@ -84,6 +68,54 @@ class QuickBooksService
         $this->dataService = DataService::Configure($config);
         
         return $this->dataService;
+    }
+
+    /**
+     * Decrypt a QuickBooks token safely, verifying whether it is an encrypted Laravel payload.
+     *
+     * @param string|null $token
+     * @param string $type
+     * @return string|null
+     * @throws \Exception
+     */
+    public function decryptTokenSafely(?string $token, string $type = 'token'): ?string
+    {
+        if (empty($token)) {
+            return null;
+        }
+
+        $isEncrypted = $this->isLaravelEncryptedPayload($token);
+
+        // If the token is already plain text (not encrypted), return it directly
+        if (!$isEncrypted) {
+            return $token;
+        }
+
+        // The token is an encrypted payload: try to decrypt it
+        try {
+            return Crypt::decryptString($token);
+        } catch (\Exception $e) {
+            Log::error("QB {$type} decryption failed: Application APP_KEY mismatch or corrupted token.", [
+                'error' => $e->getMessage(),
+            ]);
+            throw new \Exception("QuickBooks {$type} in the database is encrypted with a previous APP_KEY. Please reconnect QuickBooks in Settings to save fresh tokens.");
+        }
+    }
+
+    /**
+     * Determine if a string is a Laravel encrypted payload (base64 JSON containing iv, value, mac).
+     */
+    public function isLaravelEncryptedPayload(?string $value): bool
+    {
+        if (empty($value)) {
+            return false;
+        }
+        $decoded = base64_decode($value, true);
+        if ($decoded === false) {
+            return false;
+        }
+        $json = json_decode($decoded, true);
+        return is_array($json) && isset($json['iv'], $json['value'], $json['mac']);
     }
 
     /**
@@ -335,12 +367,7 @@ class QuickBooksService
             $OAuth2LoginHelper = $this->dataService->getOAuth2LoginHelper();
             
             // Decrypt refresh token for the SDK
-            $refreshToken = $organization->qb_refresh_token;
-            if (config('quickbooks.encrypt_tokens')) {
-                try {
-                    $refreshToken = Crypt::decryptString($refreshToken);
-                } catch (\Exception $e) {}
-            }
+            $refreshToken = $this->decryptTokenSafely($organization->qb_refresh_token, 'refresh token');
 
             $refreshedToken = $OAuth2LoginHelper->refreshAccessTokenWithRefreshToken($refreshToken);
             
@@ -464,9 +491,11 @@ class QuickBooksService
                     $OAuth2LoginHelper = $this->dataService->getOAuth2LoginHelper();
                     
                     // Decrypt for SDK
-                    $token = $organization->qb_access_token;
-                    if (config('quickbooks.encrypt_tokens')) {
-                        try { $token = Crypt::decryptString($token); } catch (\Exception $e) {}
+                    $token = null;
+                    try {
+                        $token = $this->decryptTokenSafely($organization->qb_access_token, 'access token');
+                    } catch (\Exception $e) {
+                        Log::warning('QB: Failed to decrypt access token during revoke: ' . $e->getMessage());
                     }
 
                     $result = $OAuth2LoginHelper->revokeToken($token);
@@ -725,7 +754,26 @@ class QuickBooksService
                     );
                 }
 
-                // Fallback line item if invoice has no items in BCF database
+                // Fallback 1: If invoice items are empty, populate lines from order services if available
+                if (empty($lines) && $invoice->order && $invoice->order->relationLoaded('services') ? $invoice->order->services->isNotEmpty() : ($invoice->order?->services()?->exists())) {
+                    $orderServices = $invoice->order->relationLoaded('services') ? $invoice->order->services : $invoice->order->services()->with('service')->get();
+                    $serviceCount = max(1, $orderServices->count());
+                    foreach ($orderServices as $orderService) {
+                        $service = $orderService->service;
+                        $serviceName = $service?->name ?? 'Service';
+                        $itemId = $this->getOrCreateServiceItem($dataService, $service, $serviceName);
+                        $qty = 1;
+                        $amount = (float)($orderService->price ?? $orderService->amount ?? ($invoice->total ? round($invoice->total / $serviceCount, 2) : 0));
+                        $lines[] = $this->createInvoiceLine(
+                            $itemId,
+                            $qty,
+                            $amount,
+                            $serviceName . ($invoice->order_id ? " (Order #{$invoice->order_id})" : "")
+                        );
+                    }
+                }
+
+                // Fallback 2: Final fallback line item if invoice and order still have no lines
                 if (empty($lines)) {
                     $fallbackItemName = 'General Services';
                     $fallbackItemId = $this->getOrCreateServiceItem($dataService, null, $fallbackItemName);

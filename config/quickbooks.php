@@ -51,5 +51,5 @@ return [
     | Encryption
     |--------------------------------------------------------------------------
     */
-    'encrypt_tokens' => env('QUICKBOOKS_ENCRYPT_TOKENS', true),
+    'encrypt_tokens' => env('QUICKBOOKS_ENCRYPT_TOKENS', false),
 ];

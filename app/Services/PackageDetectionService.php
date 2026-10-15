@@ -50,18 +50,24 @@ class PackageDetectionService
      * @param \Illuminate\Support\Collection $packages
      * @return Package|null
      */
-    public function getBestPackage(\Illuminate\Support\Collection $packages): ?Package
+    public function getBestPackage(\Illuminate\Support\Collection $packages, float $totalAmount = 0): ?Package
     {
         if ($packages->isEmpty()) {
             return null;
         }
 
-        // Return package with highest discount percentage
+        if ($totalAmount > 0) {
+            return $packages->sortByDesc(function ($pkg) use ($totalAmount) {
+                return $this->calculatePackageDiscount($pkg, $totalAmount);
+            })->first();
+        }
+
+        // Return package with highest discount
         return $packages->sortByDesc('discount')->first();
     }
 
     /**
-     * Calculate package discount amount based on percentage and total
+     * Calculate package discount amount based on discount_type (dollar or percentage)
      *
      * @param Package $package
      * @param float $totalAmount Total order amount before discounts
@@ -73,8 +79,12 @@ class PackageDetectionService
             return 0;
         }
 
-        // Package discount is a percentage (e.g., 20 = 20%)
-        $discountAmount = $totalAmount * ($package->discount / 100);
+        if ($package->discount_type === 'dollar') {
+            $discountAmount = min($totalAmount, (float) $package->discount);
+        } else {
+            // Package discount is a percentage (e.g., 20 = 20%)
+            $discountAmount = $totalAmount * ($package->discount / 100);
+        }
 
         return round($discountAmount, 2);
     }
@@ -93,7 +103,9 @@ class PackageDetectionService
             'package_id' => $package->id,
             'package_uuid' => $package->uuid,
             'package_name' => $package->name,
-            'package_discount_percentage' => $package->discount,
+            'package_discount' => $package->discount,
+            'package_discount_type' => $package->discount_type ?? 'percentage',
+            'package_discount_percentage' => ($package->discount_type === 'dollar') ? null : $package->discount,
             'package_discount_amount' => $discountAmount,
             'matched_service_ids' => $matchedServiceIds,
             'applied_at' => now()->toDateTimeString(),
@@ -107,10 +119,10 @@ class PackageDetectionService
      * @param array|null $existingPackageInfo Existing package info from meta
      * @return array ['should_apply' => bool, 'package' => Package|null, 'changed' => bool]
      */
-    public function evaluatePackageForUpdate(array $newServiceIds, ?array $existingPackageInfo): array
+    public function evaluatePackageForUpdate(array $newServiceIds, ?array $existingPackageInfo, $orgId = null, float $totalAmount = 0): array
     {
-        $applicablePackages = $this->detectApplicablePackages($newServiceIds);
-        $bestPackage = $this->getBestPackage($applicablePackages);
+        $applicablePackages = $this->detectApplicablePackages($newServiceIds, $orgId);
+        $bestPackage = $this->getBestPackage($applicablePackages, $totalAmount);
 
         $oldPackageId = $existingPackageInfo['package_id'] ?? null;
         $newPackageId = $bestPackage?->id;

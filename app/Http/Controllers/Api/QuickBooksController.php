@@ -196,12 +196,17 @@ class QuickBooksController extends Controller
             try {
                 $dataService = $this->quickBooksService->getDataService($organization);
                 $companyInfo = $dataService->getCompanyInfo();
-                $companyName = $companyInfo?->CompanyName ?? 'QuickBooks Company';
+                if (!$companyInfo) {
+                    $lastError = $dataService->getLastError();
+                    $errorMsg = $lastError ? ($lastError->getResponseBody() ?: $lastError->getOAuthHelperError()) : 'Failed to retrieve company info';
+                    throw new \Exception($errorMsg);
+                }
+                $companyName = $companyInfo->CompanyName ?? 'QuickBooks Company';
             } catch (\Exception $healthError) {
                 Log::warning('QuickBooks live health check failed: ' . $healthError->getMessage());
                 return response()->json([
                     'connected' => false,
-                    'error' => 'Connection to QuickBooks expired or invalid. Please reconnect.',
+                    'error' => 'Connection to QuickBooks expired or invalid. Please reconnect. (' . $healthError->getMessage() . ')',
                     'needs_reconnect' => true,
                     'realm_id' => $tokens['realm_id'],
                 ]);
@@ -348,7 +353,7 @@ class QuickBooksController extends Controller
         ]);
 
         try {
-            $invoice = \App\Models\Invoice::with(['order.property', 'items.orderService.service', 'agent'])
+            $invoice = \App\Models\Invoice::with(['order.property', 'order.services.service', 'items.orderService.service', 'agent'])
                 ->where('uuid', $request->invoice_uuid)
                 ->firstOrFail();
             
