@@ -35,6 +35,7 @@ class BillingController extends Controller
             'services.service:id,name',
             'slots:id,order_id,vendor_id,date,address,location,start_time,end_time,service_id',
             'slots.vendor:id,first_name,last_name,uuid',
+            'package:id,name,discount,discount_type',
         ]);
 
         if (!$isAdmin) {
@@ -76,7 +77,21 @@ class BillingController extends Controller
             ]);
         }
 
-        $billingData = $orders->map(function ($order) use ($user, $isAgent) {
+        $orderIds = $orders->pluck('id')->all();
+
+        // Batch load all invoices with items to eliminate N+1 queries over remote RDS
+        $allInvoices = \App\Models\Invoice::with('items')
+            ->whereIn('order_id', $orderIds)
+            ->get()
+            ->groupBy('order_id');
+
+        // Batch load all payments to eliminate N+1 queries over remote RDS
+        $allPayments = AgentPayment::whereIn('order_id', $orderIds)
+            ->orderBy('paid_at', 'desc')
+            ->get()
+            ->groupBy('order_id');
+
+        $billingData = $orders->map(function ($order) use ($user, $isAgent, $allInvoices, $allPayments) {
             // Check if current user is a co-agent on this order
             $isCoAgentOnOrder = $isAgent && ($order->agent_id !== $user->id);
             $coAgentMultiplier = 1.0;
@@ -94,27 +109,58 @@ class BillingController extends Controller
                 }
             }
 
-            $paymentsQuery = AgentPayment::where('order_id', $order->id)->orderBy('paid_at', 'desc');
-            if ($isCoAgentOnOrder) {
-                $paymentsQuery->where('agent_id', $user->id);
-            }
-            $payments = $paymentsQuery->get();
+            // In-memory payment resolution
+            $rawPayments = $allPayments->get($order->id, collect());
+            $payments = $isCoAgentOnOrder
+                ? $rawPayments->filter(fn($p) => $p->agent_id == $user->id)
+                : $rawPayments;
 
-            // Order-level total, paid, and refunds
-            $totalAmount = (float)($order->services->sum('amount') * $coAgentMultiplier);
-            
-            // Retrieve invoices to calculate tax rate and refund/cancellation status
-            $invoicesQuery = \App\Models\Invoice::where('order_id', $order->id)->where('status', '!=', 'void');
+            // In-memory invoice resolution
+            $rawInvoices = $allInvoices->get($order->id, collect());
+            $orderInvoices = $rawInvoices->filter(fn($inv) => $inv->status !== 'void');
             if ($isCoAgentOnOrder) {
-                $invoicesQuery->where('agent_id', $user->id);
+                $coAgentInvoices = $orderInvoices->filter(fn($inv) => $inv->agent_id == $user->id);
+                if ($coAgentInvoices->isNotEmpty()) {
+                    $orderInvoices = $coAgentInvoices;
+                }
             }
-            $orderInvoices = $invoicesQuery->get();
             if ($orderInvoices->isEmpty()) {
-                $orderInvoices = \App\Models\Invoice::where('order_id', $order->id)->get();
+                $orderInvoices = $rawInvoices;
             }
-            $taxRate = $orderInvoices->isNotEmpty() ? (float)$orderInvoices->first()->tax_rate : 13.0;
 
-            $grandTotal = round($totalAmount * (1 + $taxRate / 100), 2);
+            // Find primary / consolidated invoice
+            $primaryInvoice = $orderInvoices->first(function ($inv) {
+                return $inv->agent_type === 'primary'
+                    || (!empty($inv->notes) && stripos($inv->notes, 'consolidated') !== false)
+                    || empty($inv->split_details);
+            }) ?? $orderInvoices->first();
+
+            $taxRate = $primaryInvoice && (float)$primaryInvoice->tax_rate > 0
+                ? (float)$primaryInvoice->tax_rate
+                : ($orderInvoices->isNotEmpty() ? (float)$orderInvoices->first()->tax_rate : 13.0);
+
+            if ($primaryInvoice && (float)$primaryInvoice->subtotal > 0 && (float)$primaryInvoice->total > 0) {
+                $totalAmount = (float)$primaryInvoice->subtotal;
+                $grandTotal = (float)$primaryInvoice->total;
+                $taxAmount = (float)$primaryInvoice->tax_amount;
+            } elseif ($orderInvoices->isNotEmpty()) {
+                $serviceInvoices = $orderInvoices->filter(fn($inv) => !empty($inv->notes) && stripos($inv->notes, 'service invoice') !== false);
+                if ($serviceInvoices->isNotEmpty()) {
+                    $totalAmount = (float)$serviceInvoices->sum('subtotal');
+                    $grandTotal = (float)$serviceInvoices->sum('total');
+                    $taxAmount = (float)$serviceInvoices->sum('tax_amount');
+                } else {
+                    $orderSubtotal = (float)($order->amount ?? $order->services->sum('amount'));
+                    $totalAmount = (float)($orderSubtotal * $coAgentMultiplier);
+                    $taxAmount = round($totalAmount * ($taxRate / 100), 2);
+                    $grandTotal = round($totalAmount + $taxAmount, 2);
+                }
+            } else {
+                $orderSubtotal = (float)($order->amount ?? $order->services->sum('amount'));
+                $totalAmount = (float)($orderSubtotal * $coAgentMultiplier);
+                $taxAmount = round($totalAmount * ($taxRate / 100), 2);
+                $grandTotal = round($totalAmount + $taxAmount, 2);
+            }
             
             // Gross refunds
             $totalRefunded = abs((float)$payments->filter(fn($p) => $p->status === 'refunded' || (float)$p->amount < 0)->sum('amount'));
@@ -135,7 +181,7 @@ class BillingController extends Controller
             }
 
             // Service-level data
-            $services = $order->services->map(function ($service) use ($payments, $orderStatus, $coAgentMultiplier) {
+            $services = $order->services->map(function ($service) use ($order, $payments, $orderStatus, $coAgentMultiplier, $orderInvoices) {
                 // Check if any payment covered this service
                 $relatedPayments = $payments->filter(function ($p) use ($service) {
                     return $p->order_service_id == $service->id;
@@ -153,11 +199,45 @@ class BillingController extends Controller
                     }
                 }
 
+                // Check for service-specific invoice to obtain discounted base amount
+                $serviceInvoice = $orderInvoices->first(function ($inv) use ($service) {
+                    if (!empty($inv->notes) && stripos($inv->notes, 'consolidated') !== false) {
+                        return false;
+                    }
+                    return $inv->items && $inv->items->contains(function ($item) use ($service) {
+                        return (int)$item->order_service_id === (int)$service->id;
+                    });
+                });
+
+                $serviceBaseAmount = (float)($service->amount * $coAgentMultiplier);
+                if ($serviceInvoice && (float)$serviceInvoice->subtotal > 0) {
+                    $serviceDiscountedAmount = (float)$serviceInvoice->subtotal;
+                } else {
+                    $appliedPkg = $order->package ? [
+                        'discount' => $order->package->discount,
+                        'discount_type' => $order->package->discount_type,
+                    ] : ($order->meta['applied_package'] ?? null);
+
+                    if ($appliedPkg) {
+                        $disc = (float)($appliedPkg['discount'] ?? $appliedPkg['package_discount'] ?? 0);
+                        $type = strtolower($appliedPkg['discount_type'] ?? $appliedPkg['package_discount_type'] ?? 'percentage');
+                        if ($disc > 0 && $type === 'percentage') {
+                            $serviceDiscountedAmount = round($serviceBaseAmount * (1 - ($disc / 100)), 2);
+                        } else {
+                            $serviceDiscountedAmount = $serviceBaseAmount;
+                        }
+                    } else {
+                        $serviceDiscountedAmount = $serviceBaseAmount;
+                    }
+                }
+
                 return [
                     'service_id' => $service->service_id,
                     'order_service_uuid' => $service->uuid ?? null,
                     'service_name' => $service->service->name ?? 'Unknown',
-                    'amount' => (float) ($service->amount * $coAgentMultiplier),
+                    'original_amount' => $serviceBaseAmount,
+                    'amount' => $serviceDiscountedAmount,
+                    'discounted_amount' => $serviceDiscountedAmount,
                     'status' => $status,
                     'media_access' => $service->media_access,
                     'related_invoices' => $relatedPayments->map(fn($p) => [
@@ -187,9 +267,18 @@ class BillingController extends Controller
                 'property_address' => $order->property_address ?: ($order->property->address ?? null),
                 'property_location' => $order->property_location ?: ($order->property->city ?? null),
                 'total_amount' => $totalAmount,
+                'grand_total' => $grandTotal,
+                'tax_amount' => $taxAmount,
+                'tax_rate' => $taxRate,
                 'total_paid' => $totalPaid,
                 'total_refunded' => $totalRefunded,
                 'remaining_amount' => $remainingAmount,
+                'package' => $order->package ? [
+                    'id' => $order->package->id,
+                    'name' => $order->package->name,
+                    'discount' => $order->package->discount,
+                    'discount_type' => $order->package->discount_type,
+                ] : ($order->meta['applied_package'] ?? null),
                 'status' => $orderStatus,
                 'created_at' => $order->created_at,
                 'slots' => $order->slots->map(fn($slot) => [

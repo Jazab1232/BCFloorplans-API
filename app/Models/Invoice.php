@@ -322,6 +322,95 @@ class Invoice extends Model
         return $primaryInvoice;
     }
 
+    /**
+     * Resolve package discount for the given services being invoiced on an order.
+     */
+    public static function resolvePackageDiscountForServices(Order $order, $services, float $multiplier = 1.0): ?array
+    {
+        $packageInfo = $order->meta['applied_package'] ?? null;
+        $packageId = $packageInfo['package_id'] ?? $order->package_id;
+
+        if (!$packageId && empty($packageInfo)) {
+            return null;
+        }
+
+        if (empty($packageInfo) && $packageId) {
+            $package = $order->package ?? \App\Models\Package::find($packageId);
+            if (!$package || !$package->status) {
+                return null;
+            }
+            $matchedIds = $package->services->pluck('id')->toArray();
+            $packageInfo = [
+                'package_id' => $package->id,
+                'package_name' => $package->name,
+                'package_discount' => $package->discount,
+                'package_discount_type' => $package->discount_type,
+                'package_discount_percentage' => $package->discount_type === 'dollar' ? null : $package->discount,
+                'package_discount_amount' => $package->discount_type === 'dollar' ? $package->discount : null,
+                'matched_service_ids' => $matchedIds,
+            ];
+        }
+
+        $matchedServiceIds = $packageInfo['matched_service_ids'] ?? [];
+        if (empty($matchedServiceIds)) {
+            return null;
+        }
+
+        $servicesCollection = collect($services);
+        $matchedInInvoice = $servicesCollection->filter(function($os) use ($matchedServiceIds) {
+            return in_array($os->service_id, $matchedServiceIds);
+        });
+
+        if ($matchedInInvoice->isEmpty()) {
+            return null;
+        }
+
+        $matchedTotal = (float) $matchedInInvoice->sum(fn($os) => (float)$os->amount);
+        if ($matchedTotal <= 0) {
+            return null;
+        }
+
+        $discountAmount = 0.0;
+        $discountType = $packageInfo['package_discount_type'] ?? 'percentage';
+
+        if ($discountType === 'dollar') {
+            $order->loadMissing('services');
+            $totalOrderMatched = (float) $order->services
+                ->filter(fn($os) => in_array($os->service_id, $matchedServiceIds))
+                ->sum(fn($os) => (float)$os->amount);
+            $ratio = $totalOrderMatched > 0 ? ($matchedTotal / $totalOrderMatched) : 0;
+            $fullDiscount = (float) ($packageInfo['package_discount_amount'] ?? $packageInfo['package_discount'] ?? 0);
+            $discountAmount = round($fullDiscount * $ratio * $multiplier, 2);
+        } else {
+            $pct = (float) ($packageInfo['package_discount_percentage'] ?? $packageInfo['package_discount'] ?? 0);
+            $discountAmount = round(($matchedTotal * ($pct / 100)) * $multiplier, 2);
+        }
+
+        if ($discountAmount <= 0) {
+            return null;
+        }
+
+        $packageName = $packageInfo['package_name'] ?? 'Package';
+        $pctText = ($discountType !== 'dollar' && isset($packageInfo['package_discount_percentage'])) 
+            ? $packageInfo['package_discount_percentage'] 
+            : ($packageInfo['package_discount'] ?? null);
+            
+        $desc = "Package Discount: {$packageName}";
+        if ($pctText && $discountType !== 'dollar') {
+            $desc .= " ({$pctText}%)";
+        }
+        if ($multiplier < 1) {
+            $desc .= " (" . round($multiplier * 100, 1) . "%)";
+        }
+
+        return [
+            'package_id' => $packageInfo['package_id'] ?? $packageId,
+            'package_name' => $packageName,
+            'amount' => -abs($discountAmount),
+            'description' => $desc,
+        ];
+    }
+
     public static function createInvoice($order, $agent, $services, $taxInfo, $multiplier, $note, $splitDetails = null, $agentType = 'primary', $targetAgentId = null)
     {
         $province = 'BC';
@@ -347,6 +436,19 @@ class Invoice extends Model
             ];
         }
 
+        $pkgDiscount = static::resolvePackageDiscountForServices($order, $services, $multiplier);
+        if ($pkgDiscount) {
+            $preparedItems[] = [
+                'order_service' => (collect($services)->count() === 1 ? collect($services)->first() : null),
+                'service' => null,
+                'amount' => $pkgDiscount['amount'],
+                'description' => $pkgDiscount['description'],
+                'is_taxable' => true,
+                'is_package_discount' => true,
+                'package_id' => $pkgDiscount['package_id'],
+            ];
+        }
+
         $country = $order->property->country ?? 'CA';
         $taxCalc = \App\Services\TaxCalculationService::calculateTaxes(
             $order->organization_id,
@@ -360,9 +462,10 @@ class Invoice extends Model
             $calcItem = $taxCalc['items'][$idx] ?? [];
             $itemTax = $calcItem['tax_amount'] ?? 0.0;
             $os = $prep['order_service'];
+            $isPkgDisc = !empty($prep['is_package_discount']);
 
             $items[] = [
-                'order_service_id' => $os->id,
+                'order_service_id' => $os?->id,
                 'description' => $prep['description'],
                 'quantity' => 1,
                 'unit_price' => $prep['amount'],
@@ -370,6 +473,8 @@ class Invoice extends Model
                 'tax_amount' => $itemTax,
                 'gst_amount' => $calcItem['gst_amount'] ?? ($calcItem['tax_breakdown']['GST'] ?? 0.0),
                 'pst_amount' => $calcItem['pst_amount'] ?? ($calcItem['tax_breakdown']['PST'] ?? 0.0),
+                'is_extra' => $isPkgDisc,
+                'meta' => $isPkgDisc ? ['type' => 'package_discount', 'package_id' => $prep['package_id']] : null,
             ];
         }
 
@@ -423,15 +528,22 @@ class Invoice extends Model
             $amount = round($qty * $price, 2);
 
             $service = $item->orderService?->service;
+            $isPkgDisc = ($item->meta['type'] ?? null) === 'package_discount' || str_starts_with($item->description ?? '', 'Package Discount');
             $isTaxable = null;
             if ($item->gst_enabled !== null || $item->pst_enabled !== null) {
                 $isTaxable = (bool)$item->gst_enabled || (bool)$item->pst_enabled;
+            } elseif ($isPkgDisc) {
+                $isTaxable = true;
             }
 
             $calcItemsInput[] = [
                 'amount' => $amount,
                 'service' => $service,
                 'is_taxable' => $isTaxable,
+                'is_package_discount' => $isPkgDisc,
+                'description' => $item->description,
+                'gst_enabled' => $item->gst_enabled,
+                'pst_enabled' => $item->pst_enabled,
             ];
         }
 
@@ -747,6 +859,46 @@ class Invoice extends Model
                     $hasChanged = true;
                 }
 
+                // 4. Sync package discount item on consolidated invoice
+                $pkgDiscount = static::resolvePackageDiscountForServices($order, $orderServices, $multiplier);
+                $existingPackageItem = $invoice->items
+                    ->filter(function($i) {
+                        return ($i->meta['type'] ?? null) === 'package_discount' || str_starts_with($i->description ?? '', 'Package Discount');
+                    })
+                    ->first();
+
+                if ($pkgDiscount) {
+                    $expectedDiscountAmt = (float)$pkgDiscount['amount'];
+                    $expectedDiscountDesc = $pkgDiscount['description'];
+
+                    if ($existingPackageItem) {
+                        if ((float)$existingPackageItem->amount != $expectedDiscountAmt || (float)$existingPackageItem->unit_price != $expectedDiscountAmt || $existingPackageItem->description != $expectedDiscountDesc) {
+                            $existingPackageItem->update([
+                                'unit_price' => $expectedDiscountAmt,
+                                'amount' => $expectedDiscountAmt,
+                                'description' => $expectedDiscountDesc,
+                                'is_extra' => true,
+                                'meta' => ['type' => 'package_discount', 'package_id' => $pkgDiscount['package_id']],
+                            ]);
+                            $hasChanged = true;
+                        }
+                    } else {
+                        $invoice->items()->create([
+                            'order_service_id' => null,
+                            'description' => $expectedDiscountDesc,
+                            'quantity' => 1,
+                            'unit_price' => $expectedDiscountAmt,
+                            'amount' => $expectedDiscountAmt,
+                            'is_extra' => true,
+                            'meta' => ['type' => 'package_discount', 'package_id' => $pkgDiscount['package_id']],
+                        ]);
+                        $hasChanged = true;
+                    }
+                } elseif ($existingPackageItem) {
+                    $existingPackageItem->delete();
+                    $hasChanged = true;
+                }
+
                 if ($hasChanged) {
                     $invoice->recalculateTotals();
                 }
@@ -801,6 +953,46 @@ class Invoice extends Model
                         }
                         $serviceInvoiceChanged = true;
                     }
+                }
+
+                // Sync package discount item on service-specific invoice
+                $pkgDiscount = static::resolvePackageDiscountForServices($order, collect([$os]), $multiplier);
+                $existingPackageItem = $invoice->items
+                    ->filter(function($i) {
+                        return ($i->meta['type'] ?? null) === 'package_discount' || str_starts_with($i->description ?? '', 'Package Discount');
+                    })
+                    ->first();
+
+                if ($pkgDiscount) {
+                    $expectedDiscountAmt = (float)$pkgDiscount['amount'];
+                    $expectedDiscountDesc = $pkgDiscount['description'];
+
+                    if ($existingPackageItem) {
+                        if ((float)$existingPackageItem->amount != $expectedDiscountAmt || (float)$existingPackageItem->unit_price != $expectedDiscountAmt || $existingPackageItem->description != $expectedDiscountDesc) {
+                            $existingPackageItem->update([
+                                'unit_price' => $expectedDiscountAmt,
+                                'amount' => $expectedDiscountAmt,
+                                'description' => $expectedDiscountDesc,
+                                'is_extra' => true,
+                                'meta' => ['type' => 'package_discount', 'package_id' => $pkgDiscount['package_id']],
+                            ]);
+                            $serviceInvoiceChanged = true;
+                        }
+                    } else {
+                        $invoice->items()->create([
+                            'order_service_id' => $os->id,
+                            'description' => $expectedDiscountDesc,
+                            'quantity' => 1,
+                            'unit_price' => $expectedDiscountAmt,
+                            'amount' => $expectedDiscountAmt,
+                            'is_extra' => true,
+                            'meta' => ['type' => 'package_discount', 'package_id' => $pkgDiscount['package_id']],
+                        ]);
+                        $serviceInvoiceChanged = true;
+                    }
+                } elseif ($existingPackageItem) {
+                    $existingPackageItem->delete();
+                    $serviceInvoiceChanged = true;
                 }
 
                 if ($serviceInvoiceChanged) {

@@ -18,6 +18,9 @@ use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Validation\ValidationException;
 use Illuminate\Support\Facades\Auth;
 use App\Models\Role;
+use App\Models\User;
+use App\Mail\AgentWelcome;
+use App\Mail\NewAgentAdminNotification;
 class AgentController extends Controller
 {
     public function index(): JsonResponse
@@ -660,6 +663,73 @@ class AgentController extends Controller
                 'payment_status'   => 'GOOD',
                 'status'           => true,
             ]);
+
+            // Dynamically resolve login URL for the agent based on origin / organization
+            $origin = $request->header('Origin') ?: $request->header('Referer');
+            $loginUrl = null;
+            if ($origin) {
+                $parsed = parse_url($origin);
+                $scheme = $parsed['scheme'] ?? 'https';
+                $host = $parsed['host'] ?? '';
+                $port = isset($parsed['port']) ? ':' . $parsed['port'] : '';
+                if ($host) {
+                    $loginUrl = "{$scheme}://{$host}{$port}/login-user";
+                }
+            }
+
+            $org = Organization::find($orgId);
+
+            if (!$loginUrl) {
+                if ($org && $org->is_whitelabel) {
+                    $domainRecord = $org->domains()->where('portal_type', 'agent')->first();
+                    $host = $domainRecord?->domain ?: $org->domain;
+                    if ($host) {
+                        $loginUrl = (str_starts_with($host, 'http') ? $host : "https://{$host}") . '/login-user';
+                    }
+                }
+            }
+
+            if (!$loginUrl) {
+                $loginUrl = config('app.agent_url', 'https://bookings.tojuco.com/login-user');
+            }
+
+            // Dispatch welcome email and admin notification safely
+            try {
+                $emailDispatcher = app(\App\Services\EmailDispatchService::class);
+
+                // 1. Send Welcome Email to Agent
+                $welcomeMail = new AgentWelcome($agent, $org, $loginUrl);
+                $emailDispatcher->sendDirectMailable($welcomeMail, $agent->email, 'agent', $org, 'agent_welcome');
+
+                // 2. Notify Organization Admins
+                $adminEmails = collect();
+                if (!empty($org?->contact_email)) {
+                    $adminEmails->push($org->contact_email);
+                }
+                if (!empty($org?->owner_user_id)) {
+                    $owner = User::find($org->owner_user_id);
+                    if ($owner && !empty($owner->email)) {
+                        $adminEmails->push($owner->email);
+                    }
+                }
+                $orgUsers = User::where('organization_id', $orgId)->pluck('email');
+                foreach ($orgUsers as $uEmail) {
+                    if (!empty($uEmail)) {
+                        $adminEmails->push($uEmail);
+                    }
+                }
+
+                $uniqueAdminEmails = $adminEmails->unique()->filter();
+                foreach ($uniqueAdminEmails as $adminEmail) {
+                    $adminNotificationMail = new NewAgentAdminNotification($agent, $org, $loginUrl);
+                    $emailDispatcher->sendDirectMailable($adminNotificationMail, $adminEmail, 'admin', $org, 'new_agent_admin_notification');
+                }
+            } catch (\Throwable $mailErr) {
+                Log::error('Failed to send agent signup welcome/admin notification: ' . $mailErr->getMessage(), [
+                    'agent_id' => $agent->id,
+                    'trace' => $mailErr->getTraceAsString(),
+                ]);
+            }
 
             return response()->json([
                 'status'  => true,

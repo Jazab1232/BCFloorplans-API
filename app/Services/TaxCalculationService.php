@@ -394,8 +394,15 @@ class TaxCalculationService
 
         foreach ($items as $idx => $item) {
             $amount = (float)($item['amount'] ?? $item->amount ?? 0);
-            $service = $item['service'] ?? (is_object($item) ? ($item->service ?? null) : null);
-            [$gstEnabled, $pstEnabled] = InvoiceController::resolveServiceTaxFlags($service, $orgId);
+            if (isset($item['gst_enabled']) || isset($item['pst_enabled'])) {
+                $gstEnabled = (bool)($item['gst_enabled'] ?? true);
+                $pstEnabled = (bool)($item['pst_enabled'] ?? false);
+            } elseif (!empty($item['is_package_discount']) || (isset($item['description']) && str_starts_with($item['description'], 'Package Discount'))) {
+                $gstEnabled = true;
+                $pstEnabled = true;
+            } else {
+                [$gstEnabled, $pstEnabled] = InvoiceController::resolveServiceTaxFlags($service, $orgId);
+            }
 
             $taxCalc = InvoiceController::calculateLineItemTax($province, $amount, $gstEnabled, $pstEnabled);
 
