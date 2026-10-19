@@ -300,7 +300,7 @@ class InvoiceController extends Controller
             'items'                  => 'nullable|array',
             'items.*.description'    => 'required_with:items|string',
             'items.*.quantity'       => 'nullable|integer|min:1',
-            'items.*.unit_price'     => 'required_with:items|numeric|min:0',
+            'items.*.unit_price'     => 'required_with:items|numeric',
             'items.*.order_service_uuid' => 'nullable|string|exists:order_services,uuid',
             'split_details'          => 'nullable|array',
         ]);
@@ -543,7 +543,7 @@ class InvoiceController extends Controller
             'items.*.uuid'               => 'nullable|string',
             'items.*.description'        => 'required_with:items|string',
             'items.*.quantity'           => 'nullable|numeric|min:0.01',
-            'items.*.unit_price'         => 'required_with:items|numeric|min:0',
+            'items.*.unit_price'         => 'required_with:items|numeric',
             'items.*.gst_enabled'        => 'nullable|boolean',
             'items.*.pst_enabled'        => 'nullable|boolean',
             'items.*.order_service_uuid' => 'nullable|string|exists:order_services,uuid',
@@ -651,7 +651,7 @@ class InvoiceController extends Controller
             'extra_items' => 'present|array',
             'extra_items.*.description' => 'required_with:extra_items|string',
             'extra_items.*.quantity' => 'nullable|integer|min:1',
-            'extra_items.*.unit_price' => 'required_with:extra_items|numeric|min:0',
+            'extra_items.*.unit_price' => 'required_with:extra_items|numeric',
             'extra_items.*.order_service_id' => 'required_with:extra_items|exists:order_services,id',
         ]);
 
@@ -688,8 +688,15 @@ class InvoiceController extends Controller
                     $allowedServiceIds = $invoice->items()->where('is_extra', false)->pluck('order_service_id')->toArray();
                 }
 
-                // Clear old extra items
-                $invoice->items()->where('is_extra', true)->delete();
+                // Clear old extra items (only extra media items, preserve package discounts)
+                $invoice->items()
+                    ->where('is_extra', true)
+                    ->where(function($q) {
+                        $q->whereNull('meta')
+                          ->orWhere('meta->type', '!=', 'package_discount');
+                    })
+                    ->where('description', 'not like', 'Package Discount%')
+                    ->delete();
 
                 // Insert new extra items
                 foreach ($request->extra_items as $itemData) {
@@ -714,6 +721,10 @@ class InvoiceController extends Controller
                 }
 
                 $invoice->recalculateTotals();
+            }
+
+            if ($targetInvoice->order) {
+                \App\Models\Invoice::syncOrderInvoices($targetInvoice->order);
             }
 
             DB::commit();
@@ -753,6 +764,87 @@ class InvoiceController extends Controller
             return response()->json(['success' => true, 'message' => 'Invoice voided.', 'data' => $invoice]);
         } catch (\Throwable $e) {
             return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Delete an unpaid invoice (Admin only).
+     * If remove_service=true, also removes the associated service from the order.
+     */
+    public function destroy(Request $request, string $uuid): JsonResponse
+    {
+        $user = auth()->user();
+        if (!$user || !($user instanceof \App\Models\User)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized. Admin access required.'
+            ], 403);
+        }
+
+        try {
+            $invoice = Invoice::where('uuid', $uuid)->with(['items', 'order'])->firstOrFail();
+
+            if ($invoice->status === 'paid' || (float)$invoice->paid_amount > 0) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Paid invoices cannot be deleted. Please issue a refund first.'
+                ], 422);
+            }
+
+            $order = $invoice->order;
+            $removeService = filter_var($request->input('remove_service', false), FILTER_VALIDATE_BOOLEAN);
+
+            // If requested to also remove the service and invoice is tied to an order service
+            if ($removeService && $order) {
+                $serviceItem = $invoice->items->firstWhere('order_service_id', '!=', null);
+                if ($serviceItem && $serviceItem->order_service_id) {
+                    $orderService = OrderService::where('order_id', $order->id)->where('id', $serviceItem->order_service_id)->first();
+                    if ($orderService) {
+                        $orderController = app(OrderController::class);
+                        return $orderController->removeService($request, $order->uuid, $orderService->uuid);
+                    }
+                }
+            }
+
+            DB::beginTransaction();
+
+            // Void in QuickBooks if synced
+            if ($invoice->quickbooks_invoice_id) {
+                try {
+                    app(\App\Services\QuickBooksService::class)->voidInvoice($invoice->quickbooks_invoice_id);
+                } catch (\Throwable $e) {
+                    Log::warning('Failed to void invoice in QuickBooks on delete: ' . $e->getMessage());
+                }
+            }
+
+            // Delete invoice items
+            $invoice->items()->delete();
+
+            // Delete the invoice
+            $invoice->delete();
+
+            // Synchronize remaining invoices and order status
+            if ($order) {
+                Invoice::syncOrderInvoices($order);
+                Invoice::syncOrderStatus($order);
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Invoice deleted successfully.'
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            Log::error('Invoice Deletion Error: ' . $e->getMessage(), [
+                'uuid' => $uuid,
+                'trace' => $e->getTraceAsString()
+            ]);
+            return response()->json([
+                'success' => false,
+                'message' => 'An error occurred while deleting the invoice: ' . $e->getMessage()
+            ], 500);
         }
     }
 

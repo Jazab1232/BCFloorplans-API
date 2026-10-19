@@ -176,5 +176,27 @@ return [
         'variables' => ['property_address', 'new_expiry_date', 'duration_months', 'amount', 'agent_name'],
         'mailable_class' => \App\Mail\MatterportRenewed::class,
     ],
+    'service_completed' => [
+        'label' => 'Service Completed',
+        'description' => 'Sent to agent when an order service is marked as completed',
+        'recipients' => ['admin', 'agent'],
+        'defaults' => [
+            'admin' => false,
+            'agent' => true,
+        ],
+        'variables' => ['order_id', 'property_address', 'service_name', 'agent_name', 'service_url', 'completed_by'],
+        'mailable_class' => \App\Mail\ServiceCompleted::class,
+    ],
+    'media_uploaded' => [
+        'label' => 'Media Uploaded / Ready',
+        'description' => 'Sent to agent when media for a service is uploaded or approved and ready',
+        'recipients' => ['admin', 'agent'],
+        'defaults' => [
+            'admin' => false,
+            'agent' => true,
+        ],
+        'variables' => ['order_id', 'property_address', 'service_name', 'agent_name', 'service_url', 'media_count', 'uploaded_by'],
+        'mailable_class' => \App\Mail\MediaUploaded::class,
+    ],
 ];
 

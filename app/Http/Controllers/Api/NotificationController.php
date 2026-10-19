@@ -148,11 +148,10 @@ class NotificationController extends Controller
 
             // Get ALL notifications for the period (no pagination - frontend handles it)
             $notifications = $query
-                ->with([
-                    'order:id,uuid,property_address,property_location,created_at',
-                ])
                 ->orderByDesc('created_at')
                 ->get();
+
+            $notifications = $this->enrichNotifications($notifications);
 
             return response()->json([
                 'success' => true,
@@ -213,12 +212,162 @@ class NotificationController extends Controller
         }
 
         $notification->update(['is_read' => true]);
+        $this->enrichNotifications(collect([$notification]));
 
         return response()->json([
             'success' => true,
             'data' => $notification,
             'message' => 'Notification marked as read',
         ]);
+    }
+
+    /**
+     * Enrich notifications with their complete related order, agent, and property data
+     */
+    private function enrichNotifications($notifications)
+    {
+        if ($notifications->isEmpty()) {
+            return $notifications;
+        }
+
+        $orderUuids = [];
+        $orderIds = [];
+        $slotUuids = [];
+        $serviceUuids = [];
+
+        foreach ($notifications as $notification) {
+            $meta = $notification->meta_data ?? [];
+            if (!empty($meta['order_uuid'])) {
+                $orderUuids[] = $meta['order_uuid'];
+            }
+            if (!empty($meta['order_id'])) {
+                $orderIds[] = $meta['order_id'];
+            }
+            if (!empty($notification->source_id)) {
+                $src = strtolower($notification->source ?? '');
+                if ($src === 'order') {
+                    $orderUuids[] = $notification->source_id;
+                } elseif ($src === 'orderslot' && empty($meta['order_uuid']) && empty($meta['order_id'])) {
+                    $slotUuids[] = $notification->source_id;
+                } elseif ($src === 'orderservice' && empty($meta['order_uuid']) && empty($meta['order_id'])) {
+                    $serviceUuids[] = $notification->source_id;
+                }
+            }
+        }
+
+        if (!empty($slotUuids)) {
+            $slotOrderIds = \App\Models\OrderSlot::whereIn('uuid', $slotUuids)->pluck('order_id')->all();
+            $orderIds = array_merge($orderIds, $slotOrderIds);
+        }
+
+        if (!empty($serviceUuids)) {
+            $serviceOrderIds = \App\Models\OrderService::whereIn('uuid', $serviceUuids)->pluck('order_id')->all();
+            $orderIds = array_merge($orderIds, $serviceOrderIds);
+        }
+
+        $orderUuids = array_unique(array_filter($orderUuids));
+        $orderIds = array_unique(array_filter($orderIds));
+
+        $orders = collect();
+        if (!empty($orderUuids) || !empty($orderIds)) {
+            $orders = Order::withoutGlobalScopes()
+                ->with([
+                    'agent:id,uuid,first_name,last_name,email,primary_phone,secondary_phone,company_name',
+                    'property:id,uuid,address,city,province,postal_code',
+                    'services.service:id,uuid,name',
+                    'services.option:id,title',
+                    'slots.vendor:id,first_name,last_name',
+                ])
+                ->where(function ($q) use ($orderUuids, $orderIds) {
+                    if (!empty($orderUuids)) {
+                        $q->whereIn('uuid', $orderUuids);
+                    }
+                    if (!empty($orderIds)) {
+                        $q->orWhereIn('id', $orderIds);
+                    }
+                })
+                ->get();
+        }
+
+        $ordersByUuid = $orders->keyBy('uuid');
+        $ordersById = $orders->keyBy('id');
+
+        foreach ($notifications as $notification) {
+            $meta = $notification->meta_data ?? [];
+            $order = null;
+
+            if (!empty($meta['order_uuid']) && isset($ordersByUuid[$meta['order_uuid']])) {
+                $order = $ordersByUuid[$meta['order_uuid']];
+            } elseif (!empty($meta['order_id']) && isset($ordersById[$meta['order_id']])) {
+                $order = $ordersById[$meta['order_id']];
+            } elseif (!empty($notification->source_id) && isset($ordersByUuid[$notification->source_id])) {
+                $order = $ordersByUuid[$notification->source_id];
+            }
+
+            if ($order) {
+                $notification->setRelation('order', $order);
+
+                $metaUpdated = false;
+                if (empty($meta['order_id'])) {
+                    $meta['order_id'] = $order->id;
+                    $metaUpdated = true;
+                }
+                if (empty($meta['order_uuid'])) {
+                    $meta['order_uuid'] = $order->uuid;
+                    $metaUpdated = true;
+                }
+                if (empty($meta['property_address']) && !empty($order->property_address)) {
+                    $meta['property_address'] = $order->property_address;
+                    $metaUpdated = true;
+                }
+                if (empty($meta['property_location']) && !empty($order->property_location)) {
+                    $meta['property_location'] = $order->property_location;
+                    $metaUpdated = true;
+                }
+                if (empty($meta['property_id']) && !empty($order->property_id)) {
+                    $meta['property_id'] = $order->property_id;
+                    $metaUpdated = true;
+                }
+                if (empty($meta['property_uuid']) && !empty($order->property?->uuid)) {
+                    $meta['property_uuid'] = $order->property->uuid;
+                    $metaUpdated = true;
+                }
+                if (empty($meta['agent_uuid']) && !empty($order->agent?->uuid)) {
+                    $meta['agent_uuid'] = $order->agent->uuid;
+                    $metaUpdated = true;
+                }
+                if (empty($meta['agent_name']) && $order->agent) {
+                    $meta['agent_name'] = trim("{$order->agent->first_name} {$order->agent->last_name}");
+                    $metaUpdated = true;
+                }
+                if (empty($meta['agent_email']) && !empty($order->agent?->email)) {
+                    $meta['agent_email'] = $order->agent->email;
+                    $metaUpdated = true;
+                }
+                if (empty($meta['agent_phone']) && (!empty($order->agent?->primary_phone) || !empty($order->agent?->secondary_phone))) {
+                    $meta['agent_phone'] = $order->agent->primary_phone ?? $order->agent->secondary_phone;
+                    $metaUpdated = true;
+                }
+                if (empty($meta['agent_company']) && !empty($order->agent?->company_name)) {
+                    $meta['agent_company'] = $order->agent->company_name;
+                    $metaUpdated = true;
+                }
+                if (empty($meta['amount']) && isset($order->amount)) {
+                    $meta['amount'] = $order->amount;
+                    $metaUpdated = true;
+                }
+
+                if ($metaUpdated) {
+                    $notification->meta_data = $meta;
+                }
+
+                if (empty($notification->agent_uuid) && !empty($order->agent?->uuid)) {
+                    $notification->agent_uuid = $order->agent->uuid;
+                }
+            }
+        }
+
+        return $notifications;
     }
 
     private function visibleNotificationsQuery($user)

@@ -130,9 +130,9 @@ class BillingController extends Controller
 
             // Find primary / consolidated invoice
             $primaryInvoice = $orderInvoices->first(function ($inv) {
-                return $inv->agent_type === 'primary'
-                    || (!empty($inv->notes) && stripos($inv->notes, 'consolidated') !== false)
-                    || empty($inv->split_details);
+                return !empty($inv->notes) && (stripos($inv->notes, 'consolidated') !== false || stripos($inv->notes, 'add-on service invoice') !== false);
+            }) ?? $orderInvoices->first(function ($inv) {
+                return $inv->agent_type === 'primary' && empty($inv->split_details) && (empty($inv->notes) || stripos($inv->notes, 'service invoice') === false);
             }) ?? $orderInvoices->first();
 
             $taxRate = $primaryInvoice && (float)$primaryInvoice->tax_rate > 0

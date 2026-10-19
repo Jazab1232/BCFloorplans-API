@@ -56,27 +56,40 @@ class TourLink extends Model
     public function getIsPaidAttribute(): bool
     {
         $tour = $this->tour;
-        $order = $tour ? ($tour->order ?? $tour->orders) : null;
+        $order = null;
+        if ($tour) {
+            $order = $tour->order ?? $tour->orders;
+            if (!$order && !empty($tour->order_id)) {
+                $order = \App\Models\Order::find($tour->order_id);
+            }
+        }
+        $orderReleased = $order && (bool) $order->release_media_before_payment;
+        $orderPaid = $order && $order->payment_status === 'PAID';
 
         // 1. If linked to a specific service, check that OrderService
-        if ($this->service_id && $tour) {
-            $orderService = \App\Models\OrderService::where('order_id', $tour->order_id ?? 0)
+        $orderId = $tour ? ($tour->order_id ?? ($order ? $order->id : 0)) : ($order ? $order->id : 0);
+        if ($this->service_id && $orderId) {
+            $orderService = \App\Models\OrderService::where('order_id', $orderId)
                 ->where('service_id', $this->service_id)
                 ->first();
             if ($orderService) {
                 if ($orderService->media_access !== null) {
                     return (bool) $orderService->media_access;
                 }
+                if ($orderReleased || $orderPaid) {
+                    return true;
+                }
                 return $orderService->payment_status === 'PAID';
             }
         }
 
         // 2. If no service_id on the TourLink, check if the tour has an OrderService for matterport / 3d tour
-        if ($tour && ($tour->order_id ?? 0)) {
-            $orderService = \App\Models\OrderService::where('order_id', $tour->order_id)
+        if ($orderId) {
+            $orderService = \App\Models\OrderService::where('order_id', $orderId)
                 ->whereHas('service', function ($q) {
                     $q->where('name', 'like', '%matterport%')
                       ->orWhere('name', 'like', '%3d tour%')
+                      ->orWhere('name', 'like', '%3d floor%')
                       ->orWhere('name', 'like', '%virtual tour%');
                 })
                 ->first();
@@ -84,12 +97,18 @@ class TourLink extends Model
                 if ($orderService->media_access !== null) {
                     return (bool) $orderService->media_access;
                 }
+                if ($orderReleased || $orderPaid) {
+                    return true;
+                }
                 return $orderService->payment_status === 'PAID';
             }
         }
 
         // 3. Fallback to order-level lock_materials and payment_status
         if ($order) {
+            if ($orderReleased || $orderPaid) {
+                return true;
+            }
             if ($order->lock_materials && $order->payment_status !== 'PAID') {
                 return false;
             }

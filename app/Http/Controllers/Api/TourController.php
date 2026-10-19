@@ -228,8 +228,18 @@ class TourController extends Controller
                 $order = $tour->order ?? $tour->orders;
                 $isPaidOrder = $order && ($order->payment_status === 'PAID' || (bool) $order->release_media_before_payment);
                 if ($tour->links) {
-                    $tour->links->transform(function ($link) use ($isPaidOrder) {
-                        $isPaid = $link->service_id ? $link->is_paid : ($link->is_paid || $isPaidOrder);
+                    $tour->links->transform(function ($link) use ($isPaidOrder, $order) {
+                        $isRevoked = false;
+                        if ($link->service_id && $order) {
+                            $orderService = \App\Models\OrderService::where('order_id', $order->id)
+                                ->where('service_id', $link->service_id)
+                                ->first();
+                            if ($orderService && $orderService->media_access === false) {
+                                $isRevoked = true;
+                            }
+                        }
+
+                        $isPaid = !$isRevoked && ($isPaidOrder || (bool) $link->is_paid);
                         if (!$isPaid) {
                             $link->link = null;
                         }
@@ -593,7 +603,9 @@ class TourController extends Controller
             }
 
             $tour->save();
-            // $updatedTourFiles = [];
+            // Track newly approved files to notify the agent
+            $newlyApprovedFilesByService = [];
+
             // Handle files
             if (isset($data['files'])) {
                 foreach ($data['files'] as $index => $fileData) {
@@ -620,6 +632,7 @@ class TourController extends Controller
                     if (!empty($fileData['uuid'])) {
                         $file = $tour->files()->where('uuid', $fileData['uuid'])->first();
                         if ($file) {
+                            $wasAdminApproved = (bool) $file->is_admin_approved;
                             if (isset($fileData['file'])) {
                                 // Store new file
                                 $filePath = $fileData['file']->store('tours/files', 'public');
@@ -627,7 +640,20 @@ class TourController extends Controller
                             }
 
                             $file->update($fileData);
-                            // $updatedTourFiles[] = $file;
+
+                            // Detect if file transitioned to admin approved
+                            $isAdminUser = auth()->user() instanceof \App\Models\User;
+                            if ($isAdminUser && !$wasAdminApproved && !empty($fileData['is_admin_approved'])) {
+                                $targetServiceId = $file->service_id ?? ($fileData['service_id'] ?? null);
+                                $svcKey = $targetServiceId ? (string) $targetServiceId : 'default';
+                                if (!isset($newlyApprovedFilesByService[$svcKey])) {
+                                    $newlyApprovedFilesByService[$svcKey] = [
+                                        'service_id' => $targetServiceId,
+                                        'count' => 0,
+                                    ];
+                                }
+                                $newlyApprovedFilesByService[$svcKey]['count']++;
+                            }
                         }
                     } else {
                         if (isset($fileData['file'])) {
@@ -708,6 +734,38 @@ class TourController extends Controller
             }
 
             DB::commit();
+
+            // If media was approved by Admin, send notification & email to Agent
+            if (!empty($newlyApprovedFilesByService)) {
+                $tour->loadMissing(['orders.agent', 'orders.property']);
+                $adminUser = auth()->user();
+                $adminName = $adminUser 
+                    ? (trim(($adminUser->first_name ?? '') . ' ' . ($adminUser->last_name ?? '')) ?: ($adminUser->name ?? 'Admin'))
+                    : 'Admin';
+
+                foreach ($newlyApprovedFilesByService as $svcKey => $info) {
+                    $svcObj = null;
+                    if (!empty($info['service_id'])) {
+                        $svcObj = Service::find($info['service_id']);
+                    }
+                    $count = $info['count'];
+
+                    try {
+                        \App\Services\NotificationService::notifyMediaReady($tour, $svcObj, $adminUser, $count, 'approved');
+                        app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
+                            'service' => $svcObj,
+                            'media_count' => $count,
+                            'uploaded_by' => $adminName,
+                            'is_approved' => true,
+                        ]);
+                    } catch (\Throwable $err) {
+                        Log::error("Failed sending media approval notification: " . $err->getMessage(), [
+                            'tour_id' => $tour->id,
+                            'service_key' => $svcKey,
+                        ]);
+                    }
+                }
+            }
             // Sync updated tour files via FTP
             // uncomment file below to enable SFTP sync on tour update
             // also uncomment the $updatedTourFiles array population above
@@ -895,8 +953,18 @@ class TourController extends Controller
                 $order = $tour->orders ?? $tour->order;
                 $isPaidOrder = $order && ($order->payment_status === 'PAID' || (bool) $order->release_media_before_payment);
                 if ($tour->links) {
-                    $tour->links->transform(function ($link) use ($isPaidOrder) {
-                        $isPaid = $link->service_id ? $link->is_paid : ($link->is_paid || $isPaidOrder);
+                    $tour->links->transform(function ($link) use ($isPaidOrder, $order) {
+                        $isRevoked = false;
+                        if ($link->service_id && $order) {
+                            $orderService = \App\Models\OrderService::where('order_id', $order->id)
+                                ->where('service_id', $link->service_id)
+                                ->first();
+                            if ($orderService && $orderService->media_access === false) {
+                                $isRevoked = true;
+                            }
+                        }
+
+                        $isPaid = !$isRevoked && ($isPaidOrder || (bool) $link->is_paid);
                         if (!$isPaid) {
                             $link->link = null;
                         }
@@ -1115,10 +1183,6 @@ class TourController extends Controller
                 });
 
                 $tour->links->transform(function ($link) use ($isAdminOrVendor, $isPaidOrder, $order) {
-                    $isPaid = $link->service_id ? $link->is_paid : ($link->is_paid || $isPaidOrder);
-
-                    $link->has_link = !empty($link->link);
-
                     // If service_id is not set on the link, attempt to associate it with the order's 3D/Matterport service
                     if (!$link->service_id && $order) {
                         $orderService = \App\Models\OrderService::where('order_id', $order->id)
@@ -1136,6 +1200,20 @@ class TourController extends Controller
                             }
                         }
                     }
+
+                    $isRevoked = false;
+                    if ($link->service_id && $order) {
+                        $orderService = \App\Models\OrderService::where('order_id', $order->id)
+                            ->where('service_id', $link->service_id)
+                            ->first();
+                        if ($orderService && $orderService->media_access === false) {
+                            $isRevoked = true;
+                        }
+                    }
+
+                    $isPaid = !$isRevoked && ($isPaidOrder || (bool) $link->is_paid);
+
+                    $link->has_link = !empty($link->link);
 
                     if (!$isAdminOrVendor && !$isPaid) {
                         // Protect link from unpaid or access-revoked agents

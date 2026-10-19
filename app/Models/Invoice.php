@@ -771,10 +771,8 @@ class Invoice extends Model
             ->with(['items'])
             ->get();
 
-        $orderServices = $order->services->filter(function($os) {
-            return $os->payment_status !== 'PAID';
-        });
-        $orderServiceIds = $orderServices->pluck('id')->toArray();
+        $allOrderServices = $order->services;
+        $allOrderServiceIds = $allOrderServices->pluck('id')->toArray();
 
         foreach ($activeInvoices as $invoice) {
             // Skip upgrade / difference invoices
@@ -806,8 +804,8 @@ class Invoice extends Model
                 $currentItems = $nonExtraItems->keyBy('order_service_id');
                 $hasChanged = false;
 
-                // 1. Add or Update items
-                foreach ($orderServices as $os) {
+                // 1. Add or Update items (consolidated invoice contains all order services)
+                foreach ($allOrderServices as $os) {
                     $isPerSqftRate = static::isPerSqftRateService($os);
                     $effectiveServiceAmount = $isPerSqftRate 
                         ? ((float)$os->amount + $totalAreaCharges)
@@ -839,9 +837,9 @@ class Invoice extends Model
                     }
                 }
 
-                // 2. Remove items no longer in order (only for base items)
+                // 2. Remove items no longer in order (only for services actually removed from the order)
                 foreach ($currentItems as $osId => $item) {
-                    if (!in_array($osId, $orderServiceIds)) {
+                    if (!in_array($osId, $allOrderServiceIds)) {
                         $item->delete();
                         $hasChanged = true;
                     }
@@ -855,12 +853,12 @@ class Invoice extends Model
                 if ($consolidatedAreaItems->isNotEmpty()) {
                     foreach ($consolidatedAreaItems as $cItem) {
                         $cItem->delete();
+                        $hasChanged = true;
                     }
-                    $hasChanged = true;
                 }
 
-                // 4. Sync package discount item on consolidated invoice
-                $pkgDiscount = static::resolvePackageDiscountForServices($order, $orderServices, $multiplier);
+                // 4. Sync package discount item on consolidated invoice using all order services
+                $pkgDiscount = static::resolvePackageDiscountForServices($order, $allOrderServices, $multiplier);
                 $existingPackageItem = $invoice->items
                     ->filter(function($i) {
                         return ($i->meta['type'] ?? null) === 'package_discount' || str_starts_with($i->description ?? '', 'Package Discount');

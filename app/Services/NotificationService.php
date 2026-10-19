@@ -62,6 +62,16 @@ class NotificationService
         $notifications = [];
 
         // Notify agent
+        $propertyId = $model->property_id ?? null;
+        $propertyUuid = $model->property?->uuid ?? null;
+        $propertyAddress = $model->property_address ?? null;
+        $propertyLocation = $model->property_location ?? null;
+        $agentUuid = $model->agent?->uuid ?? null;
+        $agentName = $model->agent ? trim("{$model->agent->first_name} {$model->agent->last_name}") : null;
+        $agentEmail = $model->agent?->email ?? null;
+        $agentPhone = $model->agent?->primary_phone ?? $model->agent?->secondary_phone ?? null;
+        $agentCompany = $model->agent?->company_name ?? null;
+
         if ($model->agent) {
             $notifications[] = [
                 'uuid' => Str::uuid(),
@@ -74,6 +84,10 @@ class NotificationService
                     'order_id' => $model->id,
                     'order_uuid' => $model->uuid,
                     'amount' => $model->amount,
+                    'property_id' => $propertyId,
+                    'property_uuid' => $propertyUuid,
+                    'property_address' => $propertyAddress,
+                    'property_location' => $propertyLocation,
                 ],
                 'agent_uuid' => $model->agent->uuid,
                 'vendor_uuids' => null,
@@ -95,12 +109,18 @@ class NotificationService
                 'order_id' => $model->id,
                 'order_uuid' => $model->uuid,
                 'amount' => $model->amount,
-                'agent_name' => $model->agent 
-                    ? "{$model->agent->first_name} {$model->agent->last_name}"
-                    : null,
+                'property_id' => $propertyId,
+                'property_uuid' => $propertyUuid,
+                'property_address' => $propertyAddress,
+                'property_location' => $propertyLocation,
+                'agent_uuid' => $agentUuid,
+                'agent_name' => $agentName,
+                'agent_email' => $agentEmail,
+                'agent_phone' => $agentPhone,
+                'agent_company' => $agentCompany,
                 'created_by' => self::getCreatorEmail(),
             ],
-            'agent_uuid' => null,
+            'agent_uuid' => $agentUuid,
             'vendor_uuids' => null,
             'user_uuid' => null,
             'role' => 'admin',
@@ -141,10 +161,18 @@ class NotificationService
                             'date' => $slot->date ?? null,
                             'start_time' => $slot->start_time ?? null,
                             'end_time' => $slot->end_time ?? null,
-                            'property_address' => $model->property_address ?? null,
-                            'property_location' => $model->property_location ?? null,
+                            'property_id' => $propertyId,
+                            'property_uuid' => $propertyUuid,
+                            'property_address' => $propertyAddress,
+                            'property_location' => $propertyLocation,
+                            'agent_uuid' => $agentUuid,
+                            'agent_name' => $agentName,
+                            'agent_email' => $agentEmail,
+                            'agent_phone' => $agentPhone,
+                            'agent_company' => $agentCompany,
+                            'amount' => $model->amount ?? null,
                         ],
-                        'agent_uuid' => null,
+                        'agent_uuid' => $agentUuid,
                         'vendor_uuids' => [$vendorUuid],
                         'user_uuid' => null,
                         'role' => 'vendor',
@@ -176,10 +204,18 @@ class NotificationService
                             'order_id' => $model->id,
                             'order_uuid' => $model->uuid,
                             'service_name' => $serviceName,
-                            'property_address' => $model->property_address ?? null,
-                            'property_location' => $model->property_location ?? null,
+                            'property_id' => $propertyId,
+                            'property_uuid' => $propertyUuid,
+                            'property_address' => $propertyAddress,
+                            'property_location' => $propertyLocation,
+                            'agent_uuid' => $agentUuid,
+                            'agent_name' => $agentName,
+                            'agent_email' => $agentEmail,
+                            'agent_phone' => $agentPhone,
+                            'agent_company' => $agentCompany,
+                            'amount' => $model->amount ?? null,
                         ],
-                        'agent_uuid' => null,
+                        'agent_uuid' => $agentUuid,
                         'vendor_uuids' => [$vendorUuid],
                         'user_uuid' => null,
                         'role' => 'vendor',
@@ -571,6 +607,12 @@ class NotificationService
 
             $description = "Order #{$model->id} updated: " . implode(', ', $changeParts);
 
+            $agentUuid = $model->agent?->uuid ?? null;
+            $agentName = $model->agent ? trim("{$model->agent->first_name} {$model->agent->last_name}") : null;
+            $agentEmail = $model->agent?->email ?? null;
+            $agentPhone = $model->agent?->primary_phone ?? $model->agent?->secondary_phone ?? null;
+            $agentCompany = $model->agent?->company_name ?? null;
+
             $notifications[] = [
                 'uuid' => Str::uuid(),
                 'source' => class_basename($model),
@@ -583,8 +625,18 @@ class NotificationService
                     'order_uuid' => $model->uuid,
                     'changes_summary' => $changeParts,
                     'details' => $details,
+                    'property_id' => $model->property_id ?? null,
+                    'property_uuid' => $model->property?->uuid ?? null,
+                    'property_address' => $model->property_address ?? null,
+                    'property_location' => $model->property_location ?? null,
+                    'agent_uuid' => $agentUuid,
+                    'agent_name' => $agentName,
+                    'agent_email' => $agentEmail,
+                    'agent_phone' => $agentPhone,
+                    'agent_company' => $agentCompany,
+                    'amount' => $model->amount ?? null,
                 ],
-                'agent_uuid' => null,
+                'agent_uuid' => $agentUuid,
                 'vendor_uuids' => [$vendorUuid],
                 'user_uuid' => null,
                 'role' => 'vendor',
@@ -1056,6 +1108,12 @@ class NotificationService
         }
 
         if ($vendorUuid) {
+            $agentUuid = $order->agent?->uuid ?? null;
+            $agentName = $order->agent ? trim("{$order->agent->first_name} {$order->agent->last_name}") : null;
+            $agentEmail = $order->agent?->email ?? null;
+            $agentPhone = $order->agent?->primary_phone ?? $order->agent?->secondary_phone ?? null;
+            $agentCompany = $order->agent?->company_name ?? null;
+
             $notifications[] = [
                 'uuid' => (string) Str::uuid(),
                 'source' => 'OrderService',
@@ -1068,15 +1126,180 @@ class NotificationService
                     'order_uuid' => $order->uuid,
                     'service_name' => $serviceName,
                     'reason' => $reason,
+                    'property_id' => $order->property_id ?? null,
+                    'property_uuid' => $order->property?->uuid ?? null,
                     'property_address' => $order->property_address ?? null,
+                    'property_location' => $order->property_location ?? null,
+                    'agent_uuid' => $agentUuid,
+                    'agent_name' => $agentName,
+                    'agent_email' => $agentEmail,
+                    'agent_phone' => $agentPhone,
+                    'agent_company' => $agentCompany,
+                    'amount' => $order->amount ?? null,
                 ],
-                'agent_uuid' => null,
+                'agent_uuid' => $agentUuid,
                 'vendor_uuids' => [$vendorUuid],
                 'user_uuid' => null,
                 'role' => 'vendor',
                 'created_by_name' => self::getCreatorName(),
             ];
         }
+
+        self::createNotifications($notifications);
+    }
+
+    /**
+     * Notify when an order service is marked as completed
+     */
+    public static function notifyServiceCompleted($orderService, $actor = null)
+    {
+        if (!$orderService) return;
+
+        $order = $orderService->relationLoaded('order') ? $orderService->order : $orderService->order()->first();
+        if (!$order) return;
+
+        $service = $orderService->relationLoaded('service') ? $orderService->service : $orderService->service()->first();
+        $serviceName = $service?->name ?? 'Service';
+        $serviceUuid = $service?->uuid ?? null;
+        $orderServiceUuid = $orderService->uuid;
+        $propertyUuid = $order->property?->uuid ?? null;
+
+        $creatorName = $actor 
+            ? (trim(($actor->first_name ?? '') . ' ' . ($actor->last_name ?? '')) ?: ($actor->name ?? self::getCreatorName()))
+            : self::getCreatorName();
+
+        $notifications = [];
+
+        // 1. Notify Agent
+        if ($order->agent) {
+            $link = "/dashboard/file-manager/{$order->uuid}";
+            $query = [];
+            if ($serviceUuid) $query['serviceId'] = $serviceUuid;
+            if ($propertyUuid) $query['listingId'] = $propertyUuid;
+            if (!empty($query)) $link .= '?' . http_build_query($query);
+
+            $notifications[] = [
+                'uuid' => (string) Str::uuid(),
+                'organization_id' => $order->organization_id,
+                'source' => 'OrderService',
+                'source_id' => $orderService->uuid ?? $order->uuid,
+                'type' => 'service_completed',
+                'description' => "Service '{$serviceName}' has been marked as completed for {$order->property_address} (Order #{$order->id})",
+                'diff_data' => [],
+                'meta_data' => [
+                    'order_id' => $order->id,
+                    'order_uuid' => $order->uuid,
+                    'service_id' => $serviceUuid,
+                    'serviceId' => $serviceUuid,
+                    'orderservice_uuid' => $orderServiceUuid,
+                    'service_name' => $serviceName,
+                    'property_id' => $order->property_id ?? null,
+                    'property_uuid' => $propertyUuid,
+                    'property_address' => $order->property_address ?? null,
+                    'property_location' => $order->property_location ?? null,
+                    'completed_by' => $creatorName,
+                    'link' => $link,
+                ],
+                'agent_uuid' => $order->agent->uuid,
+                'vendor_uuids' => null,
+                'user_uuid' => null,
+                'role' => 'agent',
+                'created_by_name' => $creatorName,
+            ];
+        }
+
+        // 2. Notify Admin if completed by vendor
+        if ($actor instanceof \App\Models\Vendor) {
+            $notifications[] = [
+                'uuid' => (string) Str::uuid(),
+                'organization_id' => $order->organization_id,
+                'source' => 'OrderService',
+                'source_id' => $orderService->uuid ?? $order->uuid,
+                'type' => 'admin_service_completed',
+                'description' => "Vendor {$creatorName} marked service '{$serviceName}' as completed for Order #{$order->id}",
+                'diff_data' => [],
+                'meta_data' => [
+                    'order_id' => $order->id,
+                    'order_uuid' => $order->uuid,
+                    'service_id' => $serviceUuid,
+                    'serviceId' => $serviceUuid,
+                    'orderservice_uuid' => $orderServiceUuid,
+                    'service_name' => $serviceName,
+                    'property_address' => $order->property_address ?? null,
+                    'completed_by' => $creatorName,
+                ],
+                'agent_uuid' => null,
+                'vendor_uuids' => null,
+                'user_uuid' => null,
+                'role' => 'admin',
+                'created_by_name' => $creatorName,
+            ];
+        }
+
+        self::createNotifications($notifications);
+    }
+
+    /**
+     * Notify when media for a service is uploaded or approved and ready
+     */
+    public static function notifyMediaReady($tour, $service, $actor = null, int $fileCount = 1, string $actionType = 'uploaded')
+    {
+        if (!$tour) return;
+
+        $order = $tour->relationLoaded('orders') ? $tour->orders : ($tour->relationLoaded('order') ? $tour->order : ($tour->orders()->first() ?: $tour->order()->first()));
+        if (!$order || !$order->agent) return;
+
+        $serviceName = $service ? $service->name : 'Media';
+        $serviceUuid = $service?->uuid ?? null;
+        $propertyUuid = $order->property?->uuid ?? null;
+
+        $creatorName = $actor 
+            ? (trim(($actor->first_name ?? '') . ' ' . ($actor->last_name ?? '')) ?: ($actor->name ?? self::getCreatorName()))
+            : self::getCreatorName();
+
+        $link = "/dashboard/file-manager/{$order->uuid}";
+        $query = [];
+        if ($serviceUuid) $query['serviceId'] = $serviceUuid;
+        if ($propertyUuid) $query['listingId'] = $propertyUuid;
+        if (!empty($query)) $link .= '?' . http_build_query($query);
+
+        $isApproved = ($actionType === 'approved');
+        $desc = $isApproved
+            ? "Media for '{$serviceName}' has been approved and is ready to view for {$order->property_address} (Order #{$order->id})"
+            : "New media uploaded for '{$serviceName}' at {$order->property_address} (Order #{$order->id})";
+
+        $notifications = [
+            [
+                'uuid' => (string) Str::uuid(),
+                'organization_id' => $order->organization_id,
+                'source' => 'Tour',
+                'source_id' => $tour->uuid,
+                'type' => 'media_uploaded',
+                'description' => $desc,
+                'diff_data' => [],
+                'meta_data' => [
+                    'order_id' => $order->id,
+                    'order_uuid' => $order->uuid,
+                    'tour_uuid' => $tour->uuid,
+                    'service_id' => $serviceUuid,
+                    'serviceId' => $serviceUuid,
+                    'service_name' => $serviceName,
+                    'property_id' => $order->property_id ?? null,
+                    'property_uuid' => $propertyUuid,
+                    'property_address' => $order->property_address ?? null,
+                    'property_location' => $order->property_location ?? null,
+                    'media_count' => $fileCount,
+                    'action_type' => $actionType,
+                    'uploaded_by' => $creatorName,
+                    'link' => $link,
+                ],
+                'agent_uuid' => $order->agent->uuid,
+                'vendor_uuids' => null,
+                'user_uuid' => null,
+                'role' => 'agent',
+                'created_by_name' => $creatorName,
+            ]
+        ];
 
         self::createNotifications($notifications);
     }

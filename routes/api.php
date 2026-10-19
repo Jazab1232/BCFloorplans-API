@@ -431,6 +431,7 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api", "resolve
         Route::get('/{uuid}/refund-receipts', [InvoiceController::class, 'getRefundReceipts']);
         Route::post('/{uuid}/markPaid', [InvoiceController::class, 'markPaid']);
         Route::post('/{uuid}/extra-items', [InvoiceController::class, 'syncExtraItems']);
+        Route::delete('/{uuid}', [InvoiceController::class, 'destroy']);
     });
 
     // Property management
@@ -450,6 +451,8 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api", "resolve
     Route::post('orders', [OrderController::class, 'store']);
 
     Route::delete('orders/{uuid}', [OrderController::class, 'destroy']);
+    Route::get('orders/{uuid}/services/{service_uuid}/preview-remove', [OrderController::class, 'previewRemoveService']);
+    Route::delete('orders/{uuid}/services/{service_uuid}', [OrderController::class, 'removeService']);
     Route::patch('orders/completion-status/update', [OrderController::class, 'IsOrderServiceCompleted']);
     Route::patch('orders/media-access/update', [OrderController::class, 'updateOrderServiceMediaAccess']);
 

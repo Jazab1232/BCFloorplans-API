@@ -23,6 +23,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
 use Aws\S3\S3Client;
 
@@ -524,11 +525,17 @@ class PresignedUrlController extends Controller
                     }
                 }
 
+                $approvedFilesByService = [];
+                $currentUser = request()->user();
+                $isAdmin = $currentUser instanceof \App\Models\User;
+                $isVendor = $currentUser instanceof \App\Models\Vendor;
+
                 foreach ($data['uploads'] as $index => $upload) {
                     $isVideo = str_starts_with($upload['content_type'], 'video/');
 
                     // Get service_id if provided
                     $serviceId = null;
+                    $service = null;
                     if (!empty($upload['service_id'])) {
                         $svcVal = $upload['service_id'];
                         if (is_numeric($svcVal)) {
@@ -555,6 +562,16 @@ class PresignedUrlController extends Controller
                         ))
                     ));
 
+                    // Determine admin approval securely
+                    $isAdminApproved = false;
+                    if ($isAdmin) {
+                        $isAdminApproved = true;
+                    } elseif ($isVendor) {
+                        $isAdminApproved = !((bool) $currentUser->review_files);
+                    } else {
+                        $isAdminApproved = isset($upload['is_admin_approved']) ? (bool) $upload['is_admin_approved'] : false;
+                    }
+
                     // Floor plans auto-approve by default (selection bypass)
                     $isAgentApproved = isset($upload['is_agent_approved'])
                         ? (bool) $upload['is_agent_approved']
@@ -573,7 +590,7 @@ class PresignedUrlController extends Controller
                         'is_processing' => !$isVideo && !$isDoc, // Videos and documents don't need photo processing
                         'is_featured' => $upload['is_featured'] ?? false,
                         'is_show' => $upload['is_show'] ?? true,
-                        'is_admin_approved' => $upload['is_admin_approved'] ?? false,
+                        'is_admin_approved' => $isAdminApproved,
                         'is_agent_approved' => $isAgentApproved,
                         'is_complimentary' => $upload['is_complimentary'] ?? false,
                         'variants' => $isDoc ? [
@@ -584,6 +601,17 @@ class PresignedUrlController extends Controller
                             'print' => $upload['s3_key'],
                         ] : null,
                     ]);
+
+                    if ($isAdminApproved) {
+                        $svcKey = $serviceId ? (string) $serviceId : 'default';
+                        if (!isset($approvedFilesByService[$svcKey])) {
+                            $approvedFilesByService[$svcKey] = [
+                                'service' => $service,
+                                'count' => 0,
+                            ];
+                        }
+                        $approvedFilesByService[$svcKey]['count']++;
+                    }
 
                     // Dispatch image processing job (skip for videos, PDFs, and SVG documents)
                     if (!$isVideo && !$isDoc) {
@@ -611,6 +639,39 @@ class PresignedUrlController extends Controller
                     }
 
                     $confirmedFiles[] = $confirmedFileData;
+                }
+
+                // If media was auto-approved (admin upload or approved vendor), notify agent
+                if ($tour && !empty($approvedFilesByService)) {
+                    $tour->loadMissing(['orders.agent', 'orders.property']);
+                    $uploader = request()->user();
+                    $uploaderName = $uploader 
+                        ? (trim(($uploader->first_name ?? '') . ' ' . ($uploader->last_name ?? '')) ?: ($uploader->name ?? 'Team'))
+                        : 'Team';
+
+                    foreach ($approvedFilesByService as $svcKey => $info) {
+                        $svcObj = $info['service'];
+                        $count = $info['count'];
+                        $throttleKey = "media_upload_notify_{$tour->id}_{$svcKey}";
+
+                        if (!Cache::has($throttleKey)) {
+                            Cache::put($throttleKey, true, 60);
+
+                            try {
+                                \App\Services\NotificationService::notifyMediaReady($tour, $svcObj, $uploader, $count, 'uploaded');
+                                app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
+                                    'service' => $svcObj,
+                                    'media_count' => $count,
+                                    'uploaded_by' => $uploaderName,
+                                ]);
+                            } catch (\Throwable $err) {
+                                Log::error("Failed sending media upload notification: " . $err->getMessage(), [
+                                    'tour_id' => $tour->id,
+                                    'service_key' => $svcKey,
+                                ]);
+                            }
+                        }
+                    }
                 }
             }
 

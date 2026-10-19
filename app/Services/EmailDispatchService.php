@@ -120,6 +120,14 @@ class EmailDispatchService
             return $model->tour ? $this->resolveOrganization($model->tour) : null;
         }
 
+        if ($model instanceof \App\Models\TourFile) {
+            return $model->tour ? $this->resolveOrganization($model->tour) : null;
+        }
+
+        if ($model instanceof \App\Models\OrderService) {
+            return $model->order ? $this->resolveOrganization($model->order) : null;
+        }
+
         if ($model instanceof \App\Models\AgentPayment) {
             if ($model->order) {
                 $org = $this->resolveOrganization($model->order);
@@ -230,15 +238,21 @@ class EmailDispatchService
         $order = null;
         $slot = null;
         $payment = null;
-        if ($model instanceof \App\Models\Order) {
+        if (!empty($options['order'])) {
+            $order = $options['order'];
+        } elseif ($model instanceof \App\Models\Order) {
             $order = $model;
         } elseif ($model instanceof \App\Models\OrderSlot) {
             $slot = $model;
             $order = $model->order;
         } elseif ($model instanceof \App\Models\Tour) {
-            $order = $model->orders;
+            $order = $model->orders ?: $model->order;
         } elseif ($model instanceof \App\Models\TourLink) {
-            $order = $model->tour ? $model->tour->orders : null;
+            $order = $model->tour ? ($model->tour->orders ?: $model->tour->order) : null;
+        } elseif ($model instanceof \App\Models\TourFile) {
+            $order = $model->tour ? ($model->tour->orders ?: $model->tour->order) : null;
+        } elseif ($model instanceof \App\Models\OrderService) {
+            $order = $model->order;
         } elseif ($model instanceof \App\Models\AgentPayment) {
             $payment = $model;
             $order = $model->order ?: ($model->invoice ? $model->invoice->order : null);
@@ -541,6 +555,19 @@ class EmailDispatchService
             $order = $tour ? ($tour->orders ?: $tour->order) : null;
             $data['tour'] = $tour;
             $data['tour_link'] = $model;
+        } elseif ($model instanceof \App\Models\TourFile) {
+            $tour = $model->tour;
+            $order = $tour ? ($tour->orders ?: $tour->order) : null;
+            $data['tour'] = $tour;
+            $data['tour_file'] = $model;
+        } elseif ($model instanceof \App\Models\OrderService) {
+            $orderService = $model;
+            $order = $model->order;
+            $data['order_service'] = $model;
+            if ($model->service) {
+                $data['service'] = $model->service;
+                $data['service_name'] = $model->service->name;
+            }
         } elseif ($model instanceof \App\Models\AgentPayment) {
             $payment = $model;
             if (!$payment->relationLoaded('order') && $payment->order_id) {
@@ -704,6 +731,44 @@ class EmailDispatchService
             } else {
                 $data['cancellation_fee'] = null;
             }
+        }
+
+        // ── Service & Service URL Deep Link Resolution ────────────────────────
+        $serviceObj = $data['service'] ?? ($orderService?->service ?? ($preSeededData['service'] ?? null));
+        if ($serviceObj && empty($data['service_name'])) {
+            $data['service_name'] = $serviceObj->name;
+        }
+        if ($order && empty($data['property_address'])) {
+            $data['property_address'] = $order->property_address ?? 'Property';
+        }
+        if ($order && empty($data['order_id'])) {
+            $data['order_id'] = $order->id;
+        }
+
+        if ($order && empty($data['service_url'])) {
+            $propUuid = $order->property?->uuid;
+            $svcUuid = $serviceObj?->uuid;
+
+            $baseUrl = config('app.frontend_url', config('app.admin_app', 'https://teams.tojuco.com'));
+            if ($org && $org->is_whitelabel) {
+                $domainRecord = $org->domains()->where('portal_type', 'agent')->first();
+                if ($domainRecord && !empty($domainRecord->domain)) {
+                    $baseUrl = $domainRecord->domain;
+                } elseif (!empty($org->domain)) {
+                    $baseUrl = $org->domain;
+                }
+            }
+            if (!str_starts_with($baseUrl, 'http://') && !str_starts_with($baseUrl, 'https://')) {
+                $baseUrl = 'https://' . $baseUrl;
+            }
+            $baseUrl = rtrim($baseUrl, '/');
+
+            $query = [];
+            if ($svcUuid) $query['serviceId'] = $svcUuid;
+            if ($propUuid) $query['listingId'] = $propUuid;
+            $queryString = !empty($query) ? '?' . http_build_query($query) : '';
+
+            $data['service_url'] = "{$baseUrl}/dashboard/file-manager/{$order->uuid}{$queryString}";
         }
 
         // ── Password Reset ─────────────────────────────────────────────────────
@@ -952,6 +1017,26 @@ class EmailDispatchService
                 $mailable = new $mailableClass(
                     $data['tour'] ?? null,
                     $recipientName,
+                    $recipient['role'] ?? 'agent',
+                    $data
+                );
+                break;
+
+            case \App\Mail\ServiceCompleted::class:
+                $orderService = $data['order_service'] ?? ($model instanceof \App\Models\OrderService ? $model : null);
+                $mailable = new $mailableClass(
+                    $orderService,
+                    $data['recipient_name'] ?? 'Valued Customer',
+                    $recipient['role'] ?? 'agent',
+                    $data
+                );
+                break;
+
+            case \App\Mail\MediaUploaded::class:
+                $tour = $data['tour'] ?? ($model instanceof \App\Models\Tour ? $model : null);
+                $mailable = new $mailableClass(
+                    $tour,
+                    $data['recipient_name'] ?? 'Valued Customer',
                     $recipient['role'] ?? 'agent',
                     $data
                 );

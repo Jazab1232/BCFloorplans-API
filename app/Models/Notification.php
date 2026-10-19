@@ -91,18 +91,23 @@ class Notification extends Model
 
         return $query->withoutGlobalScope('organization')
             ->where(function ($query) use ($agent, $sharedOrderUuids, $sharedPropertyUuids, $sharedOrderUuidTexts, $sharedPropertyUuidTexts) {
-            $query->where('agent_uuid', $agent->uuid)
-                ->orWhere('user_uuid', $agent->uuid)
-                ->orWhere(function ($shared) use ($sharedOrderUuids, $sharedPropertyUuids, $sharedOrderUuidTexts, $sharedPropertyUuidTexts) {
-                    $shared->where('role', 'agent')
-                        ->where(function ($source) use ($sharedOrderUuids, $sharedPropertyUuids, $sharedOrderUuidTexts, $sharedPropertyUuidTexts) {
-                            $source->whereIn('source_id', $sharedOrderUuids)
-                                ->orWhereIn('meta_data->order_uuid', $sharedOrderUuidTexts)
-                                ->orWhereIn('source_id', $sharedPropertyUuids)
-                                ->orWhereIn('meta_data->property_uuid', $sharedPropertyUuidTexts);
-                        });
-                });
+            $query->where(function ($recipient) use ($agent) {
+                $recipient->where('role', 'agent')
+                    ->where(function ($q) use ($agent) {
+                        $q->where('agent_uuid', $agent->uuid)
+                            ->orWhere('user_uuid', $agent->uuid);
+                    });
+            })
+            ->orWhere(function ($shared) use ($sharedOrderUuids, $sharedPropertyUuids, $sharedOrderUuidTexts, $sharedPropertyUuidTexts) {
+                $shared->where('role', 'agent')
+                    ->where(function ($source) use ($sharedOrderUuids, $sharedPropertyUuids, $sharedOrderUuidTexts, $sharedPropertyUuidTexts) {
+                        $source->whereIn('source_id', $sharedOrderUuids)
+                            ->orWhereIn('meta_data->order_uuid', $sharedOrderUuidTexts)
+                            ->orWhereIn('source_id', $sharedPropertyUuids)
+                            ->orWhereIn('meta_data->property_uuid', $sharedPropertyUuidTexts);
+                    });
             });
+        });
     }
 
 }

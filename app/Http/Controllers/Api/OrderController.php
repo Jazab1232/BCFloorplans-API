@@ -2243,6 +2243,349 @@ private function createOrderNotification($order, array $changes)
         }
     }
 
+    /**
+     * Remove an unpaid service from an order directly (Admin only).
+     * Synchronizes calendar events, packages, order amounts, and deletes/syncs invoices.
+     */
+    public function removeService(Request $request, string $uuid, string $service_uuid): JsonResponse
+    {
+        $user = auth()->user();
+        if (!$user || !($user instanceof \App\Models\User)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized. Admin access required.'
+            ], 403);
+        }
+
+        try {
+            DB::beginTransaction();
+
+            $order = Order::with(['services.service', 'services.option', 'slots', 'property', 'agent', 'areas'])
+                ->where('uuid', $uuid)
+                ->lockForUpdate()
+                ->first();
+
+            if (!$order) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Order not found.'
+                ], 404);
+            }
+
+            $orderService = OrderService::where('order_id', $order->id)
+                ->where('uuid', $service_uuid)
+                ->first();
+
+            if (!$orderService) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Service not found in this order.'
+                ], 404);
+            }
+
+            if (strtoupper($orderService->payment_status ?? '') === 'PAID') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Paid services cannot be removed directly. Please refund the service first or use Cancel Service.'
+                ], 422);
+            }
+
+            $serviceId = $orderService->service_id;
+            $orderServiceId = $orderService->id;
+            $serviceName = $orderService->service->name ?? $orderService->custom ?? 'Service';
+
+            // 1. Delete associated calendar slot if exists
+            $deletedSlotId = null;
+            $slot = OrderSlot::where('order_id', $order->id)->where('service_id', $serviceId)->first();
+            if ($slot) {
+                $deletedSlotId = $slot->id;
+                $slot->delete();
+            }
+
+            // 2. Find and delete individual service invoice if exists
+            $serviceInvoice = Invoice::where('order_id', $order->id)
+                ->whereHas('items', function ($q) use ($orderServiceId) {
+                    $q->where('order_service_id', $orderServiceId);
+                })
+                ->where(function ($q) {
+                    $q->where('notes', 'like', 'Service Invoice:%')
+                      ->orWhere('notes', 'like', '%Invoice (%');
+                })
+                ->first();
+
+            if ($serviceInvoice) {
+                if ($serviceInvoice->status === 'paid' || (float)$serviceInvoice->paid_amount > 0) {
+                    DB::rollBack();
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'This service has an associated paid invoice. Please refund the invoice first.'
+                    ], 422);
+                }
+
+                if ($serviceInvoice->quickbooks_invoice_id) {
+                    try {
+                        app(\App\Services\QuickBooksService::class)->voidInvoice($serviceInvoice->quickbooks_invoice_id);
+                    } catch (\Throwable $e) {
+                        Log::warning('Failed to void service invoice in QuickBooks: ' . $e->getMessage());
+                    }
+                }
+
+                $serviceInvoice->items()->delete();
+                $serviceInvoice->delete();
+            }
+
+            // 3. Delete the OrderService record
+            $orderService->delete();
+
+            // 4. Re-evaluate Package Discounts with remaining services
+            $remainingServices = OrderService::where('order_id', $order->id)->get();
+            $remainingServiceIds = $remainingServices->pluck('service_id')->toArray();
+            $totalRemainingBase = (float)$remainingServices->sum('amount');
+            $existingPackageInfo = $order->meta['applied_package'] ?? null;
+
+            $packageDetectionService = app(PackageDetectionService::class);
+            $packageEvaluation = $packageDetectionService->evaluatePackageForUpdate(
+                $remainingServiceIds,
+                $existingPackageInfo,
+                $order->organization_id,
+                $totalRemainingBase
+            );
+
+            $currentMeta = $order->meta ?? [];
+            if ($packageEvaluation['changed']) {
+                if ($packageEvaluation['should_apply'] && $packageEvaluation['package']) {
+                    $packageDiscountAmount = $packageDetectionService->calculatePackageDiscount(
+                        $packageEvaluation['package'],
+                        $totalRemainingBase
+                    );
+                    $packageInfo = $packageDetectionService->getPackageInfo(
+                        $packageEvaluation['package'],
+                        $remainingServiceIds,
+                        $packageDiscountAmount
+                    );
+                    $order->package_id = $packageEvaluation['package']->id;
+                    $currentMeta['applied_package'] = $packageInfo;
+                } else {
+                    $order->package_id = null;
+                    unset($currentMeta['applied_package']);
+                }
+            }
+
+            $order->meta = $currentMeta;
+            $order->save();
+
+            // 5. Recalculate totals and amounts using existing recalculateTotals logic
+            $serviceAmounts = [];
+            foreach ($remainingServices as $rs) {
+                $serviceAmounts[$rs->service_id] = (float)$rs->amount;
+            }
+
+            $existingDiscounts = OrderTotal::where('order_id', $order->id)
+                ->whereNotNull('discount_id')
+                ->with('discount')
+                ->get()
+                ->map(function ($ot) {
+                    return [
+                        'discount_id' => $ot->discount?->uuid,
+                        'value' => (float)$ot->discount_value,
+                        'type' => $ot->discount_type,
+                    ];
+                })
+                ->filter(fn($d) => !empty($d['discount_id']))
+                ->values()
+                ->toArray();
+
+            $this->recalculateTotals($order, $existingDiscounts, $serviceAmounts, $totalRemainingBase);
+
+            // 6. Synchronize consolidated invoices (removes deleted service item and recalculates totals)
+            Invoice::syncOrderInvoices($order);
+
+            // 7. Sync order payment status
+            Invoice::syncOrderStatus($order);
+
+            DB::commit();
+
+            // 8. Dispatch Google Calendar event deletion
+            if ($deletedSlotId) {
+                try {
+                    \App\Jobs\SyncOrderCalendarEvents::dispatch($order->id, [$deletedSlotId]);
+                } catch (\Throwable $e) {
+                    Log::warning('Failed to dispatch SyncOrderCalendarEvents on removeService: ' . $e->getMessage());
+                }
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => "Service '{$serviceName}' removed successfully.",
+                'data' => [
+                    'order_uuid' => $order->uuid,
+                    'new_amount' => $order->fresh()->amount,
+                    'remaining_services' => $remainingServices->count()
+                ]
+            ]);
+
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            Log::error('Service Removal Error: ' . $e->getMessage(), [
+                'order_uuid' => $uuid,
+                'service_uuid' => $service_uuid,
+                'trace' => $e->getTraceAsString()
+            ]);
+            return response()->json([
+                'success' => false,
+                'message' => 'An error occurred while removing the service: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function previewRemoveService(Request $request, string $uuid, string $service_uuid): JsonResponse
+    {
+        $user = auth()->user();
+        if (!$user || !($user instanceof \App\Models\User)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized. Admin access required.'
+            ], 403);
+        }
+
+        try {
+            $order = Order::with(['services.service', 'services.option', 'property', 'agent', 'areas'])
+                ->where('uuid', $uuid)
+                ->first();
+
+            if (!$order) {
+                return response()->json(['success' => false, 'message' => 'Order not found.'], 404);
+            }
+
+            $orderService = OrderService::with('service')
+                ->where('order_id', $order->id)
+                ->where('uuid', $service_uuid)
+                ->first();
+
+            if (!$orderService) {
+                return response()->json(['success' => false, 'message' => 'Service not found in this order.'], 404);
+            }
+
+            $serviceName = $orderService->service->name ?? $orderService->custom ?? 'Service';
+            $basePrice = (float)$orderService->amount;
+
+            // Check if there are individual service invoice(s)
+            $serviceInvoices = Invoice::where('order_id', $order->id)
+                ->whereHas('items', function ($q) use ($orderService) {
+                    $q->where('order_service_id', $orderService->id);
+                })
+                ->where(function ($q) {
+                    $q->where('notes', 'like', 'Service Invoice:%')
+                      ->orWhere('notes', 'like', '%Invoice (%');
+                })
+                ->get();
+
+            if ($serviceInvoices->isNotEmpty()) {
+                $subtotal = (float)$serviceInvoices->sum('subtotal');
+                $taxAmount = (float)$serviceInvoices->sum('tax_amount');
+                $finalTotal = (float)$serviceInvoices->sum('total');
+                $discountAmount = max(0.0, round($basePrice - $subtotal, 2));
+                $taxRate = (float)($serviceInvoices->first()->tax_rate ?? 5.0);
+
+                return response()->json([
+                    'success' => true,
+                    'data' => [
+                        'service_name' => $serviceName,
+                        'base_price' => $basePrice,
+                        'discount_amount' => $discountAmount,
+                        'tax_rate' => $taxRate,
+                        'tax_amount' => round($taxAmount, 2),
+                        'final_total' => round($finalTotal, 2),
+                        'invoice_type' => 'individual',
+                        'invoice_number' => $serviceInvoices->map(fn($i) => '#' . ($i->invoice_number ?? $i->id))->implode(', '),
+                    ]
+                ]);
+            }
+
+            // Consolidated invoice preview
+            $activeInvoice = Invoice::where('order_id', $order->id)
+                ->where('status', '!=', 'paid')
+                ->where('status', '!=', 'void')
+                ->where('status', '!=', 'refunded')
+                ->first();
+
+            $taxRate = 5.0; // default 5% GST in BC
+            if ($activeInvoice && $activeInvoice->tax_rate) {
+                $taxRate = (float)$activeInvoice->tax_rate;
+            }
+
+            // Check package discount impact
+            $remainingServices = OrderService::where('order_id', $order->id)->where('id', '!=', $orderService->id)->get();
+            $remainingServiceIds = $remainingServices->pluck('service_id')->toArray();
+            $totalRemainingBase = (float)$remainingServices->sum('amount');
+            $existingPackageInfo = $order->meta['applied_package'] ?? null;
+
+            $packageDetectionService = app(PackageDetectionService::class);
+            $packageEvaluation = $packageDetectionService->evaluatePackageForUpdate(
+                $remainingServiceIds,
+                $existingPackageInfo,
+                $order->organization_id,
+                $totalRemainingBase
+            );
+
+            $oldDiscount = 0.0;
+            if ($existingPackageInfo && isset($existingPackageInfo['discount_amount'])) {
+                $oldDiscount = (float)$existingPackageInfo['discount_amount'];
+            }
+
+            $newDiscount = 0.0;
+            if ($packageEvaluation['should_apply'] && $packageEvaluation['package']) {
+                $newDiscount = (float)$packageDetectionService->calculatePackageDiscount(
+                    $packageEvaluation['package'],
+                    $totalRemainingBase
+                );
+            }
+
+            $existingDiscounts = OrderTotal::where('order_id', $order->id)
+                ->whereNotNull('discount_id')
+                ->get();
+            $couponDiscountPortion = 0.0;
+            $orderTotalBase = (float)$order->services->sum('amount');
+            if ($orderTotalBase > 0) {
+                foreach ($existingDiscounts as $ed) {
+                    $couponDiscountPortion += abs((float)$ed->amount) * ($basePrice / $orderTotalBase);
+                }
+            }
+
+            $packageDiscountPortion = max(0.0, $oldDiscount - $newDiscount);
+            $totalDiscountOnService = round($packageDiscountPortion + $couponDiscountPortion, 2);
+
+            $taxableAmount = max(0.0, $basePrice - $totalDiscountOnService);
+            $taxAmount = round($taxableAmount * ($taxRate / 100), 2);
+            $finalTotal = round($taxableAmount + $taxAmount, 2);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'service_name' => $serviceName,
+                    'base_price' => $basePrice,
+                    'discount_amount' => $totalDiscountOnService,
+                    'tax_rate' => $taxRate,
+                    'tax_amount' => $taxAmount,
+                    'final_total' => $finalTotal,
+                    'invoice_type' => 'consolidated',
+                    'invoice_number' => $activeInvoice ? ('#' . ($activeInvoice->invoice_number ?? $activeInvoice->id)) : null,
+                ]
+            ]);
+
+        } catch (\Throwable $e) {
+            Log::error('Service Removal Preview Error: ' . $e->getMessage(), [
+                'order_uuid' => $uuid,
+                'service_uuid' => $service_uuid,
+                'trace' => $e->getTraceAsString()
+            ]);
+            return response()->json([
+                'success' => false,
+                'message' => 'An error occurred while generating service removal preview: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
     public function IsOrderServiceCompleted(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
@@ -2272,7 +2615,31 @@ private function createOrderNotification($order, array $changes)
             ], 404);
         }
 
+        $wasCompleted = (bool) $orderService->is_completed;
         $orderService->update(['is_completed' => $request->is_completed]);
+
+        // If newly marked as completed, trigger in-app notification and email to agent
+        if (!$wasCompleted && (bool) $request->is_completed) {
+            try {
+                $orderService->loadMissing(['order.agent', 'order.property', 'service']);
+                $actor = auth()->user();
+
+                // 1. In-app notification
+                \App\Services\NotificationService::notifyServiceCompleted($orderService, $actor);
+
+                // 2. Email dispatch via EmailDispatchService
+                app(\App\Services\EmailDispatchService::class)->dispatch('service_completed', $orderService, [
+                    'order' => $order,
+                    'service' => $orderService->service,
+                    'completed_by' => $actor ? (trim(($actor->first_name ?? '') . ' ' . ($actor->last_name ?? '')) ?: ($actor->name ?? 'Team')) : 'Team',
+                ]);
+            } catch (\Throwable $notifErr) {
+                Log::error("Failed sending service completion notification: " . $notifErr->getMessage(), [
+                    'exception' => $notifErr,
+                    'order_service_uuid' => $orderService->uuid,
+                ]);
+            }
+        }
 
         return response()->json([
             'success' => true,
@@ -2402,8 +2769,18 @@ private function createOrderNotification($order, array $changes)
             $isPaidOrder = $order->payment_status === 'PAID' || (bool) $order->release_media_before_payment;
             foreach ($order->tours as $tour) {
                 if ($tour->links) {
-                    $tour->links->transform(function ($link) use ($isPaidOrder) {
-                        $isPaid = $link->service_id ? $link->is_paid : ($link->is_paid || $isPaidOrder);
+                    $tour->links->transform(function ($link) use ($isPaidOrder, $order) {
+                        $isRevoked = false;
+                        if ($link->service_id && $order) {
+                            $orderService = \App\Models\OrderService::where('order_id', $order->id)
+                                ->where('service_id', $link->service_id)
+                                ->first();
+                            if ($orderService && $orderService->media_access === false) {
+                                $isRevoked = true;
+                            }
+                        }
+
+                        $isPaid = !$isRevoked && ($isPaidOrder || (bool) $link->is_paid);
                         if (!$isPaid) {
                             $link->link = null;
                         }
