@@ -388,7 +388,12 @@ class TourController extends Controller
             }
 
             // Handle links
+            $newlyApprovedLinksByService = [];
             if (!empty($data['links'])) {
+                $currentUser = auth()->user();
+                $isAdmin = $currentUser instanceof \App\Models\User;
+                $isVendor = $currentUser instanceof \App\Models\Vendor;
+
                 foreach ($data['links'] as $index => $linkData) {
                     $serviceId = null;
                     if (isset($linkData['service_id']) && !empty($linkData['service_id'])) {
@@ -401,6 +406,33 @@ class TourController extends Controller
                         }
                     }
 
+                    if (!$serviceId && $tour) {
+                        $order = $tour->order ?? $tour->orders;
+                        if (!$order && !empty($tour->order_id)) {
+                            $order = Order::find($tour->order_id);
+                        }
+                        if ($order) {
+                            $serviceId = \App\Models\OrderService::where('order_id', $order->id)
+                                ->whereHas('service', function ($q) {
+                                    $q->where('name', 'like', '%matterport%')
+                                      ->orWhere('name', 'like', '%3d tour%')
+                                      ->orWhere('name', 'like', '%3d floor%')
+                                      ->orWhere('name', 'like', '%virtual tour%');
+                                })
+                                ->value('service_id');
+                        }
+                    }
+
+                    // Determine admin approval status
+                    $linkIsAdminApproved = false;
+                    if ($isAdmin) {
+                        $linkIsAdminApproved = isset($linkData['is_admin_approved']) ? (bool) $linkData['is_admin_approved'] : true;
+                    } elseif ($isVendor) {
+                        $linkIsAdminApproved = !((bool) $currentUser->review_files);
+                    } else {
+                        $linkIsAdminApproved = isset($linkData['is_admin_approved']) ? (bool) $linkData['is_admin_approved'] : false;
+                    }
+
                     TourLink::create([
                         'uuid' => Str::uuid()->toString(),
                         'tour_id' => $tour->id,
@@ -410,9 +442,20 @@ class TourController extends Controller
                         'expiry_date' => $linkData['expiry_date'] ?? null,
                         'sort_order' => $index,
                         'is_agent_approved' => $linkData['is_agent_approved'] ?? false,
-                        'is_admin_approved' => $linkData['is_admin_approved'] ?? false,
+                        'is_admin_approved' => $linkIsAdminApproved,
                         'is_hidden' => $linkData['is_hidden'] ?? false,
                     ]);
+
+                    if ($linkIsAdminApproved && !empty($linkData['link'])) {
+                        $svcKey = $serviceId ? (string) $serviceId : 'matterport';
+                        if (!isset($newlyApprovedLinksByService[$svcKey])) {
+                            $newlyApprovedLinksByService[$svcKey] = [
+                                'service_id' => $serviceId,
+                                'count' => 0,
+                            ];
+                        }
+                        $newlyApprovedLinksByService[$svcKey]['count']++;
+                    }
                 }
             }
 
@@ -440,6 +483,61 @@ class TourController extends Controller
             }
 
             DB::commit();
+
+            // If links (e.g. Matterport / 3D tours) were approved/added on creation, notify agent when threshold (at least 1) is reached
+            if (!empty($newlyApprovedLinksByService)) {
+                $tour->loadMissing(['orders.agent', 'orders.property']);
+                $actorUser = auth()->user();
+                $actorName = $actorUser 
+                    ? (trim(($actorUser->first_name ?? '') . ' ' . ($actorUser->last_name ?? '')) ?: ($actorUser->name ?? 'Team'))
+                    : 'Team';
+
+                foreach ($newlyApprovedLinksByService as $svcKey => $info) {
+                    $svcObj = null;
+                    if (!empty($info['service_id'])) {
+                        $svcObj = Service::find($info['service_id']);
+                    }
+                    $count = $info['count'];
+
+                    [$shouldNotify, $targetQty, $currentApprovedCount] = \App\Services\NotificationService::checkMediaQuantityThreshold(
+                        $tour,
+                        $svcObj ?? ($info['service_id'] ?? null),
+                        $count,
+                        'link'
+                    );
+
+                    if (!$shouldNotify) {
+                        continue;
+                    }
+
+                    $throttleKey = "media_upload_notify_{$tour->id}_link_{$svcKey}";
+
+                    if (!Cache::has($throttleKey)) {
+                        Cache::put($throttleKey, true, 60);
+
+                        try {
+                            \App\Services\NotificationService::notifyMediaReady(
+                                $tour,
+                                $svcObj,
+                                $actorUser,
+                                $currentApprovedCount,
+                                ($actorUser instanceof \App\Models\User) ? 'approved' : 'uploaded'
+                            );
+                            app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
+                                'service' => $svcObj,
+                                'media_count' => $currentApprovedCount,
+                                'uploaded_by' => $actorName,
+                                'is_approved' => ($actorUser instanceof \App\Models\User),
+                            ]);
+                        } catch (\Throwable $err) {
+                            Log::error("Failed sending media link notification on tour creation: " . $err->getMessage(), [
+                                'tour_id' => $tour->id,
+                                'service_key' => $svcKey,
+                            ]);
+                        }
+                    }
+                }
+            }
 
             // Sync created tour files via FTP 
             // uncomment filed below to enable SFTP sync on tour creation
@@ -669,32 +767,86 @@ class TourController extends Controller
             }
 
             // Handle links
+            $newlyApprovedLinksByService = [];
             if (isset($data['links'])) {
+                $currentUser = auth()->user();
+                $isAdmin = $currentUser instanceof \App\Models\User;
+                $isVendor = $currentUser instanceof \App\Models\Vendor;
+
                 foreach ($data['links'] as $index => $linkData) {
                     $linkData = array_merge(['sort_order' => $index], $linkData);
                     $linkData['is_agent_approved'] = $linkData['is_agent_approved'] ?? false;
-                    $linkData['is_admin_approved'] = $linkData['is_admin_approved'] ?? false;
                     $linkData['is_hidden'] = $linkData['is_hidden'] ?? false;
 
+                    $targetServiceId = null;
                     if (isset($linkData['service_id']) && !empty($linkData['service_id'])) {
                         $svcVal = $linkData['service_id'];
                         if (is_numeric($svcVal)) {
-                            $linkData['service_id'] = (int) $svcVal;
+                            $targetServiceId = (int) $svcVal;
                         } elseif (Str::isUuid($svcVal)) {
                             $service = Service::where('uuid', $svcVal)->first();
-                            $linkData['service_id'] = $service ? $service->id : null;
-                        } else {
-                            $linkData['service_id'] = null;
+                            $targetServiceId = $service ? $service->id : null;
                         }
                     }
 
+                    if (!$targetServiceId && $tour) {
+                        $order = $tour->order ?? $tour->orders;
+                        if (!$order && !empty($tour->order_id)) {
+                            $order = Order::find($tour->order_id);
+                        }
+                        if ($order) {
+                            $targetServiceId = \App\Models\OrderService::where('order_id', $order->id)
+                                ->whereHas('service', function ($q) {
+                                    $q->where('name', 'like', '%matterport%')
+                                      ->orWhere('name', 'like', '%3d tour%')
+                                      ->orWhere('name', 'like', '%3d floor%')
+                                      ->orWhere('name', 'like', '%virtual tour%');
+                                })
+                                ->value('service_id');
+                        }
+                    }
+
+                    $linkData['service_id'] = $targetServiceId;
+
+                    // Determine admin approval status
+                    $linkIsAdminApproved = false;
+                    if ($isAdmin) {
+                        $linkIsAdminApproved = isset($linkData['is_admin_approved']) ? (bool) $linkData['is_admin_approved'] : true;
+                    } elseif ($isVendor) {
+                        $linkIsAdminApproved = !((bool) $currentUser->review_files);
+                    } else {
+                        $linkIsAdminApproved = isset($linkData['is_admin_approved']) ? (bool) $linkData['is_admin_approved'] : false;
+                    }
+                    $linkData['is_admin_approved'] = $linkIsAdminApproved;
+
+                    $isNewlyApprovedLink = false;
                     if (!empty($linkData['uuid'])) {
                         $link = $tour->links()->where('uuid', $linkData['uuid'])->first();
-                        $link?->update($linkData);
+                        if ($link) {
+                            $wasAdminApproved = (bool) $link->is_admin_approved;
+                            $link->update($linkData);
+                            if (!$wasAdminApproved && $linkIsAdminApproved) {
+                                $isNewlyApprovedLink = true;
+                            }
+                        }
                     } else {
                         $tour->links()->create(array_merge($linkData, [
                             'uuid' => Str::uuid()->toString()
                         ]));
+                        if ($linkIsAdminApproved) {
+                            $isNewlyApprovedLink = true;
+                        }
+                    }
+
+                    if ($isNewlyApprovedLink && !empty($linkData['link'])) {
+                        $svcKey = $targetServiceId ? (string) $targetServiceId : 'matterport';
+                        if (!isset($newlyApprovedLinksByService[$svcKey])) {
+                            $newlyApprovedLinksByService[$svcKey] = [
+                                'service_id' => $targetServiceId,
+                                'count' => 0,
+                            ];
+                        }
+                        $newlyApprovedLinksByService[$svcKey]['count']++;
                     }
                 }
             }
@@ -735,7 +887,7 @@ class TourController extends Controller
 
             DB::commit();
 
-            // If media was approved by Admin, send notification & email to Agent
+            // If media was approved by Admin, send notification & email to Agent when target quantity is reached
             if (!empty($newlyApprovedFilesByService)) {
                 $tour->loadMissing(['orders.agent', 'orders.property']);
                 $adminUser = auth()->user();
@@ -750,19 +902,90 @@ class TourController extends Controller
                     }
                     $count = $info['count'];
 
-                    try {
-                        \App\Services\NotificationService::notifyMediaReady($tour, $svcObj, $adminUser, $count, 'approved');
-                        app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
-                            'service' => $svcObj,
-                            'media_count' => $count,
-                            'uploaded_by' => $adminName,
-                            'is_approved' => true,
-                        ]);
-                    } catch (\Throwable $err) {
-                        Log::error("Failed sending media approval notification: " . $err->getMessage(), [
-                            'tour_id' => $tour->id,
-                            'service_key' => $svcKey,
-                        ]);
+                    [$shouldNotify, $targetQty, $currentApprovedCount] = \App\Services\NotificationService::checkMediaQuantityThreshold(
+                        $tour,
+                        $svcObj ?? ($info['service_id'] ?? null),
+                        $count
+                    );
+
+                    if (!$shouldNotify) {
+                        continue;
+                    }
+
+                    $throttleKey = "media_upload_notify_{$tour->id}_{$svcKey}";
+
+                    if (!Cache::has($throttleKey)) {
+                        Cache::put($throttleKey, true, 60);
+
+                        try {
+                            \App\Services\NotificationService::notifyMediaReady($tour, $svcObj, $adminUser, $currentApprovedCount, 'approved');
+                            app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
+                                'service' => $svcObj,
+                                'media_count' => $currentApprovedCount,
+                                'uploaded_by' => $adminName,
+                                'is_approved' => true,
+                            ]);
+                        } catch (\Throwable $err) {
+                            Log::error("Failed sending media approval notification: " . $err->getMessage(), [
+                                'tour_id' => $tour->id,
+                                'service_key' => $svcKey,
+                            ]);
+                        }
+                    }
+                }
+            }
+
+            // If links (e.g. Matterport / 3D tours) were approved/added, notify agent when threshold (at least 1) is reached
+            if (!empty($newlyApprovedLinksByService)) {
+                $tour->loadMissing(['orders.agent', 'orders.property']);
+                $actorUser = auth()->user();
+                $actorName = $actorUser 
+                    ? (trim(($actorUser->first_name ?? '') . ' ' . ($actorUser->last_name ?? '')) ?: ($actorUser->name ?? 'Team'))
+                    : 'Team';
+
+                foreach ($newlyApprovedLinksByService as $svcKey => $info) {
+                    $svcObj = null;
+                    if (!empty($info['service_id'])) {
+                        $svcObj = Service::find($info['service_id']);
+                    }
+                    $count = $info['count'];
+
+                    [$shouldNotify, $targetQty, $currentApprovedCount] = \App\Services\NotificationService::checkMediaQuantityThreshold(
+                        $tour,
+                        $svcObj ?? ($info['service_id'] ?? null),
+                        $count,
+                        'link'
+                    );
+
+                    if (!$shouldNotify) {
+                        continue;
+                    }
+
+                    $throttleKey = "media_upload_notify_{$tour->id}_link_{$svcKey}";
+
+                    if (!Cache::has($throttleKey)) {
+                        Cache::put($throttleKey, true, 60);
+
+                        try {
+                            \App\Services\NotificationService::notifyMediaReady(
+                                $tour,
+                                $svcObj,
+                                $actorUser,
+                                $currentApprovedCount,
+                                ($actorUser instanceof \App\Models\User) ? 'approved' : 'uploaded'
+                            );
+                            app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
+                                'service' => $svcObj,
+                                'media_count' => $currentApprovedCount,
+                                'uploaded_by' => $actorName,
+                                'is_approved' => ($actorUser instanceof \App\Models\User),
+                            ]);
+                        } catch (\Throwable $err) {
+                            Log::error("Failed sending media link notification: " . $err->getMessage(), [
+                                'tour_id' => $tour->id,
+                                'service_key' => $svcKey,
+                            ]);
+                        }
                     }
                 }
             }

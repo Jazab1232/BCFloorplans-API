@@ -411,17 +411,19 @@ class OrderController extends Controller
                 ])->toArray(),
             ]);
             
-            $bestPackage = $packageDetectionService->getBestPackage($applicablePackages, $totalAmount);
+            $bestPackage = $packageDetectionService->getBestPackage($applicablePackages, $serviceAmounts);
 
             // Log package detection results and apply if found
             if ($bestPackage) {
-                $packageDiscountAmount = $packageDetectionService->calculatePackageDiscount($bestPackage, $totalAmount);
+                $packageEligibleAmount = $packageDetectionService->calculateEligiblePackageAmount($bestPackage, $serviceAmounts);
+                $packageDiscountAmount = $packageDetectionService->calculatePackageDiscount($bestPackage, $packageEligibleAmount);
                 
                 Log::info('✅ PACKAGE APPLIED', [
                     'package_id' => $bestPackage->id,
                     'package_name' => $bestPackage->name,
                     'package_discount_percentage' => $bestPackage->discount,
                     'calculated_discount_amount' => $packageDiscountAmount,
+                    'package_eligible_amount' => $packageEligibleAmount,
                     'original_total' => $totalAmount,
                     'package_status' => $bestPackage->status ? 'active' : 'inactive',
                 ]);
@@ -431,8 +433,9 @@ class OrderController extends Controller
                 // Store package ID in order
                 $order->update(['package_id' => $bestPackage->id]);
                 
-                // Also store package info in order meta for additional details
-                $packageInfo = $packageDetectionService->getPackageInfo($bestPackage, $serviceIds, $packageDiscountAmount);
+                // Also store package info in order meta for additional details (scoped strictly to package services)
+                $matchedServiceIds = array_values(array_intersect($serviceIds, $bestPackage->services->pluck('id')->toArray()));
+                $packageInfo = $packageDetectionService->getPackageInfo($bestPackage, $matchedServiceIds, $packageDiscountAmount);
                 
                 $currentMeta = $order->meta ?? [];
                 $currentMeta['applied_package'] = $packageInfo;
@@ -456,8 +459,6 @@ class OrderController extends Controller
             
             // Add package discount first (if applicable)
             if ($bestPackage) {
-                $packageDiscountAmount = $packageDetectionService->calculatePackageDiscount($bestPackage, $totalAmount);
-                
                 $discountDetails[] = [
                     'model' => null,
                     'type' => 'package',
@@ -911,7 +912,7 @@ class OrderController extends Controller
                 ] : null,
             ]);
             
-            $packageEvaluation = $packageDetectionService->evaluatePackageForUpdate($newServiceIds, $existingPackageInfo, $order->organization_id, $totalAmount);
+            $packageEvaluation = $packageDetectionService->evaluatePackageForUpdate($newServiceIds, $existingPackageInfo, $order->organization_id, $serviceAmounts);
             
             Log::info('Package evaluation results', [
                 'evaluation_result' => $packageEvaluation,
@@ -937,13 +938,21 @@ class OrderController extends Controller
                 
                 // Update package in database and meta
                 if ($packageEvaluation['should_apply']) {
+                    $packageEligibleAmount = $packageDetectionService->calculateEligiblePackageAmount(
+                        $packageEvaluation['package'],
+                        $serviceAmounts
+                    );
                     $packageDiscountAmount = $packageDetectionService->calculatePackageDiscount(
                         $packageEvaluation['package'],
-                        $totalAmount
+                        $packageEligibleAmount
                     );
+                    $matchedServiceIds = array_values(array_intersect(
+                        $newServiceIds,
+                        $packageEvaluation['package']->services->pluck('id')->toArray()
+                    ));
                     $packageInfo = $packageDetectionService->getPackageInfo(
                         $packageEvaluation['package'],
-                        $newServiceIds,
+                        $matchedServiceIds,
                         $packageDiscountAmount
                     );
                     
@@ -960,6 +969,7 @@ class OrderController extends Controller
                         'package_name' => $packageEvaluation['package']->name,
                         'package_discount_percentage' => $packageEvaluation['package']->discount,
                         'calculated_discount_amount' => $packageDiscountAmount,
+                        'package_eligible_amount' => $packageEligibleAmount,
                         'new_total' => $totalAmount,
                     ]);
                 } else {
@@ -1901,15 +1911,29 @@ private function recalculateTotals($order, array $discounts, array $serviceAmoun
         $package = Package::find($packageInfo['package_id']);
         
         if ($package && $package->status) {
-            $packageDiscountAmount = $packageDetectionService->calculatePackageDiscount($package, $totalAmount);
+            $packageEligibleAmount = $packageDetectionService->calculateEligiblePackageAmount($package, $serviceAmounts);
+            $packageDiscountAmount = $packageDetectionService->calculatePackageDiscount($package, $packageEligibleAmount);
             
             Log::info("✅ PACKAGE DISCOUNT APPLIED (RECALCULATE)", [
                 'order_uuid' => $order->uuid,
                 'package_id' => $package->id,
                 'package_name' => $package->name,
                 'discount_amount' => $packageDiscountAmount,
+                'eligible_amount' => $packageEligibleAmount,
                 'total_before_discount' => $totalAmount
             ]);
+            
+            // Keep package_discount_amount and matched_service_ids updated in order meta
+            $currentMeta = $order->meta ?? [];
+            if (isset($currentMeta['applied_package'])) {
+                $currentMeta['applied_package']['package_discount_amount'] = $packageDiscountAmount;
+                $currentMeta['applied_package']['matched_service_ids'] = array_values(array_intersect(
+                    array_keys($serviceAmounts),
+                    $package->services->pluck('id')->toArray()
+                ));
+                $order->meta = $currentMeta;
+                $order->save();
+            }
             
             $orderTotals[] = [
                 'uuid' => (string) Str::uuid(),
@@ -2343,42 +2367,49 @@ private function createOrderNotification($order, array $changes)
             $totalRemainingBase = (float)$remainingServices->sum('amount');
             $existingPackageInfo = $order->meta['applied_package'] ?? null;
 
+            $serviceAmounts = [];
+            foreach ($remainingServices as $rs) {
+                $serviceAmounts[$rs->service_id] = (float)$rs->amount;
+            }
+
             $packageDetectionService = app(PackageDetectionService::class);
             $packageEvaluation = $packageDetectionService->evaluatePackageForUpdate(
                 $remainingServiceIds,
                 $existingPackageInfo,
                 $order->organization_id,
-                $totalRemainingBase
+                $serviceAmounts
             );
 
             $currentMeta = $order->meta ?? [];
-            if ($packageEvaluation['changed']) {
-                if ($packageEvaluation['should_apply'] && $packageEvaluation['package']) {
-                    $packageDiscountAmount = $packageDetectionService->calculatePackageDiscount(
-                        $packageEvaluation['package'],
-                        $totalRemainingBase
-                    );
-                    $packageInfo = $packageDetectionService->getPackageInfo(
-                        $packageEvaluation['package'],
-                        $remainingServiceIds,
-                        $packageDiscountAmount
-                    );
-                    $order->package_id = $packageEvaluation['package']->id;
-                    $currentMeta['applied_package'] = $packageInfo;
-                } else {
-                    $order->package_id = null;
-                    unset($currentMeta['applied_package']);
-                }
+            if ($packageEvaluation['should_apply'] && $packageEvaluation['package']) {
+                $packageEligibleAmount = $packageDetectionService->calculateEligiblePackageAmount(
+                    $packageEvaluation['package'],
+                    $serviceAmounts
+                );
+                $packageDiscountAmount = $packageDetectionService->calculatePackageDiscount(
+                    $packageEvaluation['package'],
+                    $packageEligibleAmount
+                );
+                $matchedServiceIds = array_values(array_intersect(
+                    $remainingServiceIds,
+                    $packageEvaluation['package']->services->pluck('id')->toArray()
+                ));
+                $packageInfo = $packageDetectionService->getPackageInfo(
+                    $packageEvaluation['package'],
+                    $matchedServiceIds,
+                    $packageDiscountAmount
+                );
+                $order->package_id = $packageEvaluation['package']->id;
+                $currentMeta['applied_package'] = $packageInfo;
+            } else {
+                $order->package_id = null;
+                unset($currentMeta['applied_package']);
             }
 
             $order->meta = $currentMeta;
             $order->save();
 
             // 5. Recalculate totals and amounts using existing recalculateTotals logic
-            $serviceAmounts = [];
-            foreach ($remainingServices as $rs) {
-                $serviceAmounts[$rs->service_id] = (float)$rs->amount;
-            }
 
             $existingDiscounts = OrderTotal::where('order_id', $order->id)
                 ->whereNotNull('discount_id')
@@ -2520,24 +2551,33 @@ private function createOrderNotification($order, array $changes)
             $totalRemainingBase = (float)$remainingServices->sum('amount');
             $existingPackageInfo = $order->meta['applied_package'] ?? null;
 
+            $remainingServiceAmounts = [];
+            foreach ($remainingServices as $rs) {
+                $remainingServiceAmounts[$rs->service_id] = (float)$rs->amount;
+            }
+
             $packageDetectionService = app(PackageDetectionService::class);
             $packageEvaluation = $packageDetectionService->evaluatePackageForUpdate(
                 $remainingServiceIds,
                 $existingPackageInfo,
                 $order->organization_id,
-                $totalRemainingBase
+                $remainingServiceAmounts
             );
 
             $oldDiscount = 0.0;
-            if ($existingPackageInfo && isset($existingPackageInfo['discount_amount'])) {
-                $oldDiscount = (float)$existingPackageInfo['discount_amount'];
+            if ($existingPackageInfo && (isset($existingPackageInfo['package_discount_amount']) || isset($existingPackageInfo['discount_amount']))) {
+                $oldDiscount = (float)($existingPackageInfo['package_discount_amount'] ?? $existingPackageInfo['discount_amount']);
             }
 
             $newDiscount = 0.0;
             if ($packageEvaluation['should_apply'] && $packageEvaluation['package']) {
+                $eligibleAmount = $packageDetectionService->calculateEligiblePackageAmount(
+                    $packageEvaluation['package'],
+                    $remainingServiceAmounts
+                );
                 $newDiscount = (float)$packageDetectionService->calculatePackageDiscount(
                     $packageEvaluation['package'],
-                    $totalRemainingBase
+                    $eligibleAmount
                 );
             }
 

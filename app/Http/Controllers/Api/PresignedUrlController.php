@@ -641,7 +641,7 @@ class PresignedUrlController extends Controller
                     $confirmedFiles[] = $confirmedFileData;
                 }
 
-                // If media was auto-approved (admin upload or approved vendor), notify agent
+                // If media was auto-approved (admin upload or approved vendor), notify agent when target quantity is reached
                 if ($tour && !empty($approvedFilesByService)) {
                     $tour->loadMissing(['orders.agent', 'orders.property']);
                     $uploader = request()->user();
@@ -652,16 +652,27 @@ class PresignedUrlController extends Controller
                     foreach ($approvedFilesByService as $svcKey => $info) {
                         $svcObj = $info['service'];
                         $count = $info['count'];
+
+                        [$shouldNotify, $targetQty, $currentApprovedCount] = \App\Services\NotificationService::checkMediaQuantityThreshold(
+                            $tour,
+                            $svcObj ?? ($svcKey !== 'default' ? $svcKey : null),
+                            $count
+                        );
+
+                        if (!$shouldNotify) {
+                            continue;
+                        }
+
                         $throttleKey = "media_upload_notify_{$tour->id}_{$svcKey}";
 
                         if (!Cache::has($throttleKey)) {
                             Cache::put($throttleKey, true, 60);
 
                             try {
-                                \App\Services\NotificationService::notifyMediaReady($tour, $svcObj, $uploader, $count, 'uploaded');
+                                \App\Services\NotificationService::notifyMediaReady($tour, $svcObj, $uploader, $currentApprovedCount, 'uploaded');
                                 app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
                                     'service' => $svcObj,
-                                    'media_count' => $count,
+                                    'media_count' => $currentApprovedCount,
                                     'uploaded_by' => $uploaderName,
                                 ]);
                             } catch (\Throwable $err) {

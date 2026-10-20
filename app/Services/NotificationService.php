@@ -1240,6 +1240,133 @@ class NotificationService
     }
 
     /**
+     * Determine the target media quantity for a given service in a tour's order.
+     * Floor plans and Matterport link services with no quantity default to at least 1.
+     */
+    public static function getTargetQuantityForService($tour, $service): int
+    {
+        if (!$tour) {
+            return 1;
+        }
+
+        $order = $tour->relationLoaded('orders') ? $tour->orders : ($tour->relationLoaded('order') ? $tour->order : ($tour->orders()->first() ?: $tour->order()->first()));
+        if (!$order && !empty($tour->order_id)) {
+            $order = \App\Models\Order::find($tour->order_id);
+        }
+
+        if (!$order) {
+            return 1;
+        }
+
+        $serviceId = null;
+        if ($service instanceof \App\Models\Service) {
+            $serviceId = $service->id;
+        } elseif (is_numeric($service)) {
+            $serviceId = (int) $service;
+        } elseif (is_string($service) && !empty($service) && !in_array($service, ['default', 'matterport'])) {
+            $serviceId = \App\Models\Service::where('uuid', $service)->value('id');
+        }
+
+        // If no serviceId, check if it's a Matterport / 3D tour link service on the order
+        if (!$serviceId) {
+            $serviceId = \App\Models\OrderService::where('order_id', $order->id)
+                ->whereHas('service', function ($q) {
+                    $q->where('name', 'like', '%matterport%')
+                      ->orWhere('name', 'like', '%3d tour%')
+                      ->orWhere('name', 'like', '%3d floor%')
+                      ->orWhere('name', 'like', '%virtual tour%');
+                })
+                ->value('service_id');
+        }
+
+        if (!$serviceId) {
+            return 1;
+        }
+
+        // Find the corresponding OrderService record for this service
+        $orderService = \App\Models\OrderService::where('order_id', $order->id)
+            ->where('service_id', $serviceId)
+            ->with('option')
+            ->first();
+
+        if ($orderService) {
+            // 1. Check ProductOption quantity field
+            if ($orderService->option && isset($orderService->option->quantity) && (int) $orderService->option->quantity > 0) {
+                return max(1, (int) $orderService->option->quantity);
+            }
+
+            // 2. Fallback: Parse quantity from ProductOption title (e.g. "30 Photos", "25 HDR Stills")
+            if ($orderService->option && !empty($orderService->option->title)) {
+                if (preg_match('/\b(\d+)\s*(?:photo|still|image|picture|file|link|cop)/i', $orderService->option->title, $matches)) {
+                    return max(1, (int) $matches[1]);
+                }
+            }
+
+            // 3. Fallback: Check if custom field has quantity
+            if (!empty($orderService->custom)) {
+                if (is_numeric($orderService->custom) && (int) $orderService->custom > 0) {
+                    return max(1, (int) $orderService->custom);
+                }
+                if (is_string($orderService->custom) && preg_match('/\b(\d+)\s*(?:photo|still|image|picture|file|link|cop)/i', $orderService->custom, $matches)) {
+                    return max(1, (int) $matches[1]);
+                }
+            }
+        }
+
+        // Floor plans, Matterport links, or services with no quantity specified default to at least 1
+        return 1;
+    }
+
+    /**
+     * Check if the approved media count has reached the service's target quantity in this operation.
+     * Supports both files (photos, floor plans, videos) and links (Matterport 3D tours).
+     *
+     * @param mixed $tour
+     * @param mixed $service
+     * @param int $newlyApprovedCount
+     * @param string $mediaType 'file' or 'link'
+     * @return array [bool $shouldNotify, int $targetQuantity, int $currentApprovedCount]
+     */
+    public static function checkMediaQuantityThreshold($tour, $service, int $newlyApprovedCount, string $mediaType = 'file'): array
+    {
+        if (!$tour || $newlyApprovedCount <= 0) {
+            return [false, 1, 0];
+        }
+
+        $serviceId = null;
+        if ($service instanceof \App\Models\Service) {
+            $serviceId = $service->id;
+        } elseif (is_numeric($service)) {
+            $serviceId = (int) $service;
+        } elseif (is_string($service) && !empty($service) && !in_array($service, ['default', 'matterport'])) {
+            $serviceId = \App\Models\Service::where('uuid', $service)->value('id');
+        }
+
+        $targetQuantity = max(1, self::getTargetQuantityForService($tour, $service ?: $serviceId));
+
+        if ($mediaType === 'link') {
+            $query = \App\Models\TourLink::where('tour_id', $tour->id)->where('is_admin_approved', true);
+            if ($serviceId) {
+                $query->where('service_id', $serviceId);
+            }
+            $currentApprovedCount = $query->count();
+        } else {
+            $query = \App\Models\TourFile::where('tour_id', $tour->id)->where('is_admin_approved', true);
+            if ($serviceId) {
+                $query->where('service_id', $serviceId);
+            }
+            $currentApprovedCount = $query->count();
+        }
+
+        $previousApprovedCount = max(0, $currentApprovedCount - $newlyApprovedCount);
+
+        // Notify when the approved count reaches or crosses the target quantity
+        $shouldNotify = ($previousApprovedCount < $targetQuantity) && ($currentApprovedCount >= $targetQuantity);
+
+        return [$shouldNotify, $targetQuantity, $currentApprovedCount];
+    }
+
+    /**
      * Notify when media for a service is uploaded or approved and ready
      */
     public static function notifyMediaReady($tour, $service, $actor = null, int $fileCount = 1, string $actionType = 'uploaded')
