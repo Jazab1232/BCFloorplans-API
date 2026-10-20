@@ -41,6 +41,7 @@ use App\Services\StripeResolverService;
 use App\Services\EmailDispatchService;
 use App\Services\SettingsService;
 use Carbon\Carbon;
+use Aws\S3\S3Client;
 
 class TourController extends Controller
 
@@ -1509,35 +1510,51 @@ class TourController extends Controller
                 }
             }
 
-            // Generate presigned URL for download from S3
-            $s3Client = new S3Client([
-                'version' => 'latest',
-                'region' => config('filesystems.disks.s3.region'),
-                'credentials' => [
-                    'key' => config('filesystems.disks.s3.key'),
-                    'secret' => config('filesystems.disks.s3.secret'),
-                ],
-            ]);
-
             $bucket = config('filesystems.disks.s3.bucket');
-            $fileName = $file->name;
+            $fileName = str_replace(['"', "\r", "\n"], '', $file->name ?: basename($s3Key));
 
-            // Create GetObject command with ResponseContentDisposition to force download
-            $command = $s3Client->getCommand('GetObject', [
-                'Bucket' => $bucket,
-                'Key' => $s3Key,
-                'ResponseContentDisposition' => 'attachment; filename="' . $fileName . '"',
-            ]);
+            // Generate presigned URL for download from S3
+            try {
+                $presignedUrl = Storage::disk('s3')->temporaryUrl(
+                    $s3Key,
+                    now()->addMinutes(60),
+                    [
+                        'ResponseContentDisposition' => 'attachment; filename="' . $fileName . '"',
+                    ]
+                );
+            } catch (\Throwable $storageEx) {
+                // Fallback to direct AWS SDK S3Client
+                $s3Client = new \Aws\S3\S3Client([
+                    'version' => 'latest',
+                    'region' => config('filesystems.disks.s3.region'),
+                    'credentials' => [
+                        'key' => config('filesystems.disks.s3.key'),
+                        'secret' => config('filesystems.disks.s3.secret'),
+                    ],
+                ]);
 
-            // Generate presigned URL (valid for 1 hour)
-            $presignedRequest = $s3Client->createPresignedRequest($command, '+1 hour');
-            $presignedUrl = (string) $presignedRequest->getUri();
+                $command = $s3Client->getCommand('GetObject', [
+                    'Bucket' => $bucket,
+                    'Key' => $s3Key,
+                    'ResponseContentDisposition' => 'attachment; filename="' . $fileName . '"',
+                ]);
+
+                $presignedRequest = $s3Client->createPresignedRequest($command, '+1 hour');
+                $presignedUrl = (string) $presignedRequest->getUri();
+            }
 
             // Redirect to presigned URL
             return redirect($presignedUrl);
 
-        } catch (\Exception $e) {
-            abort(404, 'File not found: ' . $e->getMessage());
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            Log::error('Download file error: ' . $e->getMessage(), [
+                'uuid' => $uuid,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            abort(404, 'File not found or cannot be downloaded: ' . $e->getMessage());
         }
     }
 
@@ -1549,36 +1566,52 @@ class TourController extends Controller
         try {
             $snapshot = TourSnapshot::where('uuid', $uuid)->firstOrFail();
 
-            // Generate presigned URL for download from S3
-            $s3Client = new S3Client([
-                'version' => 'latest',
-                'region' => config('filesystems.disks.s3.region'),
-                'credentials' => [
-                    'key' => config('filesystems.disks.s3.key'),
-                    'secret' => config('filesystems.disks.s3.secret'),
-                ],
-            ]);
-
             $bucket = config('filesystems.disks.s3.bucket');
             $s3Key = $snapshot->file_path;
-            $fileName = $snapshot->file_name;
+            $fileName = str_replace(['"', "\r", "\n"], '', $snapshot->file_name ?: basename($s3Key));
 
-            // Create GetObject command with ResponseContentDisposition to force download
-            $command = $s3Client->getCommand('GetObject', [
-                'Bucket' => $bucket,
-                'Key' => $s3Key,
-                'ResponseContentDisposition' => 'attachment; filename="' . $fileName . '"',
-            ]);
+            // Generate presigned URL for download from S3
+            try {
+                $presignedUrl = Storage::disk('s3')->temporaryUrl(
+                    $s3Key,
+                    now()->addMinutes(60),
+                    [
+                        'ResponseContentDisposition' => 'attachment; filename="' . $fileName . '"',
+                    ]
+                );
+            } catch (\Throwable $storageEx) {
+                // Fallback to direct AWS SDK S3Client
+                $s3Client = new \Aws\S3\S3Client([
+                    'version' => 'latest',
+                    'region' => config('filesystems.disks.s3.region'),
+                    'credentials' => [
+                        'key' => config('filesystems.disks.s3.key'),
+                        'secret' => config('filesystems.disks.s3.secret'),
+                    ],
+                ]);
 
-            // Generate presigned URL (valid for 1 hour)
-            $presignedRequest = $s3Client->createPresignedRequest($command, '+1 hour');
-            $presignedUrl = (string) $presignedRequest->getUri();
+                $command = $s3Client->getCommand('GetObject', [
+                    'Bucket' => $bucket,
+                    'Key' => $s3Key,
+                    'ResponseContentDisposition' => 'attachment; filename="' . $fileName . '"',
+                ]);
+
+                $presignedRequest = $s3Client->createPresignedRequest($command, '+1 hour');
+                $presignedUrl = (string) $presignedRequest->getUri();
+            }
 
             // Redirect to presigned URL
             return redirect($presignedUrl);
 
-        } catch (\Exception $e) {
-            abort(404, 'File not found: ' . $e->getMessage());
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            Log::error('Download snapshot error: ' . $e->getMessage(), [
+                'uuid' => $uuid,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            abort(404, 'File not found or cannot be downloaded: ' . $e->getMessage());
         }
     }
 
