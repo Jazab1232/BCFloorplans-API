@@ -46,19 +46,20 @@ class EmailDispatchService
                 continue;
             }
 
-            // Pre-seed options data so buildRoleData can access token/user_type (critical for password_reset URL builder)
-            $preSeededData = [];
-            if (!empty($options['data'])) {
-                $preSeededData = $options['data'];
+            // Normalize options data (supports both direct options and nested options['data'])
+            $optionsData = (!empty($options['data']) && is_array($options['data'])) ? $options['data'] : [];
+            $directData = is_array($options) ? array_diff_key($options, array_flip(['recipients', 'order', 'data'])) : [];
+            $preSeededData = array_merge($directData, $optionsData);
+            if (!empty($options['order'])) {
+                $preSeededData['order'] = $options['order'];
             }
 
             // Build role-specific data (filter sensitive info by role)
             $data = $this->buildRoleData($eventType, $model, $recipient, $org, $preSeededData);
 
-            // Merge options data again so any further overrides take effect (buildRoleData computed values win for known keys)
-            if (!empty($options['data'])) {
-                $data = array_merge($options['data'], $data);
-            }
+            // Merge pre-seeded options data so overrides take precedence
+            $data = array_merge($data, array_filter($preSeededData, fn($v) => !is_null($v)));
+
 
             try {
                 // Resolve template: org DB override → default Blade
@@ -246,19 +247,22 @@ class EmailDispatchService
             $slot = $model;
             $order = $model->order;
         } elseif ($model instanceof \App\Models\Tour) {
-            $order = $model->orders ?: $model->order;
+            $order = $model->orders ?: ($model->order ?: ($model->order_id ? \App\Models\Order::withoutGlobalScopes()->find($model->order_id) : null));
         } elseif ($model instanceof \App\Models\TourLink) {
-            $order = $model->tour ? ($model->tour->orders ?: $model->tour->order) : null;
+            $tour = $model->tour;
+            $order = $tour ? ($tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null))) : null;
         } elseif ($model instanceof \App\Models\TourFile) {
-            $order = $model->tour ? ($model->tour->orders ?: $model->tour->order) : null;
+            $tour = $model->tour;
+            $order = $tour ? ($tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null))) : null;
         } elseif ($model instanceof \App\Models\OrderService) {
-            $order = $model->order;
+            $order = $model->order ?: ($model->order_id ? \App\Models\Order::withoutGlobalScopes()->find($model->order_id) : null);
         } elseif ($model instanceof \App\Models\AgentPayment) {
             $payment = $model;
             $order = $model->order ?: ($model->invoice ? $model->invoice->order : null);
         } elseif ($model instanceof \App\Models\Invoice) {
             $order = $model->order;
         }
+
 
 
         // 1. Resolve Admin (users of this specific organization + org contact email)
@@ -329,9 +333,12 @@ class EmailDispatchService
                 $agent = $payment->agent;
             } elseif ($order && $order->agent) {
                 $agent = $order->agent;
+            } elseif ($order && !empty($order->agent_id)) {
+                $agent = \App\Models\Agent::withoutGlobalScopes()->find($order->agent_id);
             } elseif ($model instanceof \App\Models\Agent) {
                 $agent = $model;
             }
+
 
             if ($agent && !empty($agent->email)) {
                 $recipients[] = [
@@ -548,18 +555,19 @@ class EmailDispatchService
             $slot = $model;
             $order = $model->order;
         } elseif ($model instanceof \App\Models\Tour) {
-            $order = $model->orders ?: $model->order;
+            $order = $preSeededData['order'] ?? ($model->orders ?: ($model->order ?: ($model->order_id ? \App\Models\Order::withoutGlobalScopes()->find($model->order_id) : null)));
             $data['tour'] = $model;
         } elseif ($model instanceof \App\Models\TourLink) {
             $tour = $model->tour;
-            $order = $tour ? ($tour->orders ?: $tour->order) : null;
+            $order = $preSeededData['order'] ?? ($tour ? ($tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null))) : null);
             $data['tour'] = $tour;
             $data['tour_link'] = $model;
         } elseif ($model instanceof \App\Models\TourFile) {
             $tour = $model->tour;
-            $order = $tour ? ($tour->orders ?: $tour->order) : null;
+            $order = $preSeededData['order'] ?? ($tour ? ($tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null))) : null);
             $data['tour'] = $tour;
             $data['tour_file'] = $model;
+
         } elseif ($model instanceof \App\Models\OrderService) {
             $orderService = $model;
             $order = $model->order;
@@ -735,18 +743,40 @@ class EmailDispatchService
 
         // ── Service & Service URL Deep Link Resolution ────────────────────────
         $serviceObj = $data['service'] ?? ($orderService?->service ?? ($preSeededData['service'] ?? null));
-        if ($serviceObj && empty($data['service_name'])) {
-            $data['service_name'] = $serviceObj->name;
+        if (is_numeric($serviceObj)) {
+            $serviceObj = \App\Models\Service::find((int) $serviceObj);
+        } elseif (is_string($serviceObj) && \Illuminate\Support\Str::isUuid($serviceObj)) {
+            $serviceObj = \App\Models\Service::where('uuid', $serviceObj)->first();
         }
-        if ($order && empty($data['property_address'])) {
-            $data['property_address'] = $order->property_address ?? 'Property';
+
+        if ($serviceObj) {
+            $data['service'] = $serviceObj;
+            if (empty($data['service_name'])) {
+                $data['service_name'] = $serviceObj->name;
+            }
         }
-        if ($order && empty($data['order_id'])) {
-            $data['order_id'] = $order->id;
+
+        if ($order) {
+            $agent = $order->agent ?: ($order->agent_id ? \App\Models\Agent::withoutGlobalScopes()->find($order->agent_id) : null);
+            if ($agent && empty($data['agent_name'])) {
+                $data['agent_name'] = trim(($agent->first_name ?? '') . ' ' . ($agent->last_name ?? ''));
+            }
+            if (empty($data['property_address'])) {
+                $data['property_address'] = $order->property_address ?? 'Property';
+            }
+            if (empty($data['order_id'])) {
+                $data['order_id'] = $order->id;
+            }
+            if (empty($data['order_uuid'])) {
+                $data['order_uuid'] = $order->uuid;
+            }
         }
 
         if ($order && empty($data['service_url'])) {
             $propUuid = $order->property?->uuid;
+            if (!$propUuid && !empty($order->property_id)) {
+                $propUuid = \App\Models\Property::withoutGlobalScopes()->where('id', $order->property_id)->value('uuid');
+            }
             $svcUuid = $serviceObj?->uuid;
 
             $baseUrl = config('app.frontend_url', config('app.admin_app', 'https://teams.tojuco.com'));
@@ -770,6 +800,7 @@ class EmailDispatchService
 
             $data['service_url'] = "{$baseUrl}/dashboard/file-manager/{$order->uuid}{$queryString}";
         }
+
 
         // ── Password Reset ─────────────────────────────────────────────────────
         if (
@@ -1026,7 +1057,7 @@ class EmailDispatchService
                 $orderService = $data['order_service'] ?? ($model instanceof \App\Models\OrderService ? $model : null);
                 $mailable = new $mailableClass(
                     $orderService,
-                    $data['recipient_name'] ?? 'Valued Customer',
+                    $data['recipient_name'] ?? ($recipient['name'] ?? 'Valued Customer'),
                     $recipient['role'] ?? 'agent',
                     $data
                 );
@@ -1036,11 +1067,12 @@ class EmailDispatchService
                 $tour = $data['tour'] ?? ($model instanceof \App\Models\Tour ? $model : null);
                 $mailable = new $mailableClass(
                     $tour,
-                    $data['recipient_name'] ?? 'Valued Customer',
+                    $data['recipient_name'] ?? ($recipient['name'] ?? 'Valued Customer'),
                     $recipient['role'] ?? 'agent',
                     $data
                 );
                 break;
+
 
             case \App\Mail\PasswordReset::class:
                 $mailable = new $mailableClass(

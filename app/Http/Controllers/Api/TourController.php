@@ -517,6 +517,7 @@ class TourController extends Controller
                         Cache::put($throttleKey, true, 60);
 
                         try {
+                            $order = $tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null));
                             \App\Services\NotificationService::notifyMediaReady(
                                 $tour,
                                 $svcObj,
@@ -525,12 +526,14 @@ class TourController extends Controller
                                 ($actorUser instanceof \App\Models\User) ? 'approved' : 'uploaded'
                             );
                             app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
+                                'order' => $order,
                                 'service' => $svcObj,
                                 'media_count' => $currentApprovedCount,
                                 'uploaded_by' => $actorName,
                                 'is_approved' => ($actorUser instanceof \App\Models\User),
                             ]);
                         } catch (\Throwable $err) {
+
                             Log::error("Failed sending media link notification on tour creation: " . $err->getMessage(), [
                                 'tour_id' => $tour->id,
                                 'service_key' => $svcKey,
@@ -919,8 +922,10 @@ class TourController extends Controller
                         Cache::put($throttleKey, true, 60);
 
                         try {
+                            $order = $tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null));
                             \App\Services\NotificationService::notifyMediaReady($tour, $svcObj, $adminUser, $currentApprovedCount, 'approved');
                             app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
+                                'order' => $order,
                                 'service' => $svcObj,
                                 'media_count' => $currentApprovedCount,
                                 'uploaded_by' => $adminName,
@@ -968,6 +973,7 @@ class TourController extends Controller
                         Cache::put($throttleKey, true, 60);
 
                         try {
+                            $order = $tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null));
                             \App\Services\NotificationService::notifyMediaReady(
                                 $tour,
                                 $svcObj,
@@ -976,12 +982,14 @@ class TourController extends Controller
                                 ($actorUser instanceof \App\Models\User) ? 'approved' : 'uploaded'
                             );
                             app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
+                                'order' => $order,
                                 'service' => $svcObj,
                                 'media_count' => $currentApprovedCount,
                                 'uploaded_by' => $actorName,
                                 'is_approved' => ($actorUser instanceof \App\Models\User),
                             ]);
                         } catch (\Throwable $err) {
+
                             Log::error("Failed sending media link notification: " . $err->getMessage(), [
                                 'tour_id' => $tour->id,
                                 'service_key' => $svcKey,

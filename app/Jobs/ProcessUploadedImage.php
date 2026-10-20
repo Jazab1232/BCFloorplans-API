@@ -18,10 +18,7 @@ class ProcessUploadedImage implements ShouldQueue, ShouldBeUnique
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    /**
-     * Number of times the job may be attempted.
-     */
-    public int $tries = 3;
+    public int $tries = 5;
 
     /**
      * Number of seconds to wait before retrying.
@@ -32,6 +29,11 @@ class ProcessUploadedImage implements ShouldQueue, ShouldBeUnique
      * Maximum time in seconds the job can run.
      */
     public int $timeout = 420; // 7 minutes (adjusted for 4K images)
+
+    /**
+     * The number of seconds after which the job's unique lock will be released.
+     */
+    public int $uniqueFor = 300;
 
     /**
      * Delete the job if its models no longer exist.
@@ -46,6 +48,7 @@ class ProcessUploadedImage implements ShouldQueue, ShouldBeUnique
     public function __construct(
         public TourFile $tourFile
     ) {
+        $this->onQueue('image-processing');
     }
 
     /**
@@ -54,7 +57,9 @@ class ProcessUploadedImage implements ShouldQueue, ShouldBeUnique
     public function middleware(): array
     {
         return [
-            (new WithoutOverlapping($this->tourFile->uuid))->releaseAfter(60)
+            (new WithoutOverlapping($this->tourFile->uuid))
+                ->expireAfter(180)
+                ->dontRelease()
         ];
     }
 

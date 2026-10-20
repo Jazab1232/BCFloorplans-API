@@ -34,7 +34,7 @@ class PropertyController extends Controller
                     $query->select('id', 'uuid', 'first_name', 'last_name', 'company_name', 'email', 'status', 'primary_phone');
                 },
                 'orders' => function($query) {
-                    $query->select('id', 'uuid', 'property_id', 'agent_id', 'amount', 'payment_status', 'order_status', 'created_at', 'co_agents');
+                    $query->select('id', 'uuid', 'property_id', 'agent_id', 'amount', 'payment_status', 'order_status', 'created_at', 'co_agents', 'release_media_before_payment');
                 },
                 'orders.tours' => function($query) {
                     $query->select('id', 'uuid', 'order_id', 'is_publish');

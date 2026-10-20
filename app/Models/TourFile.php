@@ -51,10 +51,20 @@ class TourFile extends Model
 
     public function getIsPaidAttribute()
     {
-        $tour = $this->relationLoaded('tour') ? $this->getRelation('tour') : null;
+        $tour = $this->relationLoaded('tour') ? $this->getRelation('tour') : $this->tour;
         $order = null;
         if ($tour) {
-            $order = $tour->relationLoaded('order') ? $tour->getRelation('order') : ($tour->relationLoaded('orders') ? $tour->getRelation('orders') : null);
+            $order = $tour->relationLoaded('order') ? $tour->getRelation('order') : ($tour->relationLoaded('orders') ? $tour->getRelation('orders') : ($tour->order ?: $tour->orders));
+            if (!$order && !empty($tour->order_id)) {
+                $order = \App\Models\Order::withoutGlobalScopes()->find($tour->order_id);
+            }
+        }
+        $orderReleased = $order && (bool) $order->release_media_before_payment;
+        $orderPaid = $order && $order->payment_status === 'PAID';
+
+        // If media is explicitly released before payment on the order, or order is paid in full
+        if ($orderReleased || $orderPaid) {
+            return true;
         }
 
         // If it's linked to a service, check the payment / media_access status
@@ -62,11 +72,15 @@ class TourFile extends Model
             $orderService = null;
             if ($order && $order->relationLoaded('services')) {
                 $orderService = $order->services->firstWhere('service_id', $this->service_id);
-            } elseif ($tour && !empty($tour->order_id)) {
-                $orderService = \App\Models\OrderService::where('order_id', $tour->order_id)
-                                                        ->where('service_id', $this->service_id)
-                                                        ->first();
+            } else {
+                $orderId = $order?->id ?? ($tour?->order_id);
+                if ($orderId) {
+                    $orderService = \App\Models\OrderService::where('order_id', $orderId)
+                                                            ->where('service_id', $this->service_id)
+                                                            ->first();
+                }
             }
+
             if ($orderService) {
                 if ($orderService->media_access !== null) {
                     return (bool) $orderService->media_access;
@@ -76,10 +90,10 @@ class TourFile extends Model
         }
 
         if ($order) {
-            if ($order->lock_materials && $order->payment_status !== 'PAID') {
+            if ($order->lock_materials && !$orderPaid) {
                 return false;
             }
-            if ($order->payment_status === 'PAID') {
+            if ($orderPaid) {
                 return true;
             }
         }

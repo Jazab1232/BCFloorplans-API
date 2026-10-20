@@ -359,12 +359,16 @@ class StripeAgentWebhookController extends Controller
 
                     // Trigger background reprocessing of photos to generate unwatermarked variants once paid
                     try {
-                        $paidServiceId = null;
+                        $paidServiceIds = [];
                         if (($paymentType === 'service' || $paymentType === 'partial') && $serviceUuid) {
                             if (is_numeric($serviceUuid)) {
-                                $paidServiceId = intval($serviceUuid);
+                                $os = OrderService::find(intval($serviceUuid));
+                                $paidServiceIds[] = $os ? $os->service_id : intval($serviceUuid);
                             } else {
-                                $paidServiceId = OrderService::where('uuid', $serviceUuid)->value('service_id');
+                                $svcId = OrderService::where('uuid', $serviceUuid)->value('service_id');
+                                if ($svcId) {
+                                    $paidServiceIds[] = $svcId;
+                                }
                             }
                         }
 
@@ -373,14 +377,26 @@ class StripeAgentWebhookController extends Controller
                                 $q->where('order_id', $order->id);
                             });
 
-                        if ($paidServiceId) {
-                            $tourFilesQuery->where('service_id', $paidServiceId);
+                        // If the entire order is not fully paid, reprocess files for all paid order services
+                        if ($order->payment_status !== 'PAID') {
+                            $orderPaidServices = $order->services()
+                                ->where('payment_status', 'PAID')
+                                ->pluck('service_id')
+                                ->toArray();
+
+                            $allPaidServiceIds = array_unique(array_filter(array_merge($paidServiceIds, $orderPaidServices)));
+
+                            if (!empty($allPaidServiceIds)) {
+                                $tourFilesQuery->whereIn('service_id', $allPaidServiceIds);
+                            }
                         }
 
                         $tourFiles = $tourFilesQuery->get();
 
                         foreach ($tourFiles as $tourFile) {
-                            \App\Jobs\ProcessUploadedImage::dispatch($tourFile)->afterCommit();
+                            \App\Jobs\ProcessUploadedImage::dispatch($tourFile)
+                                ->onQueue('image-processing')
+                                ->afterCommit();
                             Log::info('Queued unwatermarked image reprocessing after payment commit', [
                                 'file_id' => $tourFile->id,
                                 'order_id' => $order->id,

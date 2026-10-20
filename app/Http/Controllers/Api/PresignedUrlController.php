@@ -670,10 +670,13 @@ class PresignedUrlController extends Controller
 
                             try {
                                 \App\Services\NotificationService::notifyMediaReady($tour, $svcObj, $uploader, $currentApprovedCount, 'uploaded');
+                                $order = $tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null));
                                 app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
+                                    'order' => $order,
                                     'service' => $svcObj,
                                     'media_count' => $currentApprovedCount,
                                     'uploaded_by' => $uploaderName,
+                                    'is_approved' => ($isAdminApproved ?? false),
                                 ]);
                             } catch (\Throwable $err) {
                                 Log::error("Failed sending media upload notification: " . $err->getMessage(), [
@@ -682,6 +685,7 @@ class PresignedUrlController extends Controller
                                 ]);
                             }
                         }
+
                     }
                 }
             }
