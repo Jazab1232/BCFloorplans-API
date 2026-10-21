@@ -42,6 +42,7 @@ use App\Services\EmailDispatchService;
 use App\Services\SettingsService;
 use Carbon\Carbon;
 use Aws\S3\S3Client;
+use App\Services\MediaSync\FtpSyncService;
 
 class TourController extends Controller
 
