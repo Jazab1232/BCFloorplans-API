@@ -121,6 +121,7 @@ class Vendor extends Authenticatable
     public function sendPasswordResetNotification($token)
     {
         app(\App\Services\EmailDispatchService::class)->dispatch('password_reset', $this, [
+            'organization' => $this->organization,
             'recipients' => [[
                 'email' => $this->email,
                 'name'  => trim($this->first_name . ' ' . $this->last_name),
@@ -131,6 +132,7 @@ class Vendor extends Authenticatable
                 'token'     => $token,
                 'user_type' => 'vendor',
                 'role'      => 'vendor',
+                'origin'    => request()?->header('Origin') ?: request()?->header('Referer'),
             ],
         ]);
     }

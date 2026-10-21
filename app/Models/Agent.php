@@ -284,6 +284,7 @@ class Agent extends Authenticatable
     public function sendPasswordResetNotification($token)
     {
         app(\App\Services\EmailDispatchService::class)->dispatch('password_reset', $this, [
+            'organization' => $this->organization,
             'recipients' => [[
                 'email' => $this->email,
                 'name'  => trim($this->first_name . ' ' . $this->last_name),
@@ -291,9 +292,12 @@ class Agent extends Authenticatable
                 'model' => $this,
             ]],
             'data' => [
-                'token'     => $token,
-                'user_type' => 'agent',
-                'role'      => 'agent',
+                'token'             => $token,
+                'user_type'         => 'agent',
+                'role'              => 'agent',
+                'organization_slug' => $this->organization?->slug,
+                'organization_id'   => $this->organization_id,
+                'origin'            => request()?->header('Origin') ?: request()?->header('Referer'),
             ],
         ]);
     }

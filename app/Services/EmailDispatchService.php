@@ -33,7 +33,14 @@ class EmailDispatchService
             }
         }
 
-        $org = $this->resolveOrganization($model);
+        $org = $options['organization'] ?? $this->resolveOrganization($model);
+        if (!$org && !empty($options['data']['organization_slug'])) {
+            $org = Organization::where('slug', $options['data']['organization_slug'])->first();
+        } elseif (!$org && !empty($options['data']['organization_id'])) {
+            $org = is_numeric($options['data']['organization_id'])
+                ? Organization::find($options['data']['organization_id'])
+                : Organization::where('uuid', $options['data']['organization_id'])->first();
+        }
         $recipients = $this->resolveRecipients($eventType, $model, $org, $options);
 
         Log::info("EmailDispatchService: Found " . count($recipients) . " potential recipients");
@@ -539,7 +546,7 @@ class EmailDispatchService
         $data = array_merge($preSeededData, [
             'event_type' => $eventType,
             'recipient_role' => $role,
-            'recipient_name' => $recipient['name'],
+            'recipient_name' => $recipient['name'] ?? 'User',
             'organization' => $org,
         ]);
 
@@ -805,7 +812,8 @@ class EmailDispatchService
         // ── Password Reset ─────────────────────────────────────────────────────
         if (
             $eventType === 'password_reset' &&
-            ($model instanceof \App\Models\User
+            (!$model
+                || $model instanceof \App\Models\User
                 || $model instanceof \App\Models\Agent
                 || $model instanceof \App\Models\SubAccount
                 || $model instanceof \App\Models\Vendor)
@@ -814,31 +822,94 @@ class EmailDispatchService
             $email = $recipient['email'] ?? '';
             $userType = $data['user_type'] ?? $role;
 
-            // Resolve the correct platform base URL per portal type
-            $baseUrl = config('app.frontend_url', config('app.admin_app', 'https://teams.tojuco.com'));
+            // 1. Check for local request origin (preserves localhost:port during local testing)
+            $origin = $data['origin'] ?? request()?->header('Origin') ?? request()?->header('Referer');
+            $isLocalOrigin = false;
+            $baseUrl = null;
 
-            // For whitelabel orgs: look up their custom domain for this portal type
-            if ($org && $org->is_whitelabel) {
-                $domainRecord = $org->domains()->where('portal_type', $userType)->first();
-                if ($domainRecord && !empty($domainRecord->domain)) {
-                    $baseUrl = $domainRecord->domain;
-                } elseif (!empty($org->domain)) {
-                    $baseUrl = $org->domain;
+            if ($origin) {
+                $parsedOrigin = parse_url($origin);
+                $originHost = strtolower($parsedOrigin['host'] ?? '');
+                if ($originHost === 'localhost' || $originHost === '127.0.0.1' || str_ends_with($originHost, '.localhost')) {
+                    $isLocalOrigin = true;
+                    $originPort = !empty($parsedOrigin['port']) ? ':' . $parsedOrigin['port'] : '';
+                    $originScheme = !empty($parsedOrigin['scheme']) ? $parsedOrigin['scheme'] : 'http';
+                    $baseUrl = "{$originScheme}://{$originHost}{$originPort}";
                 }
             }
 
+            // 2. If request was sent directly from a custom whitelabel domain (neither localhost nor platform tojuco.com)
+            if (!$isLocalOrigin && !empty($originHost) && !str_contains($originHost, 'tojuco.com')) {
+                $originPort = !empty($parsedOrigin['port']) ? ':' . $parsedOrigin['port'] : '';
+                $originScheme = !empty($parsedOrigin['scheme']) ? $parsedOrigin['scheme'] : 'https';
+                $baseUrl = "{$originScheme}://{$originHost}{$originPort}";
+            }
+
+            // 3. If not sent from a custom origin, but the organization is whitelabel in database
+            if (!$baseUrl && $org && $org->is_whitelabel) {
+                try {
+                    $domainRecord = $org->domains()->where('portal_type', $userType)->first();
+                    if ($domainRecord && !empty($domainRecord->domain)) {
+                        $baseUrl = $domainRecord->domain;
+                    } elseif (!empty($org->domain)) {
+                        $baseUrl = $org->domain;
+                    }
+                } catch (\Throwable $e) {
+                    if (!empty($org->domain)) {
+                        $baseUrl = $org->domain;
+                    }
+                }
+            }
+
+                // If not whitelabel (or no custom domain configured), resolve platform domain per role and environment
+                if (!$baseUrl) {
+                    $isDevEnv = (
+                        str_contains($originHost ?? '', 'dev.tojuco.com') ||
+                        in_array(config('app.env'), ['develop', 'dev', 'development', 'staging', 'local']) ||
+                        str_contains(config('app.admin_app', ''), 'dev.tojuco.com')
+                    );
+
+                    if ($isDevEnv) {
+                        // 3 Development domains
+                        $baseUrl = match ($userType) {
+                            'agent' => config('app.dev_agent_domain', env('DEFAULT_AGENT_DOMAIN', 'my.dev.tojuco.com')),
+                            'vendor' => config('app.dev_vendor_domain', env('DEFAULT_VENDOR_DOMAIN', 'team.dev.tojuco.com')),
+                            default => config('app.dev_admin_domain', env('DEFAULT_ADMIN_DOMAIN', 'admin.dev.tojuco.com')),
+                        };
+                    } else {
+                        // 3 Production domains
+                        $baseUrl = match ($userType) {
+                            'agent' => config('app.prod_agent_domain', env('DEFAULT_BOOKINGS_DOMAIN', 'bookings.tojuco.com')),
+                            'vendor' => config('app.prod_vendor_domain', env('DEFAULT_VENDORS_DOMAIN', 'vendors.tojuco.com')),
+                            default => config('app.prod_admin_domain', env('DEFAULT_TEAMS_DOMAIN', 'teams.tojuco.com')),
+                        };
+                    }
+                }
+
             if (!str_starts_with($baseUrl, 'http://') && !str_starts_with($baseUrl, 'https://')) {
-                $baseUrl = 'https://' . $baseUrl;
+                $baseUrl = (str_contains($baseUrl, 'localhost') || str_contains($baseUrl, '127.0.0.1')) ? 'http://' . $baseUrl : 'https://' . $baseUrl;
             }
 
             $baseUrl = rtrim($baseUrl, '/');
 
-            // Path varies by role
-            $resetPath = match ($userType) {
-                'agent' => '/agent/new-password',
-                'vendor' => '/vendor/new-password',
-                default => '/new-password',
-            };
+            // 2. Resolve organization slug for agent path
+            $orgSlug = $org?->slug ?? $data['organization_slug'] ?? null;
+            if (!$orgSlug && $model && isset($model->organization_id)) {
+                $orgModel = Organization::find($model->organization_id);
+                $orgSlug = $orgModel?->slug;
+                if (!$org && $orgModel) {
+                    $org = $orgModel;
+                }
+            }
+
+            // Path varies by role and presence of organization slug
+            if ($userType === 'agent') {
+                $resetPath = !empty($orgSlug) ? "/{$orgSlug}/new-password" : '/agent/new-password';
+            } elseif ($userType === 'vendor') {
+                $resetPath = '/vendor/new-password';
+            } else {
+                $resetPath = '/new-password';
+            }
 
             $resetUrl = $baseUrl . $resetPath
                 . '?token=' . urlencode($token ?? '')
@@ -910,6 +981,7 @@ class EmailDispatchService
                 // Password reset
                 'name' => $data['recipient_name'] ?? '',
                 'reset_link' => $data['reset_link'] ?? $data['url'] ?? '',
+                'url' => $data['url'] ?? $data['reset_link'] ?? '',
                 'organization_name' => $data['organization_name'] ?? ($org?->name ?? ''),
                 'email' => $recipient['email'] ?? '',
 

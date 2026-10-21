@@ -213,11 +213,26 @@ class AuthController extends Controller
         try {
             $request->validate([
                 'email' => 'required|email',
-                'role' => 'nullable|in:admin,agent,vendor'
+                'role' => 'nullable|in:admin,agent,vendor',
+                'organization_id' => 'nullable',
+                'organization_slug' => 'nullable|string',
             ]);
 
             $email = $request->email;
             $role = $request->role;
+            $orgId = $request->organization_id;
+            $orgSlug = $request->organization_slug;
+            $org = null;
+
+            if ($orgSlug) {
+                $org = Organization::where('slug', $orgSlug)->first();
+                if ($org) {
+                    $orgId = $org->id;
+                }
+            } elseif ($orgId) {
+                $org = is_numeric($orgId) ? Organization::find($orgId) : Organization::where('uuid', $orgId)->first();
+            }
+
             $user = null;
             $userType = null;
 
@@ -230,15 +245,37 @@ class AuthController extends Controller
             }
 
             if (!$user && ($role === 'agent' || !$role)) {
-                $user = Agent::whereRaw('LOWER(email) = ?', [strtolower(trim($email))])->first();
+                $agentQuery = Agent::whereRaw('LOWER(email) = ?', [strtolower(trim($email))]);
+                if ($orgId) {
+                    $agentQuery->where('organization_id', $orgId);
+                }
+                $user = $agentQuery->first();
+
                 if (!$user) {
-                    $user = SubAccount::where(function ($q) use ($email) {
+                    $subQuery = SubAccount::where(function ($q) use ($email) {
                         $q->whereRaw('LOWER(primary_email) = ?', [strtolower(trim($email))])
                           ->orWhereRaw('LOWER(secondary_email) = ?', [strtolower(trim($email))]);
-                    })->first();
+                    });
+                    if ($orgId) {
+                        $subQuery->where('organization_id', $orgId);
+                    }
+                    $user = $subQuery->first();
                 }
+
+                // If not found with org filter, fallback to search across any organization
+                if (!$user && $orgId) {
+                    $user = Agent::whereRaw('LOWER(email) = ?', [strtolower(trim($email))])->first()
+                        ?? SubAccount::where(function ($q) use ($email) {
+                            $q->whereRaw('LOWER(primary_email) = ?', [strtolower(trim($email))])
+                              ->orWhereRaw('LOWER(secondary_email) = ?', [strtolower(trim($email))]);
+                        })->first();
+                }
+
                 if ($user) {
                     $userType = 'agent';
+                    if (!$org && isset($user->organization_id)) {
+                        $org = Organization::find($user->organization_id);
+                    }
                 }
             }
 
@@ -262,6 +299,7 @@ class AuthController extends Controller
             // Dispatch through unified EmailDispatchService so it uses the verified
             // Resend sender, respects whitelabel branding, and is logged in email_logs.
             app(\App\Services\EmailDispatchService::class)->dispatch('password_reset', $user, [
+                'organization' => $org,
                 'recipients' => [[
                     'email' => method_exists($user, 'getEmailForPasswordReset')
                         ? $user->getEmailForPasswordReset()
@@ -271,9 +309,12 @@ class AuthController extends Controller
                     'model' => $user,
                 ]],
                 'data' => [
-                    'token'     => $token,
-                    'user_type' => $userType,
-                    'role'      => $userType,
+                    'token'             => $token,
+                    'user_type'         => $userType,
+                    'role'              => $userType,
+                    'origin'            => $request->header('Origin') ?: $request->header('Referer'),
+                    'organization_slug' => $org?->slug ?? $orgSlug,
+                    'organization_id'   => $org?->id ?? $orgId,
                 ],
             ]);
 
@@ -307,35 +348,63 @@ class AuthController extends Controller
                 'email' => 'required|string|email',
                 'password' => 'required|string|min:8|confirmed',
                 'token' => 'required|string',
-                'role' => 'nullable|in:admin,agent,vendor'
+                'role' => 'nullable|in:admin,agent,vendor',
+                'organization_id' => 'nullable',
+                'organization_slug' => 'nullable|string',
             ]);
 
             $email = strtolower(trim($data['email']));
             $password = $data['password'];
             $token = $data['token'];
             $role = $data['role'] ?? null;
+            $orgId = $data['organization_id'] ?? null;
+            $orgSlug = $data['organization_slug'] ?? null;
+
+            if (!$orgId && $orgSlug) {
+                $org = Organization::where('slug', $orgSlug)->first();
+                $orgId = $org?->id;
+            }
+
             $user = null;
 
             // Find user in appropriate table based on role
             if ($role === 'admin') {
                 $user = User::whereRaw('LOWER(email) = ?', [$email])->first();
             } elseif ($role === 'agent') {
-                $user = Agent::whereRaw('LOWER(email) = ?', [$email])->first() 
-                    ?? SubAccount::where(function ($q) use ($email) {
-                        $q->whereRaw('LOWER(primary_email) = ?', [$email])
-                          ->orWhereRaw('LOWER(secondary_email) = ?', [$email]);
-                    })->first();
-            } elseif ($role === 'vendor') {
-                $user = Vendor::whereRaw('LOWER(email) = ?', [$email])->first();
-            } else {
-                // If no role provided, search all tables in sequence
-                $user = User::whereRaw('LOWER(email) = ?', [$email])->first();
+                if ($orgId) {
+                    $user = Agent::where('organization_id', $orgId)->whereRaw('LOWER(email) = ?', [$email])->first()
+                        ?? SubAccount::where('organization_id', $orgId)->where(function ($q) use ($email) {
+                            $q->whereRaw('LOWER(primary_email) = ?', [$email])
+                              ->orWhereRaw('LOWER(secondary_email) = ?', [$email]);
+                        })->first();
+                }
                 if (!$user) {
                     $user = Agent::whereRaw('LOWER(email) = ?', [$email])->first() 
                         ?? SubAccount::where(function ($q) use ($email) {
                             $q->whereRaw('LOWER(primary_email) = ?', [$email])
                               ->orWhereRaw('LOWER(secondary_email) = ?', [$email]);
                         })->first();
+                }
+            } elseif ($role === 'vendor') {
+                $user = Vendor::whereRaw('LOWER(email) = ?', [$email])->first();
+            } else {
+                // If no role provided, search all tables in sequence
+                $user = User::whereRaw('LOWER(email) = ?', [$email])->first();
+                if (!$user) {
+                    if ($orgId) {
+                        $user = Agent::where('organization_id', $orgId)->whereRaw('LOWER(email) = ?', [$email])->first()
+                            ?? SubAccount::where('organization_id', $orgId)->where(function ($q) use ($email) {
+                                $q->whereRaw('LOWER(primary_email) = ?', [$email])
+                                  ->orWhereRaw('LOWER(secondary_email) = ?', [$email]);
+                            })->first();
+                    }
+                    if (!$user) {
+                        $user = Agent::whereRaw('LOWER(email) = ?', [$email])->first() 
+                            ?? SubAccount::where(function ($q) use ($email) {
+                                $q->whereRaw('LOWER(primary_email) = ?', [$email])
+                                  ->orWhereRaw('LOWER(secondary_email) = ?', [$email]);
+                            })->first();
+                    }
                 }
                 if (!$user) {
                     $user = Vendor::whereRaw('LOWER(email) = ?', [$email])->first();

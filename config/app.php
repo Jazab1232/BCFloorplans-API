@@ -126,4 +126,17 @@ return [
     'admin_app' => env('ADMIN_APP', 'https://teams.tojuco.com/'),
     'admin_app_img' => env('ADMIN_APP_IMG', 'https://teams.tojuco.com/_next/image?url=%2Fbcfloor.png&w=384&q=75'),
     'frontend_url' => env('FRONTEND_URL', env('ADMIN_APP', 'https://teams.tojuco.com')),
+    'agent_url' => env('DEFAULT_AGENT_DOMAIN', env('AGENT_APP_URL', 'https://bookings.tojuco.com')),
+    'vendor_url' => env('DEFAULT_VENDOR_DOMAIN', env('VENDOR_APP_URL', 'https://vendors.tojuco.com')),
+
+    // Platform Production Domains (3 portals)
+    'prod_admin_domain' => env('PROD_ADMIN_DOMAIN', env('DEFAULT_TEAMS_DOMAIN', 'teams.tojuco.com')),
+    'prod_agent_domain' => env('PROD_AGENT_DOMAIN', env('DEFAULT_BOOKINGS_DOMAIN', 'bookings.tojuco.com')),
+    'prod_vendor_domain' => env('PROD_VENDOR_DOMAIN', env('DEFAULT_VENDORS_DOMAIN', 'vendors.tojuco.com')),
+
+    // Platform Development Domains (3 portals)
+    'dev_admin_domain' => env('DEV_ADMIN_DOMAIN', env('DEFAULT_ADMIN_DOMAIN', 'admin.dev.tojuco.com')),
+    'dev_agent_domain' => env('DEV_AGENT_DOMAIN', env('DEFAULT_AGENT_DOMAIN', 'my.dev.tojuco.com')),
+    'dev_vendor_domain' => env('DEV_VENDOR_DOMAIN', env('DEFAULT_VENDOR_DOMAIN', 'team.dev.tojuco.com')),
 ];
+
