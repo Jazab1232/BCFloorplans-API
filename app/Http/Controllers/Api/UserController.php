@@ -63,6 +63,12 @@ class UserController extends Controller
     public function store(Request $request): JsonResponse
     {
         try {
+            if ($request->has('notification_email')) {
+                $request->merge([
+                    'notification_email' => filter_var($request->input('notification_email'), FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE) ?? $request->input('notification_email'),
+                ]);
+            }
+
             $data = $request->validate([
                 'first_name' => 'required|string|max:255',
                 'last_name' => 'nullable|string|max:255',
@@ -157,6 +163,12 @@ class UserController extends Controller
     {
         try {
             $user = User::where('uuid', $uuid)->firstOrFail();
+
+            if ($request->has('notification_email')) {
+                $request->merge([
+                    'notification_email' => filter_var($request->input('notification_email'), FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE) ?? $request->input('notification_email'),
+                ]);
+            }
 
             $data = $request->validate([
                 'first_name' => 'sometimes|string|max:255',

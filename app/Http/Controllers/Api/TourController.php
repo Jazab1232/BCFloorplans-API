@@ -209,6 +209,24 @@ class TourController extends Controller
                 ]);
             }
 
+            if ($tour->order_id) {
+                $this->consolidateToursForOrder($tour->order_id, $tour->id);
+                $tour->load([
+                    'files' => function ($query) use ($includeHidden) {
+                        if (!$includeHidden) $query->where('is_hidden', false);
+                        $query->with('service');
+                    },
+                    'links' => function ($query) use ($includeHidden) {
+                        if (!$includeHidden) $query->where('is_hidden', false);
+                        $query->with('service');
+                    },
+                    'snapshots' => function ($query) use ($includeHidden) {
+                        if (!$includeHidden) $query->where('is_hidden', false);
+                    },
+                    'order'
+                ]);
+            }
+
             // Organization isolation: verify tour belongs to current user's org (exempt super admins)
             $user = auth()->user();
             if ($user) {
@@ -322,8 +340,11 @@ class TourController extends Controller
             'slide_show.slide_delay' => 'nullable|integer',
             'slide_show.transitions' => 'nullable|string',
             'slide_show.background_audio' => 'nullable|string',
-            'slide_show.auto_play' => 'nullable|boolean',
-            'slide_show.video_overlay' => 'nullable|boolean',
+            'slide_show.auto_play' => 'nullable',
+            'slide_show.video_overlay' => 'nullable',
+            'slide_show.hero_type' => 'nullable|string',
+            'slide_show.hero_video_uuid' => 'nullable|string',
+            'slide_show.pan_adjust' => 'nullable',
 
         ]);
 
@@ -341,13 +362,31 @@ class TourController extends Controller
             $data = $validator->validated();
             $order = Order::where('uuid', $data['order_id'])->first();
 
-            // Create tour
-            $tour = Tour::create([
-                'uuid' => Str::uuid()->toString(),
-                'order_id' => $order->id,
-                'slide_show' => $data['slide_show'] ?? null,
-                'is_publish' => $data['is_publish'] ?? false,
-            ]);
+            // Consolidate or reuse existing tour for this order
+            $tour = $this->consolidateToursForOrder($order->id);
+            if ($tour) {
+                if (isset($data['slide_show']) || $request->has('slide_show')) {
+                    $existingSlideShow = is_array($tour->slide_show)
+                        ? $tour->slide_show
+                        : (is_string($tour->slide_show) ? (json_decode($tour->slide_show, true) ?? []) : []);
+                    $newSlideShow = $data['slide_show'] ?? ($request->input('slide_show') ?? []);
+                    if (is_array($newSlideShow)) {
+                        $tour->slide_show = array_merge($existingSlideShow, $newSlideShow);
+                    }
+                }
+                if (isset($data['is_publish'])) {
+                    $tour->is_publish = $data['is_publish'];
+                }
+                $tour->save();
+            } else {
+                // Create tour
+                $tour = Tour::create([
+                    'uuid' => Str::uuid()->toString(),
+                    'order_id' => $order->id,
+                    'slide_show' => $data['slide_show'] ?? null,
+                    'is_publish' => $data['is_publish'] ?? false,
+                ]);
+            }
 
             // $createdTourFiles = [];
             // Handle files
@@ -661,8 +700,11 @@ class TourController extends Controller
             'slide_show.slide_delay' => 'nullable|integer',
             'slide_show.transitions' => 'nullable|string',
             'slide_show.background_audio' => 'nullable|string',
-            'slide_show.auto_play' => 'nullable|boolean',
-            'slide_show.video_overlay' => 'nullable|boolean',
+            'slide_show.auto_play' => 'nullable',
+            'slide_show.video_overlay' => 'nullable',
+            'slide_show.hero_type' => 'nullable|string',
+            'slide_show.hero_video_uuid' => 'nullable|string',
+            'slide_show.pan_adjust' => 'nullable',
         ]);
 
         if ($validator->fails()) {
@@ -700,9 +742,14 @@ class TourController extends Controller
             }
 
             // Update slide_show if provided
-            if ($request->filled('slide_show')) {
-                $tour->slide_show = $data['slide_show'];
-
+            if (isset($data['slide_show']) || $request->has('slide_show')) {
+                $existingSlideShow = is_array($tour->slide_show)
+                    ? $tour->slide_show
+                    : (is_string($tour->slide_show) ? (json_decode($tour->slide_show, true) ?? []) : []);
+                $newSlideShow = $data['slide_show'] ?? ($request->input('slide_show') ?? []);
+                if (is_array($newSlideShow)) {
+                    $tour->slide_show = array_merge($existingSlideShow, $newSlideShow);
+                }
             }
 
             $tour->save();
@@ -1362,6 +1409,9 @@ class TourController extends Controller
         try {
             $includeHidden = $request->boolean('include_hidden');
             $order = Order::where('uuid', $orderUuid)->firstOrFail();
+
+            // Consolidate any duplicate tours for this order
+            $this->consolidateToursForOrder($order->id);
             
             $tours = Tour::with([
                 'files' => function ($query) use ($includeHidden) {
@@ -3012,6 +3062,77 @@ class TourController extends Controller
                 'error' => config('app.env') === 'production' ? null : $e->getMessage()
             ], 500);
         }
+    }
+
+    /**
+     * Consolidate duplicate tours for an order so that only one primary tour remains,
+     * with all files, links, snapshots, and slideshow settings merged.
+     */
+    protected function consolidateToursForOrder(int $orderId, ?int $preferredTourId = null): ?Tour
+    {
+        $existingTours = Tour::where('order_id', $orderId)->orderBy('id', 'asc')->get();
+        if ($existingTours->isEmpty()) {
+            return null;
+        }
+
+        if ($existingTours->count() === 1) {
+            return $existingTours->first();
+        }
+
+        // Multiple tours exist for this order. Find the primary tour.
+        $primaryTour = null;
+        if ($preferredTourId) {
+            $primaryTour = $existingTours->firstWhere('id', $preferredTourId);
+        }
+        if (!$primaryTour) {
+            // Prefer the tour with the most files, or the first one created
+            $primaryTour = $existingTours->sortByDesc(function ($t) {
+                return TourFile::where('tour_id', $t->id)->count();
+            })->first() ?? $existingTours->first();
+        }
+
+        $secondaryTours = $existingTours->filter(function ($t) use ($primaryTour) {
+            return $t->id !== $primaryTour->id;
+        });
+
+        foreach ($secondaryTours as $secTour) {
+            // Re-parent files, links, snapshots
+            TourFile::where('tour_id', $secTour->id)->update(['tour_id' => $primaryTour->id]);
+            TourLink::where('tour_id', $secTour->id)->update(['tour_id' => $primaryTour->id]);
+            TourSnapshot::where('tour_id', $secTour->id)->update(['tour_id' => $primaryTour->id]);
+
+            // Re-parent related stats/logs if any
+            try { TourDailyStat::where('tour_id', $secTour->id)->update(['tour_id' => $primaryTour->id]); } catch (\Throwable $e) {}
+            try { TourVisitor::where('tour_id', $secTour->id)->update(['tour_id' => $primaryTour->id]); } catch (\Throwable $e) {}
+            try { TourDailyReferrer::where('tour_id', $secTour->id)->update(['tour_id' => $primaryTour->id]); } catch (\Throwable $e) {}
+            try { TourDailyMediaStat::where('tour_id', $secTour->id)->update(['tour_id' => $primaryTour->id]); } catch (\Throwable $e) {}
+            try { MatterportRenewal::where('tour_id', $secTour->id)->update(['tour_id' => $primaryTour->id]); } catch (\Throwable $e) {}
+
+            // Merge slideshow configuration
+            if (!empty($secTour->slide_show)) {
+                $primarySlideShow = is_array($primaryTour->slide_show)
+                    ? $primaryTour->slide_show
+                    : (is_string($primaryTour->slide_show) ? (json_decode($primaryTour->slide_show, true) ?? []) : []);
+                $secSlideShow = is_array($secTour->slide_show)
+                    ? $secTour->slide_show
+                    : (is_string($secTour->slide_show) ? (json_decode($secTour->slide_show, true) ?? []) : []);
+
+                $filteredSec = array_filter($secSlideShow, function ($v) {
+                    return $v !== null && $v !== '';
+                });
+
+                $primaryTour->slide_show = array_merge($primarySlideShow, $filteredSec);
+            }
+
+            if ($secTour->is_publish) {
+                $primaryTour->is_publish = true;
+            }
+
+            $primaryTour->save();
+            $secTour->delete();
+        }
+
+        return $primaryTour;
     }
 }
 
