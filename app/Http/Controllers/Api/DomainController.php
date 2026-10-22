@@ -26,7 +26,7 @@ class DomainController extends Controller
         $domainStr = rtrim($domainStr, '/');
 
         // Find the domain in the database (supports fuzzy matching for uncleaned records)
-        $domainRecord = OrganizationDomain::with(['organization.settings'])
+        $domainRecord = OrganizationDomain::with(['organization.settings', 'organization.domains'])
             ->where(function($query) use ($domainStr) {
                 $query->where('domain', $domainStr)
                       ->orWhere('domain', 'like', '%' . $domainStr . '%');
@@ -78,7 +78,17 @@ class DomainController extends Controller
             'organization_id' => $organization->id,
             'uuid' => $organization->uuid,
             'organization_uuid' => $organization->uuid,
+            'name' => $organization->name,
             'slug' => $organization->slug,
+            'domain' => $organization->domain,
+            'domains' => $organization->domains ? $organization->domains->map(function ($d) {
+                return [
+                    'id' => $d->id,
+                    'organization_id' => $d->organization_id,
+                    'domain' => $d->domain,
+                    'portal_type' => $d->portal_type,
+                ];
+            })->values() : [],
             'portal_type' => $domainRecord->portal_type,
             'is_whitelabel' => (bool)$organization->is_whitelabel,
             'from_name' => $organization->from_name,

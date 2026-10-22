@@ -41,7 +41,11 @@ class PropertyController extends Controller
                 },
                 'orders.tours.files' => function($query) {
                     $query->select('id', 'uuid', 'tour_id', 'file_path', 'is_featured', 'type', 'variants', 'is_processing', 'service_id', 'created_at');
-                }
+                },
+                'organization' => function($query) {
+                    $query->select('id', 'uuid', 'name', 'slug', 'domain', 'is_whitelabel');
+                },
+                'organization.domains'
             ]);
 
             $user = auth()->user();

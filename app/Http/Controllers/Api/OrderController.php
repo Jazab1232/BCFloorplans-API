@@ -147,7 +147,7 @@ class OrderController extends Controller
     public function show($uuid): JsonResponse
     {
         try {
-            $order = Order::with(['agent', 'property', 'package', 'areas', 'services.service', 'services.option', 'slots.vendor.workHours', 'slots.vendor.company', 'slots.vendor.addresses', 'totals', 'logs'])->where('uuid', $uuid)->first();
+            $order = Order::with(['agent', 'property', 'package', 'areas', 'services.service', 'services.option', 'slots.vendor.workHours', 'slots.vendor.company', 'slots.vendor.addresses', 'totals', 'logs', 'organization.domains'])->where('uuid', $uuid)->first();
 
             if (!$order) {
                 return response()->json([
