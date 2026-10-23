@@ -238,18 +238,7 @@ class CoAgentService
      */
     protected function resolvePortalUrl(Agent $agent): string
     {
-        $adminAppUrl = config('app.admin_app', 'https://bcfloorplans.com');
         $org = $agent->organization ?? null;
-
-        if ($org && $org->is_whitelabel) {
-            $domainRecord = $org->domains()->where('portal_type', 'agent')->first();
-            if ($domainRecord) {
-                $adminAppUrl = 'https://' . $domainRecord->domain . '/';
-            } elseif (!empty($org->domain)) {
-                $adminAppUrl = 'https://' . $org->domain . '/';
-            }
-        }
-
-        return $adminAppUrl;
+        return app(\App\Services\EmailDispatchService::class)->resolvePortalBaseUrl('agent', $org) . '/';
     }
 }

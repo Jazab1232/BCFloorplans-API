@@ -240,7 +240,7 @@ class EmailDispatchService
             return [];
         }
 
-        $allowedRoles = $eventConfig['recipients'] ?? [];
+        $allowedRoles = $options['allowed_roles'] ?? ($eventConfig['recipients'] ?? []);
         $recipients = [];
 
         $order = null;
@@ -786,19 +786,7 @@ class EmailDispatchService
             }
             $svcUuid = $serviceObj?->uuid;
 
-            $baseUrl = config('app.frontend_url', config('app.admin_app', 'https://teams.tojuco.com'));
-            if ($org && $org->is_whitelabel) {
-                $domainRecord = $org->domains()->where('portal_type', 'agent')->first();
-                if ($domainRecord && !empty($domainRecord->domain)) {
-                    $baseUrl = $domainRecord->domain;
-                } elseif (!empty($org->domain)) {
-                    $baseUrl = $org->domain;
-                }
-            }
-            if (!str_starts_with($baseUrl, 'http://') && !str_starts_with($baseUrl, 'https://')) {
-                $baseUrl = 'https://' . $baseUrl;
-            }
-            $baseUrl = rtrim($baseUrl, '/');
+            $baseUrl = $this->resolvePortalBaseUrl($role, $org);
 
             $query = [];
             if ($svcUuid) $query['serviceId'] = $svcUuid;
@@ -1096,7 +1084,13 @@ class EmailDispatchService
                 break;
 
             case \App\Mail\SlotCancelled::class:
-                $mailable = new $mailableClass($data['slot'], $data['recipient_name'], $recipient['role']);
+                $mailable = new $mailableClass(
+                    $data['slot'],
+                    $data['recipient_name'],
+                    $recipient['role'],
+                    $data['cancellation_fee'] ?? ($data['cancellation_fee_raw'] ?? null),
+                    $data['cancellation_reason'] ?? null
+                );
                 break;
 
             case \App\Mail\SlotRescheduled::class:
@@ -1340,5 +1334,79 @@ class EmailDispatchService
             }
             return false;
         }
+    }
+
+    /**
+     * Resolve the portal base URL based on recipient role and whitelabel context.
+     *
+     * @param string $role 'agent', 'admin', 'vendor', etc.
+     * @param Organization|null $org
+     * @param string|null $originHost
+     * @return string Normalized base URL without trailing slash
+     */
+    public function resolvePortalBaseUrl(string $role, ?Organization $org, ?string $originHost = null): string
+    {
+        $baseUrl = null;
+
+        // 1. Whitelabel Organization: match portal_type to recipient role
+        if ($org && $org->is_whitelabel) {
+            try {
+                $portalType = match ($role) {
+                    'admin', 'user' => 'admin',
+                    'vendor' => 'vendor',
+                    default => 'agent',
+                };
+                $domainRecord = $org->domains()->where('portal_type', $portalType)->first();
+                if ($domainRecord && !empty($domainRecord->domain)) {
+                    $baseUrl = $domainRecord->domain;
+                } elseif (!empty($org->domain)) {
+                    $baseUrl = $org->domain;
+                }
+            } catch (\Throwable $e) {
+                if (!empty($org->domain)) {
+                    $baseUrl = $org->domain;
+                }
+            }
+        }
+
+        // 2. Non-Whitelabel: environment-driven domain resolution
+        if (!$baseUrl) {
+            $configuredDomain = match ($role) {
+                'agent' => config('app.agent_url') ?: env('DEFAULT_AGENT_DOMAIN', env('AGENT_APP_URL')),
+                'vendor' => config('app.vendor_url') ?: env('DEFAULT_VENDOR_DOMAIN', env('VENDOR_APP_URL')),
+                default => config('app.admin_app') ?: (config('app.frontend_url') ?: env('ADMIN_APP', env('DEFAULT_ADMIN_DOMAIN', env('FRONTEND_URL')))),
+            };
+
+            if (!empty($configuredDomain)) {
+                $baseUrl = $configuredDomain;
+            } else {
+                $isDevEnv = (
+                    str_contains($originHost ?? '', 'dev.tojuco.com') ||
+                    in_array(config('app.env'), ['develop', 'dev', 'development', 'staging', 'local']) ||
+                    str_contains(config('app.admin_app', ''), 'dev.tojuco.com')
+                );
+
+                if ($isDevEnv) {
+                    $baseUrl = match ($role) {
+                        'agent' => config('app.dev_agent_domain', 'my.dev.tojuco.com'),
+                        'vendor' => config('app.dev_vendor_domain', 'team.dev.tojuco.com'),
+                        default => config('app.dev_admin_domain', 'admin.dev.tojuco.com'),
+                    };
+                } else {
+                    $baseUrl = match ($role) {
+                        'agent' => config('app.prod_agent_domain', 'bookings.tojuco.com'),
+                        'vendor' => config('app.prod_vendor_domain', 'vendors.tojuco.com'),
+                        default => config('app.prod_admin_domain', 'teams.tojuco.com'),
+                    };
+                }
+            }
+        }
+
+        if (!str_starts_with($baseUrl, 'http://') && !str_starts_with($baseUrl, 'https://')) {
+            $isLocal = str_contains($baseUrl, 'localhost') || str_contains($baseUrl, '127.0.0.1');
+            $baseUrl = ($isLocal ? 'http://' : 'https://') . $baseUrl;
+        }
+
+        return rtrim($baseUrl, '/');
     }
 }

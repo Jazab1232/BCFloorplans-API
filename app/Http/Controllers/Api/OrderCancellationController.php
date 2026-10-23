@@ -412,12 +412,25 @@ class OrderCancellationController extends Controller
 
             DB::beginTransaction();
 
-            // Track deleted slot for calendar sync
+            // Track deleted slot for calendar sync and email notifications
             $deletedSlotId = null;
-            $slot = OrderSlot::where('order_id', $order->id)->where('service_id', $orderService->service_id)->first();
+            $slot = OrderSlot::withoutGlobalScopes()
+                ->where('order_id', $order->id)
+                ->where('service_id', $orderService->service_id)
+                ->first();
+
+            $vendor = null;
             if ($slot) {
+                $slot->loadMissing(['service', 'order.property', 'vendor']);
                 $deletedSlotId = $slot->id;
+                $vendor = $slot->vendor;
                 $slot->delete();
+            }
+
+            if (!$vendor && !empty($orderService->vendor_id)) {
+                $vendor = Str::isUuid($orderService->vendor_id)
+                    ? Vendor::withoutGlobalScopes()->where('uuid', $orderService->vendor_id)->first()
+                    : Vendor::withoutGlobalScopes()->find($orderService->vendor_id);
             }
 
             // Handle Financials
@@ -526,7 +539,7 @@ class OrderCancellationController extends Controller
             }
 
             // Send notification email (only to agent, admins, and the specific vendor affected)
-            $this->sendSingleServiceCancellationEmails($order, $orderService, $slot?->vendor, $cancellationFee, $request->reason);
+            $this->sendSingleServiceCancellationEmails($order, $orderService, $vendor, $cancellationFee, $request->reason, $slot);
 
             return response()->json([
                 'success' => true,
@@ -838,12 +851,28 @@ class OrderCancellationController extends Controller
     /**
      * Send cancellation emails for a SINGLE service cancellation.
      */
-    protected function sendSingleServiceCancellationEmails(Order $order, OrderService $orderService, ?Vendor $vendor, float $fee, ?string $reason): void
+    protected function sendSingleServiceCancellationEmails(Order $order, OrderService $orderService, ?Vendor $vendor, float $fee, ?string $reason, ?OrderSlot $slot = null): void
     {
         try {
-            $order->cancellation_fee = $fee;
             $serviceName = $orderService->service->name ?? 'Service';
-            $order->cancellation_reason = $reason . " (Cancelled single service: {$serviceName})";
+
+            if (!$slot) {
+                $slot = new OrderSlot([
+                    'order_id' => $order->id,
+                    'service_id' => $orderService->service_id,
+                    'vendor_id' => $vendor?->id,
+                    'date' => now()->toDateString(),
+                    'start_time' => 'N/A',
+                    'end_time' => 'N/A',
+                ]);
+            }
+            $slot->setRelation('order', $order);
+            if ($orderService->service) {
+                $slot->setRelation('service', $orderService->service);
+            }
+            if ($vendor) {
+                $slot->setRelation('vendor', $vendor);
+            }
 
             $recipients = [];
             
@@ -878,8 +907,13 @@ class OrderCancellationController extends Controller
                 ];
             }
 
-            app(\App\Services\EmailDispatchService::class)->dispatch('order_cancelled', $order, [
-                'recipients' => $recipients
+            app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $slot, [
+                'recipients' => $recipients,
+                'data' => [
+                    'cancellation_fee' => $fee > 0 ? $fee : null,
+                    'cancellation_reason' => $reason,
+                    'service_name' => $serviceName,
+                ]
             ]);
         } catch (\Throwable $e) {
             Log::error('Failed to send single service cancellation emails via dispatch service: ' . $e->getMessage());

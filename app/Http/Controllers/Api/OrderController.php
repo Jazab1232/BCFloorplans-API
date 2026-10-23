@@ -780,6 +780,13 @@ class OrderController extends Controller
             'release_media_before_payment' => filter_var($releaseMedia, FILTER_VALIDATE_BOOLEAN),
         ]);
     }
+    foreach (['notify_agent', 'inform_agent', 'notify_vendor', 'inform_vendor', 'notify_admin', 'inform_admin'] as $notifyKey) {
+        if ($request->has($notifyKey)) {
+            $request->merge([
+                $notifyKey => filter_var($request->input($notifyKey), FILTER_VALIDATE_BOOLEAN),
+            ]);
+        }
+    }
 
     $validator = Validator::make($request->all(), [
         'agent_id' => 'sometimes|exists:agents,uuid',
@@ -834,6 +841,12 @@ class OrderController extends Controller
         'areas.*.custom_title' => 'nullable|string|max:255',
         'is_add_service' => 'nullable|boolean',
         'update_invoice' => 'nullable|boolean',
+        'notify_agent' => 'nullable|boolean',
+        'inform_agent' => 'nullable|boolean',
+        'notify_vendor' => 'nullable|boolean',
+        'inform_vendor' => 'nullable|boolean',
+        'notify_admin' => 'nullable|boolean',
+        'inform_admin' => 'nullable|boolean',
     ]);
 
     if ($validator->fails()) {
@@ -844,10 +857,13 @@ class OrderController extends Controller
         ], 422);
     }
 
+    @set_time_limit(300);
+    @ini_set('max_execution_time', '300');
+
     try {
         DB::beginTransaction();
         
-        $order = Order::with(['services', 'slots', 'totals', 'areas'])
+        $order = Order::with(['services', 'slots.service', 'slots.vendor', 'totals', 'areas'])
             ->where('uuid', $uuid)
             ->lockForUpdate()
             ->first();
@@ -1020,13 +1036,18 @@ class OrderController extends Controller
                     ];
                 }
 
+                $consecutiveVendors = Vendor::with(['settings', 'workHours'])
+                    ->whereIn('uuid', array_keys($slotsByVendorAndDate))
+                    ->get()
+                    ->keyBy('uuid');
+
                 foreach ($slotsByVendorAndDate as $vendorUuid => $dates) {
-                    $slotVendor = Vendor::where('uuid', $vendorUuid)->first();
+                    $slotVendor = $consecutiveVendors->get($vendorUuid) ?? Vendor::where('uuid', $vendorUuid)->first();
                     $vendorSettings = $slotVendor?->settings;
 
                     if ($vendorSettings && $vendorSettings->next_booking_slot_only) {
                         foreach ($dates as $date => $groupSlots) {
-                            [$isValid, $nextAvailableTime] = $this->validateConsecutiveBooking($slotVendor, $date, $groupSlots, $uuid);
+                            [$isValid, $nextAvailableTime] = $this->validateConsecutiveBooking($slotVendor, $date, $groupSlots, $order->id);
                             
                             if (!$isValid) {
                                 return response()->json([
@@ -1173,7 +1194,41 @@ class OrderController extends Controller
         }
 
         // Send email notifications after successful order update
-        if ($this->hasSignificantChanges($changes)) {
+        $hasExplicitNotificationFlags = $request->has('notify_agent') || $request->has('inform_agent') ||
+            $request->has('notify_vendor') || $request->has('inform_vendor') ||
+            $request->has('notify_admin') || $request->has('inform_admin');
+
+        $allowedRoles = [];
+        $shouldSendEmails = false;
+
+        if ($hasExplicitNotificationFlags) {
+            $notifyAgent = $request->has('notify_agent') ? filter_var($request->input('notify_agent'), FILTER_VALIDATE_BOOLEAN) : (
+                $request->has('inform_agent') ? filter_var($request->input('inform_agent'), FILTER_VALIDATE_BOOLEAN) : false
+            );
+            $notifyVendor = $request->has('notify_vendor') ? filter_var($request->input('notify_vendor'), FILTER_VALIDATE_BOOLEAN) : (
+                $request->has('inform_vendor') ? filter_var($request->input('inform_vendor'), FILTER_VALIDATE_BOOLEAN) : false
+            );
+            $notifyAdmin = $request->has('notify_admin') ? filter_var($request->input('notify_admin'), FILTER_VALIDATE_BOOLEAN) : (
+                $request->has('inform_admin') ? filter_var($request->input('inform_admin'), FILTER_VALIDATE_BOOLEAN) : false
+            );
+
+            if ($notifyAgent) {
+                $allowedRoles[] = 'agent';
+            }
+            if ($notifyVendor) {
+                $allowedRoles[] = 'vendor';
+            }
+            if ($notifyAdmin) {
+                $allowedRoles[] = 'admin';
+            }
+
+            $shouldSendEmails = !empty($allowedRoles);
+        } else {
+            $shouldSendEmails = $this->hasSignificantChanges($changes);
+            $allowedRoles = ['admin', 'agent', 'vendor'];
+        }
+
+        if ($shouldSendEmails && !empty($allowedRoles)) {
             try {
                 $order->load(['agent', 'services.service', 'services.option', 'slots.service', 'slots.vendor']);
                 
@@ -1210,7 +1265,12 @@ class OrderController extends Controller
                     $changesSummary[] = "Price changed from $" . number_format($emailChanges['old_amount'], 2) . " to $" . number_format($emailChanges['new_amount'], 2);
                 }
 
+                if (empty($changesSummary)) {
+                    $changesSummary[] = "Order details updated";
+                }
+
                 app(\App\Services\EmailDispatchService::class)->dispatch('order_updated', $order, [
+                    'allowed_roles' => $allowedRoles,
                     'data' => [
                         'changes_summary' => $changesSummary,
                     ]
@@ -1388,12 +1448,30 @@ private function processServices($order, array $incomingServices): array
     $existingServices = $order->services->keyBy('uuid');
     $processedUuids = [];
 
+    // Pre-load services, options, and feature sheets to minimize queries
+    $incomingServiceUuids = array_filter(array_column($incomingServices, 'service_id'));
+    $serviceModels = !empty($incomingServiceUuids)
+        ? Service::whereIn('uuid', $incomingServiceUuids)->get()->keyBy('uuid')
+        : collect();
+
+    $incomingOptionUuids = array_filter(array_column($incomingServices, 'option_id'));
+    $optionModels = !empty($incomingOptionUuids)
+        ? ProductOption::whereIn('uuid', $incomingOptionUuids)->get()->keyBy('uuid')
+        : collect();
+
+    $incomingSheetUuids = array_filter(array_column($incomingServices, 'feature_sheet_uuid'));
+    $sheetModels = !empty($incomingSheetUuids)
+        ? FeatureSheet::whereIn('uuid', $incomingSheetUuids)->get()->keyBy('uuid')
+        : collect();
+
     foreach ($incomingServices as $incoming) {
-        $serviceModel = Service::where('uuid', $incoming['service_id'])->firstOrFail();
+        $serviceModel = $serviceModels->get($incoming['service_id'])
+            ?? Service::where('uuid', $incoming['service_id'])->firstOrFail();
         
         $optionId = null;
         if (!empty($incoming['option_id'])) {
-            $optionId = ProductOption::where('uuid', $incoming['option_id'])->value('id');
+            $optionId = $optionModels->get($incoming['option_id'])?->id
+                ?? ProductOption::where('uuid', $incoming['option_id'])->value('id');
         }
 
         $featureSheetId = null;
@@ -1403,7 +1481,8 @@ private function processServices($order, array $incomingServices): array
                 ? (int)$incoming['feature_sheet_id']
                 : FeatureSheet::where('uuid', $incoming['feature_sheet_id'])->value('id');
         } elseif ($featureSheetUuid) {
-            $featureSheetId = FeatureSheet::where('uuid', $featureSheetUuid)->value('id');
+            $featureSheetId = $sheetModels->get($featureSheetUuid)?->id
+                ?? FeatureSheet::where('uuid', $featureSheetUuid)->value('id');
         }
         if (!$featureSheetUuid && $featureSheetId) {
             $featureSheetUuid = FeatureSheet::where('id', $featureSheetId)->value('uuid');
@@ -1436,7 +1515,7 @@ private function processServices($order, array $incomingServices): array
 
             // Compare only the fields that matter
             $hasChanged = (
-                $existing->amount != $payload['amount'] ||
+                (float)$existing->amount != (float)$payload['amount'] ||
                 $existing->option_id != $payload['option_id'] ||
                 $existing->feature_sheet_uuid != $payload['feature_sheet_uuid'] ||
                 $existing->custom != $payload['custom'] ||
@@ -1444,36 +1523,84 @@ private function processServices($order, array $incomingServices): array
                 (array_key_exists('vendor_id', $payload) && $existing->vendor_id != $payload['vendor_id'])
             );
 
-            $changes['services_modified'][] = [
-                'order_service' => $existing,
-                'service_name' => $serviceModel->name,
-                'old_amount' => $existing->amount,
-                'new_amount' => $payload['amount'],
-            ];
-            $existing->update($payload);
+            if ($hasChanged) {
+                $oldServiceVendorUuid = $existing->vendor_id;
+                $newServiceVendorUuid = $payload['vendor_id'] ?? null;
+                $vendorHasChanged = array_key_exists('vendor_id', $payload) && ($oldServiceVendorUuid != $newServiceVendorUuid);
 
-            // Sync with associated PrintRequest if this is a feature sheet service
-            $targetSheetUuid = $payload['feature_sheet_uuid'] ?? $existing->feature_sheet_uuid;
-            if ($targetSheetUuid) {
-                $printReq = PrintRequest::where('feature_sheet_id', $targetSheetUuid)
-                    ->where('status', '!=', 'Cancelled')
-                    ->latest()
-                    ->first();
-                if ($printReq) {
-                    $optModel = $payload['option_id'] ? ProductOption::find($payload['option_id']) : null;
-                    $copies = $optModel?->quantity;
-                    if (!$copies && $optModel?->title) {
-                        preg_match('/\d+/', $optModel->title, $m);
-                        $copies = !empty($m[0]) ? (int)$m[0] : null;
+                $changes['services_modified'][] = [
+                    'order_service' => $existing,
+                    'service_name' => $serviceModel->name,
+                    'old_amount' => $existing->amount,
+                    'new_amount' => $payload['amount'],
+                ];
+                $existing->update($payload);
+
+                // If vendor on service was changed, notify previous vendor of unassignment
+                if ($vendorHasChanged && !empty($oldServiceVendorUuid)) {
+                    try {
+                        $oldVendor = Str::isUuid($oldServiceVendorUuid)
+                            ? Vendor::withoutGlobalScopes()->where('uuid', $oldServiceVendorUuid)->first()
+                            : Vendor::withoutGlobalScopes()->find($oldServiceVendorUuid);
+
+                        if ($oldVendor && !empty($oldVendor->email)) {
+                            $slotForOld = OrderSlot::withoutGlobalScopes()
+                                ->where('order_id', $order->id)
+                                ->where('service_id', $serviceModel->id)
+                                ->first();
+
+                            $dummySlot = $slotForOld ?: new OrderSlot([
+                                'order_id' => $order->id,
+                                'service_id' => $serviceModel->id,
+                                'vendor_id' => $oldVendor->id,
+                                'date' => now()->toDateString(),
+                                'start_time' => 'N/A',
+                                'end_time' => 'N/A',
+                            ]);
+                            $dummySlot->setRelation('order', $order);
+                            $dummySlot->setRelation('service', $serviceModel);
+                            $dummySlot->setRelation('vendor', $oldVendor);
+
+                            app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $dummySlot, [
+                                'recipients' => [[
+                                    'email' => $oldVendor->email,
+                                    'name' => trim($oldVendor->first_name . ' ' . $oldVendor->last_name),
+                                    'role' => 'vendor',
+                                    'model' => $oldVendor,
+                                ]],
+                                'data' => [
+                                    'cancellation_reason' => "Service reassigned on order #{$order->id}",
+                                ]
+                            ]);
+                        }
+                    } catch (\Throwable $e) {
+                        Log::warning("Failed to dispatch slot_cancelled to old vendor on service update: " . $e->getMessage());
                     }
-                    $printReqUpdate = ['amount' => $payload['amount']];
-                    if ($copies) {
-                        $printReqUpdate['copies'] = $copies;
+                }
+
+                // Sync with associated PrintRequest if this is a feature sheet service
+                $targetSheetUuid = $payload['feature_sheet_uuid'] ?? $existing->feature_sheet_uuid;
+                if ($targetSheetUuid) {
+                    $printReq = PrintRequest::where('feature_sheet_id', $targetSheetUuid)
+                        ->where('status', '!=', 'Cancelled')
+                        ->latest()
+                        ->first();
+                    if ($printReq) {
+                        $optModel = $payload['option_id'] ? ($optionModels->get($incoming['option_id'] ?? '') ?? ProductOption::find($payload['option_id'])) : null;
+                        $copies = $optModel?->quantity;
+                        if (!$copies && $optModel?->title) {
+                            preg_match('/\d+/', $optModel->title, $m);
+                            $copies = !empty($m[0]) ? (int)$m[0] : null;
+                        }
+                        $printReqUpdate = ['amount' => $payload['amount']];
+                        if ($copies) {
+                            $printReqUpdate['copies'] = $copies;
+                        }
+                        if ($optModel) {
+                            $printReqUpdate['option_id'] = $optModel->uuid;
+                        }
+                        $printReq->update($printReqUpdate);
                     }
-                    if ($optModel) {
-                        $printReqUpdate['option_id'] = $optModel->uuid;
-                    }
-                    $printReq->update($printReqUpdate);
                 }
             }
 
@@ -1505,6 +1632,54 @@ private function processServices($order, array $incomingServices): array
                 'service_name' => $serviceName,
                 'amount' => $existing->amount,
             ];
+
+            // Notify assigned vendor that this service was removed from the order
+            try {
+                $vendor = null;
+                if (!empty($existing->vendor_id)) {
+                    $vendor = Str::isUuid($existing->vendor_id)
+                        ? Vendor::withoutGlobalScopes()->where('uuid', $existing->vendor_id)->first()
+                        : Vendor::withoutGlobalScopes()->find($existing->vendor_id);
+                }
+
+                $existingSlot = OrderSlot::withoutGlobalScopes()
+                    ->where('order_id', $order->id)
+                    ->where('service_id', $existing->service_id)
+                    ->first();
+
+                if (!$vendor && $existingSlot && $existingSlot->vendor_id) {
+                    $vendor = Vendor::withoutGlobalScopes()->find($existingSlot->vendor_id);
+                }
+
+                if ($vendor && !empty($vendor->email)) {
+                    $dummySlot = $existingSlot ?: new OrderSlot([
+                        'order_id' => $order->id,
+                        'service_id' => $existing->service_id,
+                        'vendor_id' => $vendor->id,
+                        'date' => now()->toDateString(),
+                        'start_time' => 'N/A',
+                        'end_time' => 'N/A',
+                    ]);
+                    $dummySlot->setRelation('order', $order);
+                    $dummySlot->setRelation('service', $existing->service ?: Service::find($existing->service_id));
+                    $dummySlot->setRelation('vendor', $vendor);
+
+                    app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $dummySlot, [
+                        'recipients' => [[
+                            'email' => $vendor->email,
+                            'name' => trim($vendor->first_name . ' ' . $vendor->last_name),
+                            'role' => 'vendor',
+                            'model' => $vendor,
+                        ]],
+                        'data' => [
+                            'cancellation_reason' => "Service '{$serviceName}' removed from order #{$order->id}",
+                        ]
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                Log::warning("Failed to dispatch cancellation email to vendor for removed service: " . $e->getMessage());
+            }
+
             $existing->delete();
         }
     }
@@ -1649,10 +1824,43 @@ private function processSlots($order, array $incomingSlots): array
     $existingSlots = $order->slots->keyBy('uuid');
     $processedUuids = [];
 
+    // Pre-load slot services, vendors, and travel rate to minimize queries
+    $incomingServiceUuids = array_filter(array_column($incomingSlots, 'service_id'));
+    $slotServices = !empty($incomingServiceUuids)
+        ? Service::whereIn('uuid', $incomingServiceUuids)->get()->keyBy('uuid')
+        : collect();
+
+    $incomingVendorUuids = array_filter(array_column($incomingSlots, 'vendor_id'));
+    $slotVendors = !empty($incomingVendorUuids)
+        ? Vendor::with([
+            'addresses' => fn($q) => $q->where('type', 'start_location'),
+            'settings'
+        ])->whereIn('uuid', $incomingVendorUuids)->get()->keyBy('uuid')
+        : collect();
+
+    $defaultKmPrice = 0.50;
+    $orgId = $order->organization_id;
+    $orgUuid = $orgId ? \App\Models\Organization::find($orgId)?->uuid : null;
+    if ($orgUuid) {
+        $orgSetting = \App\Models\Setting::where('org_id', $orgUuid)->where('key', 'default_travel_rate')->first();
+        if ($orgSetting && !is_null($orgSetting->value)) {
+            $val = $orgSetting->value;
+            $defaultKmPrice = is_array($val) ? (isset($val['rate']) ? (float)$val['rate'] : (isset($val[0]) ? (float)$val[0] : 0.50)) : (float)$val;
+        } else {
+            $globalSetting = \App\Models\Setting::whereNull('org_id')->where('key', 'default_travel_rate')->first();
+            if ($globalSetting && !is_null($globalSetting->value)) {
+                $val = $globalSetting->value;
+                $defaultKmPrice = is_array($val) ? (isset($val['rate']) ? (float)$val['rate'] : (isset($val[0]) ? (float)$val[0] : 0.50)) : (float)$val;
+            }
+        }
+    }
+
     foreach ($incomingSlots as $incoming) {
-        $serviceId = !empty($incoming['service_id']) ? Service::where('uuid', $incoming['service_id'])->value('id') : null;
+        $slotService = !empty($incoming['service_id']) ? $slotServices->get($incoming['service_id']) : null;
+        $serviceId = $slotService?->id ?? (!empty($incoming['service_id']) ? Service::where('uuid', $incoming['service_id'])->value('id') : null);
         $vendorUuid = $incoming['vendor_id'] ?? null;
-        $vendorId = $vendorUuid ? Vendor::where('uuid', $vendorUuid)->value('id') : null;
+        $slotVendor = $vendorUuid ? $slotVendors->get($vendorUuid) : null;
+        $vendorId = $slotVendor?->id ?? ($vendorUuid ? Vendor::where('uuid', $vendorUuid)->value('id') : null);
 
         if (!$serviceId || !$vendorId) {
             continue;
@@ -1660,36 +1868,16 @@ private function processSlots($order, array $incomingSlots): array
 
         $vendorUuids[] = $vendorUuid;
 
-        $vendorAddress = Vendor::find($vendorId)
-            ?->addresses()
-            ->where('type', 'start_location')
-            ->first();
+        $vendorAddress = $slotVendor?->addresses?->firstWhere('type', 'start_location')
+            ?? $slotVendor?->addresses?->first();
 
         $kmPrice = $incoming['km_price'] ?? null;
         if (is_null($kmPrice) || $kmPrice === '') {
-            $vendorSetting = \App\Models\VendorSetting::where('vendor_id', $vendorId)->first();
+            $vendorSetting = $slotVendor?->settings;
             if ($vendorSetting && !is_null($vendorSetting->payment_per_km)) {
                 $kmPrice = (float)$vendorSetting->payment_per_km;
             } else {
-                $orgId = $order->organization_id;
-                $orgUuid = \App\Models\Organization::find($orgId)?->uuid;
-                if ($orgUuid) {
-                    $orgSetting = \App\Models\Setting::where('org_id', $orgUuid)->where('key', 'default_travel_rate')->first();
-                    if ($orgSetting && !is_null($orgSetting->value)) {
-                        $val = $orgSetting->value;
-                        $kmPrice = is_array($val) ? (isset($val['rate']) ? (float)$val['rate'] : (isset($val[0]) ? (float)$val[0] : 0.50)) : (float)$val;
-                    } else {
-                        $globalSetting = \App\Models\Setting::whereNull('org_id')->where('key', 'default_travel_rate')->first();
-                        if ($globalSetting && !is_null($globalSetting->value)) {
-                            $val = $globalSetting->value;
-                            $kmPrice = is_array($val) ? (isset($val['rate']) ? (float)$val['rate'] : (isset($val[0]) ? (float)$val[0] : 0.50)) : (float)$val;
-                        } else {
-                            $kmPrice = 0.50;
-                        }
-                    }
-                } else {
-                    $kmPrice = 0.50;
-                }
+                $kmPrice = $defaultKmPrice;
             }
         }
 
@@ -1751,8 +1939,8 @@ private function processSlots($order, array $incomingSlots): array
                 $oldVendorId = $existing->vendor_id;
 
                 $existing->update($payload);
-                $serviceName = Service::find($serviceId)->name ?? 'Unknown';
-                $vendorName = Vendor::find($vendorId)->name ?? 'Unknown';
+                $serviceName = $slotService?->name ?? (Service::find($serviceId)->name ?? 'Unknown');
+                $vendorName = $slotVendor ? trim($slotVendor->first_name . ' ' . $slotVendor->last_name) : (Vendor::find($vendorId)->name ?? 'Unknown');
                 
                 $changes['slots_modified'][] = [
                     'service_name' => $serviceName,
@@ -1765,7 +1953,7 @@ private function processSlots($order, array $incomingSlots): array
                 try {
                     $existing->load(['service', 'order.property']);
                     if ($oldVendorId && $oldVendorId != $payload['vendor_id']) {
-                        $oldVendor = \App\Models\Vendor::find($oldVendorId);
+                        $oldVendor = \App\Models\Vendor::withoutGlobalScopes()->find($oldVendorId);
                         if ($oldVendor && $oldVendor->email) {
                             app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $existing, [
                                 'recipients' => [[
@@ -1777,7 +1965,7 @@ private function processSlots($order, array $incomingSlots): array
                             ]);
                         }
                         if (!empty($payload['vendor_id'])) {
-                            $newVendor = \App\Models\Vendor::find($payload['vendor_id']);
+                            $newVendor = \App\Models\Vendor::withoutGlobalScopes()->find($payload['vendor_id']);
                             if ($newVendor && $newVendor->email) {
                                 app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $existing, [
                                     'recipients' => [[
@@ -1811,8 +1999,8 @@ private function processSlots($order, array $incomingSlots): array
                 array_merge($payload, ['uuid' => (string) Str::uuid()])
             );
 
-            $serviceName = Service::find($serviceId)->name ?? 'Unknown';
-            $vendorName = Vendor::find($vendorId)->name ?? 'Unknown';
+            $serviceName = $slotService?->name ?? (Service::find($serviceId)->name ?? 'Unknown');
+            $vendorName = $slotVendor ? trim($slotVendor->first_name . ' ' . $slotVendor->last_name) : (Vendor::find($vendorId)->name ?? 'Unknown');
             
             $changes['slots_added'][] = [
                 'service_name' => $serviceName,
@@ -1836,8 +2024,8 @@ private function processSlots($order, array $incomingSlots): array
     // REMOVED SLOTS
     foreach ($existingSlots as $existing) {
         if (!in_array($existing->uuid, $processedUuids)) {
-            $serviceName = Service::find($existing->service_id)->name ?? 'Unknown';
-            $vendorName = Vendor::find($existing->vendor_id)->name ?? 'Unknown';
+            $serviceName = $existing->service?->name ?? (Service::find($existing->service_id)->name ?? 'Unknown');
+            $vendorName = $existing->vendor ? trim($existing->vendor->first_name . ' ' . $existing->vendor->last_name) : (Vendor::find($existing->vendor_id)->name ?? 'Unknown');
             
             $changes['slots_removed'][] = [
                 'service_name' => $serviceName,
@@ -1852,7 +2040,7 @@ private function processSlots($order, array $incomingSlots): array
             // Dispatch slot_cancelled to vendor prior to deletion
             if ($existing->vendor_id) {
                 try {
-                    $removedVendor = \App\Models\Vendor::find($existing->vendor_id);
+                    $removedVendor = \App\Models\Vendor::withoutGlobalScopes()->find($existing->vendor_id);
                     if ($removedVendor && $removedVendor->email) {
                         $existing->load(['service', 'order.property']);
                         app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $existing, [
@@ -2632,6 +2820,7 @@ private function createOrderNotification($order, array $changes)
             'order_uuid' => 'required|exists:orders,uuid',
             'orderservice_uuid' => 'required|exists:order_services,uuid',
             'is_completed' => 'required|boolean',
+            'skip_email' => 'nullable|boolean',
         ]);
 
         if ($validator->fails()) {
@@ -2668,11 +2857,40 @@ private function createOrderNotification($order, array $changes)
                 \App\Services\NotificationService::notifyServiceCompleted($orderService, $actor);
 
                 // 2. Email dispatch via EmailDispatchService
-                app(\App\Services\EmailDispatchService::class)->dispatch('service_completed', $orderService, [
-                    'order' => $order,
-                    'service' => $orderService->service,
-                    'completed_by' => $actor ? (trim(($actor->first_name ?? '') . ' ' . ($actor->last_name ?? '')) ?: ($actor->name ?? 'Team')) : 'Team',
-                ]);
+                // Suppress service_completed email if:
+                // - explicitly requested (e.g. auto-completion via file manager media upload)
+                // - or if media files/links already exist for this service under the order (media_uploaded is the single email)
+                $shouldSendEmail = !filter_var($request->input('skip_email', false), FILTER_VALIDATE_BOOLEAN);
+
+                if ($shouldSendEmail && $order) {
+                    $tourIds = $order->tours()->pluck('id');
+                    if ($tourIds->isNotEmpty()) {
+                        $hasMedia = \App\Models\TourFile::whereIn('tour_id', $tourIds)
+                            ->where('service_id', $orderService->service_id)
+                            ->exists()
+                            || \App\Models\TourLink::whereIn('tour_id', $tourIds)
+                            ->where(function ($q) use ($orderService) {
+                                $q->where('service_id', $orderService->service_id);
+                                $serviceName = strtolower($orderService->service?->name ?? '');
+                                if (str_contains($serviceName, 'matterport') || str_contains($serviceName, '3d')) {
+                                    $q->orWhereNull('service_id');
+                                }
+                            })
+                            ->exists();
+
+                        if ($hasMedia) {
+                            $shouldSendEmail = false;
+                        }
+                    }
+                }
+
+                if ($shouldSendEmail) {
+                    app(\App\Services\EmailDispatchService::class)->dispatch('service_completed', $orderService, [
+                        'order' => $order,
+                        'service' => $orderService->service,
+                        'completed_by' => $actor ? (trim(($actor->first_name ?? '') . ' ' . ($actor->last_name ?? '')) ?: ($actor->name ?? 'Team')) : 'Team',
+                    ]);
+                }
             } catch (\Throwable $notifErr) {
                 Log::error("Failed sending service completion notification: " . $notifErr->getMessage(), [
                     'exception' => $notifErr,
@@ -2972,9 +3190,14 @@ private function createOrderNotification($order, array $changes)
             };
         }
 
+        $serviceUuids = array_filter(array_column($slots, 'service_id'));
+        $services = !empty($serviceUuids) ? Service::whereIn('uuid', $serviceUuids)->get()->keyBy('uuid') : collect();
+        $vendorUuids = array_filter(array_column($slots, 'vendor_id'));
+        $vendors = !empty($vendorUuids) ? Vendor::whereIn('uuid', $vendorUuids)->get()->keyBy('uuid') : collect();
+
         foreach ($slots as $slot) {
             if (empty($slot['service_id'])) continue;
-            $serviceModel = Service::where('uuid', $slot['service_id'])->first();
+            $serviceModel = $services->get($slot['service_id']) ?? Service::where('uuid', $slot['service_id'])->first();
             if (!$serviceModel || !$twilightService->isTwilightService($serviceModel)) {
                 continue;
             }
@@ -2990,7 +3213,7 @@ private function createOrderNotification($order, array $changes)
                 ], 422);
             }
 
-            $slotVendor = Vendor::where('uuid', $slot['vendor_id'])->first();
+            $slotVendor = $vendors->get($slot['vendor_id'] ?? '') ?? (!empty($slot['vendor_id']) ? Vendor::where('uuid', $slot['vendor_id'])->first() : null);
             if ($slotVendor && !$twilightService->isVendorAvailableForTwilight($slotVendor, $date, $window)) {
                 return response()->json([
                     'success' => false,
@@ -3065,9 +3288,13 @@ private function createOrderNotification($order, array $changes)
             ->whereDate('date', $date);
             
         if ($excludeOrderUuid) {
-            $dbSlotsQuery->whereHas('order', function($q) use ($excludeOrderUuid) {
-                $q->where('uuid', '!=', $excludeOrderUuid);
-            });
+            if (is_numeric($excludeOrderUuid)) {
+                $dbSlotsQuery->where('order_id', '!=', (int)$excludeOrderUuid);
+            } else {
+                $dbSlotsQuery->whereHas('order', function($q) use ($excludeOrderUuid) {
+                    $q->where('uuid', '!=', $excludeOrderUuid);
+                });
+            }
         }
 
         $dbSlots = $dbSlotsQuery->get()->map(fn($s) => [
@@ -3162,12 +3389,13 @@ private function createOrderNotification($order, array $changes)
                 ? OrderSlot::where('id', $slotUuid)->firstOrFail()
                 : OrderSlot::where('uuid', $slotUuid)->firstOrFail();
 
-            $oldVendor = $slot->vendor;
+            $oldVendor = $slot->vendor ?: ($slot->vendor_id ? Vendor::withoutGlobalScopes()->find($slot->vendor_id) : null);
             $oldEventId = $slot->google_event_id;
 
             // Notify old vendor of cancellation/unassignment
             if ($oldVendor && $oldVendor->email) {
                 try {
+                    $slot->loadMissing(['service', 'order.property']);
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $slot, [
                         'recipients' => [[
                             'email' => $oldVendor->email,
@@ -3192,8 +3420,8 @@ private function createOrderNotification($order, array $changes)
             }
 
             $newVendor = is_numeric($request->vendor_id)
-                ? Vendor::where('id', $request->vendor_id)->firstOrFail()
-                : Vendor::where('uuid', $request->vendor_id)->firstOrFail();
+                ? Vendor::withoutGlobalScopes()->where('id', $request->vendor_id)->firstOrFail()
+                : Vendor::withoutGlobalScopes()->where('uuid', $request->vendor_id)->firstOrFail();
 
             $slot->vendor_id = $newVendor->id;
 
@@ -3303,14 +3531,15 @@ private function createOrderNotification($order, array $changes)
                 ? OrderSlot::where('id', $request->slot2_uuid)->firstOrFail()
                 : OrderSlot::where('uuid', $request->slot2_uuid)->firstOrFail();
 
-            $vendor1 = $s1->vendor;
-            $vendor2 = $s2->vendor;
+            $vendor1 = $s1->vendor ?: ($s1->vendor_id ? Vendor::withoutGlobalScopes()->find($s1->vendor_id) : null);
+            $vendor2 = $s2->vendor ?: ($s2->vendor_id ? Vendor::withoutGlobalScopes()->find($s2->vendor_id) : null);
             $event1Id = $s1->google_event_id;
             $event2Id = $s2->google_event_id;
 
-            // Notify both vendors of cancellation/unassignment
+            // Notify both vendors of cancellation/unassignment from previous slots
             if ($vendor1 && $vendor1->email) {
                 try {
+                    $s1->loadMissing(['service', 'order.property']);
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $s1, [
                         'recipients' => [[
                             'email' => $vendor1->email,
@@ -3326,6 +3555,7 @@ private function createOrderNotification($order, array $changes)
 
             if ($vendor2 && $vendor2->email) {
                 try {
+                    $s2->loadMissing(['service', 'order.property']);
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $s2, [
                         'recipients' => [[
                             'email' => $vendor2->email,

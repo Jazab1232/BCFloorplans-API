@@ -16,15 +16,19 @@ class SlotCancelled extends Mailable
     public $slot;
     public $recipientName;
     public $recipientRole;
+    public $cancellationFee;
+    public $cancellationReason;
 
     /**
      * Create a new message instance.
      */
-    public function __construct(OrderSlot $slot, string $recipientName, string $recipientRole = 'agent')
+    public function __construct(OrderSlot $slot, string $recipientName, string $recipientRole = 'agent', $cancellationFee = null, ?string $cancellationReason = null)
     {
         $this->slot = $slot;
         $this->recipientName = $recipientName;
         $this->recipientRole = $recipientRole;
+        $this->cancellationFee = $cancellationFee;
+        $this->cancellationReason = $cancellationReason;
     }
 
     /**
@@ -33,8 +37,9 @@ class SlotCancelled extends Mailable
     public function envelope(): Envelope
     {
         $serviceName = $this->slot->service ? $this->slot->service->name : 'Service';
+        $prop = $this->slot->order ? ($this->slot->order->property_address ?? '') : '';
         return new Envelope(
-            subject: 'Appointment Cancelled: ' . $serviceName . ' - ' . ($this->slot->order->property_address ?? ''),
+            subject: 'Appointment Cancelled: ' . $serviceName . ($prop ? ' - ' . $prop : ''),
         );
     }
 

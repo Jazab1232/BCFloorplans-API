@@ -127,19 +127,7 @@ class CheckMatterportExpirations extends Command
             }
 
             // Resolve Agent Portal Base URL (Whitelabel vs Default Agent Domain)
-            $agentDomain = env('NEXT_PUBLIC_DEFAULT_AGENT_DOMAIN', env('FRONTEND_URL', config('app.frontend_url', 'https://teams.tojuco.com')));
-            if ($org && $org->is_whitelabel) {
-                $domainRecord = $org->domains()->where('portal_type', 'agent')->first();
-                if ($domainRecord && !empty($domainRecord->domain)) {
-                    $agentDomain = $domainRecord->domain;
-                } elseif (!empty($org->domain)) {
-                    $agentDomain = $org->domain;
-                }
-            }
-            if (!str_starts_with($agentDomain, 'http://') && !str_starts_with($agentDomain, 'https://')) {
-                $agentDomain = 'https://' . $agentDomain;
-            }
-            $agentDomain = rtrim($agentDomain, '/');
+            $agentDomain = app(\App\Services\EmailDispatchService::class)->resolvePortalBaseUrl('agent', $org);
             $renewalUrl = $agentDomain . '/dashboard/matterport?tour=' . ($tour->uuid ?? '');
 
             $propertyAddress = $order->property_address ?? ($property ? $property->address : 'Property');
