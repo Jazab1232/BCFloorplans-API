@@ -2505,10 +2505,12 @@ private function createOrderNotification($order, array $changes)
             $serviceId = $orderService->service_id;
             $orderServiceId = $orderService->id;
             $serviceName = $orderService->service->name ?? $orderService->custom ?? 'Service';
+            $serviceModel = $orderService->service;
 
             // 1. Delete associated calendar slot if exists
             $deletedSlotId = null;
-            $slot = OrderSlot::where('order_id', $order->id)->where('service_id', $serviceId)->first();
+            $slot = OrderSlot::where('order_id', $order->id)->where('service_id', $serviceId)->with('vendor')->first();
+            $vendor = $slot?->vendor;
             if ($slot) {
                 $deletedSlotId = $slot->id;
                 $slot->delete();
@@ -2631,6 +2633,67 @@ private function createOrderNotification($order, array $changes)
                 } catch (\Throwable $e) {
                     Log::warning('Failed to dispatch SyncOrderCalendarEvents on removeService: ' . $e->getMessage());
                 }
+            }
+
+            // 9. Dispatch service cancellation/removal notification email
+            try {
+                $notificationSlot = $slot ?: new OrderSlot([
+                    'order_id' => $order->id,
+                    'service_id' => $serviceId,
+                    'date' => now()->toDateString(),
+                    'start_time' => 'N/A',
+                    'end_time' => 'N/A',
+                ]);
+                $notificationSlot->setRelation('order', $order);
+                $order->loadMissing(['agent', 'property', 'organization']);
+                if ($serviceModel) {
+                    $notificationSlot->setRelation('service', $serviceModel);
+                }
+                if ($vendor) {
+                    $notificationSlot->setRelation('vendor', $vendor);
+                }
+
+                $recipients = [];
+                // Admin
+                $adminEmail = $order->organization ? $order->organization->contact_email : null;
+                if (!$adminEmail) {
+                    $adminEmail = config('mail.from.address', 'support@bcfpsoftware.com');
+                }
+                $recipients[] = [
+                    'email' => $adminEmail,
+                    'name' => 'Admin',
+                    'role' => 'admin',
+                ];
+
+                // Agent
+                if ($order->agent && $order->agent->email) {
+                    $recipients[] = [
+                        'email' => $order->agent->email,
+                        'name' => trim($order->agent->first_name . ' ' . $order->agent->last_name),
+                        'role' => 'agent',
+                        'model' => $order->agent,
+                    ];
+                }
+
+                // Vendor (if assigned)
+                if ($vendor && !empty($vendor->email)) {
+                    $recipients[] = [
+                        'email' => $vendor->email,
+                        'name' => trim($vendor->first_name . ' ' . $vendor->last_name),
+                        'role' => 'vendor',
+                        'model' => $vendor,
+                    ];
+                }
+
+                app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $notificationSlot, [
+                    'recipients' => $recipients,
+                    'data' => [
+                        'cancellation_reason' => "Service '{$serviceName}' removed from order #{$order->id}",
+                        'service_name' => $serviceName,
+                    ]
+                ]);
+            } catch (\Throwable $notifErr) {
+                Log::warning('Failed to dispatch service cancellation notification on removeService: ' . $notifErr->getMessage());
             }
 
             return response()->json([

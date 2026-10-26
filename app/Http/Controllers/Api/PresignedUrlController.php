@@ -171,6 +171,8 @@ class PresignedUrlController extends Controller
      */
     public function confirmUploads(Request $request): JsonResponse
     {
+        @ini_set('max_execution_time', '300');
+        @set_time_limit(300);
         $validator = Validator::make($request->all(), [
             'entity_type' => 'required|in:tour,order,listing,feature-sheet,vendor-portfolio,agent-audio,organization-audio,agent,organization,tour-snapshot,video-thumbnail,service',
             'entity_id' => 'required|uuid',
@@ -643,7 +645,10 @@ class PresignedUrlController extends Controller
 
                 // If media was auto-approved (admin upload or approved vendor), notify agent when target quantity is reached
                 if ($tour && !empty($approvedFilesByService)) {
-                    $tour->loadMissing(['orders.agent', 'orders.property']);
+                    $order = $tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null));
+                    if ($order) {
+                        $order->loadMissing(['agent', 'property', 'organization']);
+                    }
                     $uploader = request()->user();
                     $uploaderName = $uploader 
                         ? (trim(($uploader->first_name ?? '') . ' ' . ($uploader->last_name ?? '')) ?: ($uploader->name ?? 'Team'))
@@ -670,10 +675,11 @@ class PresignedUrlController extends Controller
 
                             try {
                                 \App\Services\NotificationService::notifyMediaReady($tour, $svcObj, $uploader, $currentApprovedCount, 'uploaded');
-                                $order = $tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null));
+                                $serviceName = $svcObj ? $svcObj->name : 'Media';
                                 app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
                                     'order' => $order,
                                     'service' => $svcObj,
+                                    'service_name' => $serviceName,
                                     'media_count' => $currentApprovedCount,
                                     'uploaded_by' => $uploaderName,
                                     'is_approved' => ($isAdminApproved ?? false),
@@ -685,7 +691,6 @@ class PresignedUrlController extends Controller
                                 ]);
                             }
                         }
-
                     }
                 }
             }

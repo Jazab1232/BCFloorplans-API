@@ -183,23 +183,13 @@ class TourController extends Controller
 
     public function show(Request $request, $uuid): JsonResponse
     {
+        @ini_set('max_execution_time', '300');
+        @set_time_limit(300);
+
         try {
             $includeHidden = $request->boolean('include_hidden');
 
-            $tour = Tour::with([
-                'files' => function ($query) use ($includeHidden) {
-                    if (!$includeHidden) $query->where('is_hidden', false);
-                    $query->with('service');
-                },
-                'links' => function ($query) use ($includeHidden) {
-                    if (!$includeHidden) $query->where('is_hidden', false);
-                    $query->with('service');
-                },
-                'snapshots' => function ($query) use ($includeHidden) {
-                    if (!$includeHidden) $query->where('is_hidden', false);
-                },
-                'order'
-            ])->where('uuid', $uuid)->first();
+            $tour = Tour::where('uuid', $uuid)->first();
 
             if (!$tour) {
                 return response()->json([
@@ -211,21 +201,22 @@ class TourController extends Controller
 
             if ($tour->order_id) {
                 $this->consolidateToursForOrder($tour->order_id, $tour->id);
-                $tour->load([
-                    'files' => function ($query) use ($includeHidden) {
-                        if (!$includeHidden) $query->where('is_hidden', false);
-                        $query->with('service');
-                    },
-                    'links' => function ($query) use ($includeHidden) {
-                        if (!$includeHidden) $query->where('is_hidden', false);
-                        $query->with('service');
-                    },
-                    'snapshots' => function ($query) use ($includeHidden) {
-                        if (!$includeHidden) $query->where('is_hidden', false);
-                    },
-                    'order'
-                ]);
             }
+
+            $tour->loadMissing([
+                'files' => function ($query) use ($includeHidden) {
+                    if (!$includeHidden) $query->where('is_hidden', false);
+                    $query->with('service');
+                },
+                'links' => function ($query) use ($includeHidden) {
+                    if (!$includeHidden) $query->where('is_hidden', false);
+                    $query->with('service');
+                },
+                'snapshots' => function ($query) use ($includeHidden) {
+                    if (!$includeHidden) $query->where('is_hidden', false);
+                },
+                'order.services'
+            ]);
 
             // Organization isolation: verify tour belongs to current user's org (exempt super admins)
             $user = auth()->user();
@@ -302,6 +293,8 @@ class TourController extends Controller
 
     public function store(Request $request): JsonResponse
     {
+        @ini_set('max_execution_time', '300');
+        @set_time_limit(300);
         $validator = Validator::make($request->all(), [
             'order_id' => 'required|exists:orders,uuid',
             'is_publish' => 'nullable|boolean',
@@ -612,6 +605,10 @@ class TourController extends Controller
             ]);
         } catch (\Throwable $e) {
             DB::rollBack();
+            Log::error('Tour creation failed in store(): ' . $e->getMessage(), [
+                'exception' => $e->getTraceAsString(),
+                'payload' => $request->except(['files'])
+            ]);
 
             return response()->json([
                 'success' => false,
@@ -659,6 +656,8 @@ class TourController extends Controller
 
     public function update(Request $request, $uuid): JsonResponse
     {
+        @ini_set('max_execution_time', '300');
+        @set_time_limit(300);
         $validator = Validator::make($request->all(), [
             'order_id' => 'sometimes|exists:orders,uuid',
             'is_publish' => 'nullable|boolean',
@@ -1072,6 +1071,10 @@ class TourController extends Controller
             ]);
         } catch (\Throwable $e) {
             DB::rollBack();
+            Log::error('Tour update failed in update(): ' . $e->getMessage(), [
+                'tour_uuid' => $uuid,
+                'exception' => $e->getTraceAsString(),
+            ]);
 
             return response()->json([
                 'success' => false,
@@ -1406,9 +1409,12 @@ class TourController extends Controller
 
     public function getByOrder(Request $request, $orderUuid)
     {
+        @ini_set('max_execution_time', '300');
+        @set_time_limit(300);
+
         try {
             $includeHidden = $request->boolean('include_hidden');
-            $order = Order::where('uuid', $orderUuid)->firstOrFail();
+            $order = Order::with('services')->where('uuid', $orderUuid)->firstOrFail();
 
             // Consolidate any duplicate tours for this order
             $this->consolidateToursForOrder($order->id);

@@ -1243,19 +1243,24 @@ class NotificationService
      * Determine the target media quantity for a given service in a tour's order.
      * Floor plans and Matterport link services with no quantity default to at least 1.
      */
-    public static function getTargetQuantityForService($tour, $service): int
+    /**
+     * Resolve the target quantity and corresponding OrderService for a given service on a tour.
+     * Returns [int $targetQuantity, ?OrderService $orderService].
+     * If the option has no quantity (e.g. Floor Plans, Video, 3D Tour), returns 0.
+     */
+    public static function getTargetQuantityAndOrderService($tour, $service): array
     {
         if (!$tour) {
-            return 1;
+            return [0, null];
         }
 
         $order = $tour->relationLoaded('orders') ? $tour->orders : ($tour->relationLoaded('order') ? $tour->order : ($tour->orders()->first() ?: $tour->order()->first()));
         if (!$order && !empty($tour->order_id)) {
-            $order = \App\Models\Order::find($tour->order_id);
+            $order = \App\Models\Order::withoutGlobalScopes()->find($tour->order_id);
         }
 
         if (!$order) {
-            return 1;
+            return [0, null];
         }
 
         $serviceId = null;
@@ -1267,54 +1272,86 @@ class NotificationService
             $serviceId = \App\Models\Service::where('uuid', $service)->value('id');
         }
 
-        // If no serviceId, check if it's a Matterport / 3D tour link service on the order
-        if (!$serviceId) {
-            $serviceId = \App\Models\OrderService::where('order_id', $order->id)
+        $serviceModel = ($service instanceof \App\Models\Service)
+            ? $service
+            : ($serviceId ? \App\Models\Service::with('category')->find($serviceId) : null);
+
+        // 1. Direct match on service_id
+        $orderService = null;
+        if ($serviceId) {
+            $orderService = \App\Models\OrderService::where('order_id', $order->id)
+                ->where('service_id', $serviceId)
+                ->with(['option', 'service.category'])
+                ->first();
+        }
+
+        // 2. Category match fallback (e.g. upload has Service 19, order has Service 20, both in HDR Photos category)
+        if (!$orderService && $serviceModel && $serviceModel->category_id) {
+            $orderService = \App\Models\OrderService::where('order_id', $order->id)
+                ->whereHas('service', function ($q) use ($serviceModel) {
+                    $q->where('category_id', $serviceModel->category_id);
+                })
+                ->with(['option', 'service.category'])
+                ->first();
+        }
+
+        // 3. Name match fallback for photo services
+        if (!$orderService && $serviceModel && preg_match('/photo|still|image/i', $serviceModel->name ?? '')) {
+            $orderService = \App\Models\OrderService::where('order_id', $order->id)
+                ->whereHas('service', function ($q) {
+                    $q->where('name', 'like', '%photo%')
+                      ->orWhere('name', 'like', '%still%')
+                      ->orWhere('name', 'like', '%hdr%');
+                })
+                ->with(['option', 'service.category'])
+                ->first();
+        }
+
+        // 4. Fallback for Matterport / 3D tours
+        if (!$orderService && (!$serviceId || ($serviceModel && preg_match('/matterport|3d\s*(tour|floor)|virtual\s*tour/i', $serviceModel->name ?? '')))) {
+            $orderService = \App\Models\OrderService::where('order_id', $order->id)
                 ->whereHas('service', function ($q) {
                     $q->where('name', 'like', '%matterport%')
                       ->orWhere('name', 'like', '%3d tour%')
                       ->orWhere('name', 'like', '%3d floor%')
                       ->orWhere('name', 'like', '%virtual tour%');
                 })
-                ->value('service_id');
+                ->with(['option', 'service.category'])
+                ->first();
         }
-
-        if (!$serviceId) {
-            return 1;
-        }
-
-        // Find the corresponding OrderService record for this service
-        $orderService = \App\Models\OrderService::where('order_id', $order->id)
-            ->where('service_id', $serviceId)
-            ->with('option')
-            ->first();
 
         if ($orderService) {
-            // 1. Check ProductOption quantity field
+            // Check ProductOption quantity field
             if ($orderService->option && isset($orderService->option->quantity) && (int) $orderService->option->quantity > 0) {
-                return max(1, (int) $orderService->option->quantity);
+                return [(int) $orderService->option->quantity, $orderService];
             }
 
-            // 2. Fallback: Parse quantity from ProductOption title (e.g. "30 Photos", "25 HDR Stills")
+            // Fallback: Parse quantity from ProductOption title (e.g. "40 Photos", "25 HDR Stills")
             if ($orderService->option && !empty($orderService->option->title)) {
                 if (preg_match('/\b(\d+)\s*(?:photo|still|image|picture|file|link|cop)/i', $orderService->option->title, $matches)) {
-                    return max(1, (int) $matches[1]);
+                    return [(int) $matches[1], $orderService];
                 }
             }
 
-            // 3. Fallback: Check if custom field has quantity
+            // Fallback: Check if custom field has quantity
             if (!empty($orderService->custom)) {
                 if (is_numeric($orderService->custom) && (int) $orderService->custom > 0) {
-                    return max(1, (int) $orderService->custom);
+                    return [(int) $orderService->custom, $orderService];
                 }
                 if (is_string($orderService->custom) && preg_match('/\b(\d+)\s*(?:photo|still|image|picture|file|link|cop)/i', $orderService->custom, $matches)) {
-                    return max(1, (int) $matches[1]);
+                    return [(int) $matches[1], $orderService];
                 }
             }
         }
 
-        // Floor plans, Matterport links, or services with no quantity specified default to at least 1
-        return 1;
+        // Services or options with no quantity specified default to 0
+        return [0, $orderService];
+    }
+
+    public static function getTargetQuantityForService($tour, $service): int
+    {
+        list($quantity) = self::getTargetQuantityAndOrderService($tour, $service);
+        return $quantity;
     }
 
     /**
@@ -1330,7 +1367,7 @@ class NotificationService
     public static function checkMediaQuantityThreshold($tour, $service, int $newlyApprovedCount, string $mediaType = 'file'): array
     {
         if (!$tour || $newlyApprovedCount <= 0) {
-            return [false, 1, 0];
+            return [false, 0, 0];
         }
 
         $serviceId = null;
@@ -1342,26 +1379,36 @@ class NotificationService
             $serviceId = \App\Models\Service::where('uuid', $service)->value('id');
         }
 
-        $targetQuantity = max(1, self::getTargetQuantityForService($tour, $service ?: $serviceId));
+        list($targetQuantity, $matchedOrderService) = self::getTargetQuantityAndOrderService($tour, $service ?: $serviceId);
+
+        // Collect all related service IDs (both upload service_id and matched order service_id)
+        $serviceIds = array_unique(array_filter([$serviceId, $matchedOrderService?->service_id]));
 
         if ($mediaType === 'link') {
             $query = \App\Models\TourLink::where('tour_id', $tour->id)->where('is_admin_approved', true);
-            if ($serviceId) {
-                $query->where('service_id', $serviceId);
+            if (!empty($serviceIds)) {
+                $query->whereIn('service_id', $serviceIds);
             }
             $currentApprovedCount = $query->count();
         } else {
             $query = \App\Models\TourFile::where('tour_id', $tour->id)->where('is_admin_approved', true);
-            if ($serviceId) {
-                $query->where('service_id', $serviceId);
+            if (!empty($serviceIds)) {
+                $query->whereIn('service_id', $serviceIds);
             }
             $currentApprovedCount = $query->count();
         }
 
         $previousApprovedCount = max(0, $currentApprovedCount - $newlyApprovedCount);
 
-        // Notify when the approved count reaches or crosses the target quantity
-        $shouldNotify = ($previousApprovedCount < $targetQuantity) && ($currentApprovedCount >= $targetQuantity);
+        // For services/options with no quantity set (targetQuantity == 0, e.g. Floor Plans, Virtual Tours, Video):
+        // Send email when media is uploaded
+        if ($targetQuantity <= 0) {
+            $shouldNotify = $newlyApprovedCount > 0;
+        } else {
+            // For services with a specific quantity set (e.g. 40 photos):
+            // Only send email when the approved media count reaches or crosses the target quantity
+            $shouldNotify = ($previousApprovedCount < $targetQuantity) && ($currentApprovedCount >= $targetQuantity);
+        }
 
         return [$shouldNotify, $targetQuantity, $currentApprovedCount];
     }
@@ -1374,7 +1421,12 @@ class NotificationService
         if (!$tour) return;
 
         $order = $tour->relationLoaded('orders') ? $tour->orders : ($tour->relationLoaded('order') ? $tour->order : ($tour->orders()->first() ?: $tour->order()->first()));
-        if (!$order || !$order->agent) return;
+        if (!$order && !empty($tour->order_id)) {
+            $order = \App\Models\Order::withoutGlobalScopes()->find($tour->order_id);
+        }
+        if (!$order) return;
+        $order->loadMissing(['agent', 'property']);
+        if (!$order->agent) return;
 
         $serviceName = $service ? $service->name : 'Media';
         $serviceUuid = $service?->uuid ?? null;

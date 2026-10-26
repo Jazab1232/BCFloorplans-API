@@ -54,7 +54,7 @@ return [
         'recipients' => ['admin', 'agent', 'vendor'],
         'defaults' => [
             'admin' => true,
-            'agent' => false,
+            'agent' => true,
             'vendor' => true,
         ],
         'variables' => ['order_id', 'property_address', 'service_name'],
