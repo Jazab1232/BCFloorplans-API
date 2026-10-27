@@ -397,7 +397,9 @@ class TaxCalculationService
             if (isset($item['gst_enabled']) || isset($item['pst_enabled'])) {
                 $gstEnabled = (bool)($item['gst_enabled'] ?? true);
                 $pstEnabled = (bool)($item['pst_enabled'] ?? false);
-            } elseif (!empty($item['is_package_discount']) || (isset($item['description']) && str_starts_with($item['description'], 'Package Discount'))) {
+            } elseif (!empty($item['is_package_discount']) 
+                || !empty($item['is_agent_discount']) 
+                || (isset($item['description']) && (str_starts_with($item['description'], 'Package Discount') || str_starts_with($item['description'], 'Agent Discount')))) {
                 $gstEnabled = true;
                 $pstEnabled = true;
             } else {

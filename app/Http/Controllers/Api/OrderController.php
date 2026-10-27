@@ -316,8 +316,10 @@ class OrderController extends Controller
             }
 
             // Save agent discount snapshot (object or array)
-            if ($request->has('agent_discount')) {
+            if ($request->has('agent_discount') && !empty($request->agent_discount)) {
                 $meta['agent_discount'] = $request->agent_discount;
+            } elseif ($agent && !empty($agent->agent_discount)) {
+                $meta['agent_discount'] = $agent->agent_discount;
             }
 
             // Note: Package info will be added after package detection
@@ -457,18 +459,48 @@ class OrderController extends Controller
             
             $discountDetails = [];
             
-            // Add package discount first (if applicable)
-            if ($bestPackage) {
+            // Check and resolve Agent Discount (if applicable)
+            $agentDiscountInput = $request->input('agent_discount') ?? ($agent->agent_discount ?? null);
+            $agentDiscount = $this->resolveAgentDiscount($agent, $agentDiscountInput, $totalAmount);
+
+            // Option B: Pick Maximum / Best Single Discount between Package and Agent Discount
+            $applyPackage = false;
+            $applyAgent = false;
+            $rawPkgVal = $bestPackage ? (float)$packageDiscountAmount : 0;
+            $rawAgentVal = $agentDiscount ? (float)$agentDiscount['discount_value'] : 0;
+
+            if ($rawPkgVal > 0 && $rawAgentVal > 0) {
+                if ($rawAgentVal >= $rawPkgVal) {
+                    $applyAgent = true;
+                    Log::info('Option B Selection: Agent discount selected over package discount (best single discount)', [
+                        'agent_discount' => $rawAgentVal,
+                        'package_discount' => $rawPkgVal,
+                    ]);
+                } else {
+                    $applyPackage = true;
+                    Log::info('Option B Selection: Package discount selected over agent discount (best single discount)', [
+                        'package_discount' => $rawPkgVal,
+                        'agent_discount' => $rawAgentVal,
+                    ]);
+                }
+            } elseif ($rawPkgVal > 0) {
+                $applyPackage = true;
+            } elseif ($rawAgentVal > 0) {
+                $applyAgent = true;
+            }
+
+            // Add package discount first (if applicable and selected under Option B)
+            if ($applyPackage && $bestPackage) {
                 $discountDetails[] = [
                     'model' => null,
                     'type' => 'package',
-                    'value' => $packageDiscountAmount,
+                    'value' => $rawPkgVal,
                     'service_id' => null,
                     'package' => $bestPackage,
                 ];
                 
                 Log::info('Package discount added to processing queue', [
-                    'package_discount_amount' => $packageDiscountAmount,
+                    'package_discount_amount' => $rawPkgVal,
                     'package_name' => $bestPackage->name,
                 ]);
             }
@@ -492,6 +524,32 @@ class OrderController extends Controller
                         'service_id' => $discSvc?->id,
                     ];
                 }
+            }
+
+            // Add Agent Discount (if applicable and selected under Option B)
+            if ($applyAgent && $agentDiscount) {
+                $discountDetails[] = [
+                    'model' => null,
+                    'type' => 'agent',
+                    'value' => $agentDiscount['discount_value'],
+                    'rate' => $agentDiscount['amount'],
+                    'service_id' => null,
+                    'name' => $agentDiscount['name'],
+                    'data' => $agentDiscount['data'],
+                ];
+
+                $currentMeta = $order->meta ?? [];
+                $currentMeta['agent_discount'] = array_merge($agentDiscount['data'], [
+                    'calculated_discount_amount' => $agentDiscount['discount_value']
+                ]);
+                $order->update(['meta' => $currentMeta]);
+
+                Log::info('✅ AGENT DISCOUNT APPLIED (STORE)', [
+                    'agent_id' => $agent->id,
+                    'discount_name' => $agentDiscount['name'],
+                    'discount_amount' => $agentDiscount['discount_value'],
+                    'is_percentage' => $agentDiscount['is_percentage'],
+                ]);
             }
 
             // Calculate totals with discounts
@@ -522,11 +580,11 @@ class OrderController extends Controller
                 }
             }
 
-            // Then apply order-wide discounts (including package)
+            // Then apply order-wide discounts (including package and agent)
             foreach ($discountDetails as $discount) {
                 if (!$discount['service_id']) {
-                    // Package discount is already calculated, others need calculation
-                    if ($discount['type'] === 'package') {
+                    // Package and agent discounts are already calculated, others need calculation
+                    if ($discount['type'] === 'package' || $discount['type'] === 'agent') {
                         $discountValue = $discount['value']; // Already calculated
                     } else {
                         $discountValue = $this->calculateDiscountValue($totalAmount, $discount['value'], $discount['type']);
@@ -539,7 +597,7 @@ class OrderController extends Controller
                         'discount_id' => $discount['model']->id ?? null,
                         'amount' => -$discountValue,
                         'discount_type' => $discount['type'] ?? null,
-                        'discount_value' => $discount['value'] ?? null,
+                        'discount_value' => $discount['rate'] ?? ($discount['value'] ?? null),
                         'sort_order' => $discount['type'] === 'package' ? 0 : 1,
                     ];
 
@@ -751,8 +809,73 @@ class OrderController extends Controller
             'code' => $value,    // Fixed amount discount
             'manual' => $amount * ($value / 100), // Percentage discount
             'package' => $value, // Package discount is already calculated
+            'agent' => $value,   // Agent discount is already calculated
             default => 0,
         };
+    }
+
+    /**
+     * Resolve and validate agent discount eligibility for an order
+     */
+    private function resolveAgentDiscount(?Agent $agent, ?array $agentDiscountInput, float $subtotal): ?array
+    {
+        $discountData = $agentDiscountInput;
+        if (empty($discountData) && $agent && !empty($agent->agent_discount)) {
+            $discountData = $agent->agent_discount;
+        }
+
+        if (empty($discountData)) {
+            return null;
+        }
+
+        // Must be active
+        $isActive = filter_var($discountData['is_active'] ?? true, FILTER_VALIDATE_BOOLEAN);
+        if (!$isActive) {
+            return null;
+        }
+
+        // Check expiry date
+        if (!empty($discountData['expiry_date'])) {
+            $expiry = \Carbon\Carbon::parse($discountData['expiry_date'])->endOfDay();
+            if ($expiry->isPast()) {
+                return null;
+            }
+        }
+
+        // Check minimum orders if specified
+        if (!empty($discountData['minimum_orders']) && (int)$discountData['minimum_orders'] > 0) {
+            $orderCount = $agent ? $agent->orders()->count() : 0;
+            if ($orderCount < (int)$discountData['minimum_orders']) {
+                return null;
+            }
+        }
+
+        // Check minimum spend if specified
+        if (!empty($discountData['minimum_spend']) && (float)$discountData['minimum_spend'] > 0) {
+            if ($subtotal < (float)$discountData['minimum_spend']) {
+                return null;
+            }
+        }
+
+        $amount = (float)($discountData['amount'] ?? 0);
+        if ($amount <= 0) {
+            return null;
+        }
+
+        $isPercentage = filter_var($discountData['is_percentage'] ?? true, FILTER_VALIDATE_BOOLEAN);
+        $discountValue = $isPercentage ? round($subtotal * ($amount / 100), 2) : min($subtotal, round($amount, 2));
+
+        if ($discountValue <= 0) {
+            return null;
+        }
+
+        return [
+            'name' => $discountData['name'] ?? 'Agent Discount',
+            'amount' => $amount,
+            'is_percentage' => $isPercentage,
+            'discount_value' => $discountValue,
+            'data' => $discountData,
+        ];
     }
 
 
@@ -2122,33 +2245,56 @@ private function recalculateTotals($order, array $discounts, array $serviceAmoun
                 $order->meta = $currentMeta;
                 $order->save();
             }
-            
-            $orderTotals[] = [
-                'uuid' => (string) Str::uuid(),
-                'order_id' => $order->id,
-                'discount_id' => null,
-                'amount' => -$packageDiscountAmount,
-                'discount_type' => 'package',
-                'discount_value' => $packageDiscountAmount,
-                'sort_order' => 0,
-                'order_service_id' => null,
-            ];
-            
-            $discountAmount += $packageDiscountAmount;
-        } else {
-            Log::warning("❌ PACKAGE DISCOUNT SKIPPED (RECALCULATE)", [
+        }
+    }
+
+    // Check Agent Discount eligibility
+    $agentDiscountInput = $order->meta['agent_discount'] ?? null;
+    $agent = $order->agent ?? Agent::find($order->agent_id);
+    $agentDiscount = $this->resolveAgentDiscount($agent, $agentDiscountInput, $totalAmount);
+
+    // Option B: Pick Maximum / Best Single Discount between Package and Agent Discount
+    $rawPkgVal = (float)$packageDiscountAmount;
+    $rawAgentVal = $agentDiscount ? (float)$agentDiscount['discount_value'] : 0;
+
+    $applyPackage = false;
+    $applyAgent = false;
+
+    if ($rawPkgVal > 0 && $rawAgentVal > 0) {
+        if ($rawAgentVal >= $rawPkgVal) {
+            $applyAgent = true;
+            Log::info("Option B Selection (RECALCULATE): Agent discount selected over package discount", [
                 'order_uuid' => $order->uuid,
-                'package_id' => $packageInfo['package_id'],
-                'package_found' => !is_null($package),
-                'package_active' => $package ? $package->status : null,
-                'reason' => !$package ? 'Package not found' : 'Package inactive'
+                'agent_discount' => $rawAgentVal,
+                'package_discount' => $rawPkgVal,
+            ]);
+        } else {
+            $applyPackage = true;
+            Log::info("Option B Selection (RECALCULATE): Package discount selected over agent discount", [
+                'order_uuid' => $order->uuid,
+                'package_discount' => $rawPkgVal,
+                'agent_discount' => $rawAgentVal,
             ]);
         }
-    } else {
-        Log::info("ℹ️ NO PACKAGE IN META (RECALCULATE)", [
-            'order_uuid' => $order->uuid,
-            'order_meta' => $order->meta
-        ]);
+    } elseif ($rawPkgVal > 0) {
+        $applyPackage = true;
+    } elseif ($rawAgentVal > 0) {
+        $applyAgent = true;
+    }
+
+    if ($applyPackage && $rawPkgVal > 0) {
+        $orderTotals[] = [
+            'uuid' => (string) Str::uuid(),
+            'order_id' => $order->id,
+            'discount_id' => null,
+            'amount' => -$rawPkgVal,
+            'discount_type' => 'package',
+            'discount_value' => $rawPkgVal,
+            'sort_order' => 0,
+            'order_service_id' => null,
+        ];
+        
+        $discountAmount += $rawPkgVal;
     }
 
     foreach ($discounts as $discount) {
@@ -2172,6 +2318,36 @@ private function recalculateTotals($order, array $discounts, array $serviceAmoun
             'sort_order' => 1,
             'order_service_id' => null,
         ];
+    }
+
+    if ($applyAgent && $agentDiscount) {
+        $agentVal = min($agentDiscount['discount_value'], max(0, $totalAmount - $discountAmount));
+        if ($agentVal > 0) {
+            $discountAmount += $agentVal;
+            $orderTotals[] = [
+                'uuid' => (string) Str::uuid(),
+                'order_id' => $order->id,
+                'discount_id' => null,
+                'amount' => -$agentVal,
+                'discount_type' => 'agent',
+                'discount_value' => $agentDiscount['amount'],
+                'sort_order' => 1,
+                'order_service_id' => null,
+            ];
+
+            $currentMeta = $order->meta ?? [];
+            $currentMeta['agent_discount'] = array_merge($agentDiscount['data'], [
+                'calculated_discount_amount' => $agentVal
+            ]);
+            $order->meta = $currentMeta;
+            $order->save();
+
+            Log::info("✅ AGENT DISCOUNT APPLIED (RECALCULATE)", [
+                'order_uuid' => $order->uuid,
+                'discount_name' => $agentDiscount['name'],
+                'discount_amount' => $agentVal,
+            ]);
+        }
     }
 
     $finalAmount = $totalAmount - $discountAmount;

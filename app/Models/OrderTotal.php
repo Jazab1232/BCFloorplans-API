@@ -52,6 +52,11 @@ class OrderTotal extends Model
         return $this->isDiscount() && $this->discount_type === 'quantity';
     }
 
+    public function isAgentDiscount(): bool
+    {
+        return $this->discount_type === 'agent';
+    }
+
     protected static function booted()
     {
         static::creating(function ($model) {

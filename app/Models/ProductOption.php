@@ -31,6 +31,8 @@ class ProductOption extends Model
 
     protected $casts = [
         'uuid' => 'string',
+        'amount' => 'decimal:2',
+        'min_price' => 'decimal:2',
         'sort_order' => 'integer',
         'vendor_price' => 'decimal:2',
         'vendor_sq_ft_rate' => 'decimal:4',

@@ -978,7 +978,7 @@ class ServiceController extends Controller
                         $existing->title = $optOverride['title'];
                     }
                     if (isset($optOverride['amount'])) {
-                        $existing->amount = $optOverride['amount'];
+                        $existing->amount = is_numeric($optOverride['amount']) ? (float) $optOverride['amount'] : $optOverride['amount'];
                     }
                     if (isset($optOverride['sort_order'])) {
                         $existing->sort_order = (int) $optOverride['sort_order'];
@@ -1034,7 +1034,7 @@ class ServiceController extends Controller
                         'uuid' => $optUuid ?: Str::uuid()->toString(),
                         'service_id' => $service->id,
                         'title' => $optOverride['title'] ?? '',
-                        'amount' => $optOverride['amount'] ?? 0.00,
+                        'amount' => isset($optOverride['amount']) && is_numeric($optOverride['amount']) ? (float) $optOverride['amount'] : ($optOverride['amount'] ?? 0.00),
                         'sort_order' => (int) ($optOverride['sort_order'] ?? ($idx + 1)),
                         'quantity' => $optOverride['quantity'] ?? null,
                         'sq_ft_range' => $optOverride['sq_ft_range'] ?? null,

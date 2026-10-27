@@ -411,6 +411,72 @@ class Invoice extends Model
         ];
     }
 
+    /**
+     * Resolve agent discount for the given services being invoiced on an order.
+     */
+    public static function resolveAgentDiscountForInvoice(Order $order, $services, float $multiplier = 1.0): ?array
+    {
+        $discountData = $order->meta['agent_discount'] ?? null;
+        if (empty($discountData) && $order->agent && !empty($order->agent->agent_discount)) {
+            $discountData = $order->agent->agent_discount;
+        }
+
+        if (empty($discountData)) {
+            return null;
+        }
+
+        $isActive = filter_var($discountData['is_active'] ?? true, FILTER_VALIDATE_BOOLEAN);
+        if (!$isActive) {
+            return null;
+        }
+
+        $amount = (float)($discountData['amount'] ?? 0);
+        if ($amount <= 0) {
+            return null;
+        }
+
+        $isPercentage = filter_var($discountData['is_percentage'] ?? true, FILTER_VALIDATE_BOOLEAN);
+
+        $servicesCollection = collect($services);
+        $currentServicesTotal = (float) $servicesCollection->sum(fn($os) => (float)$os->amount);
+        if ($currentServicesTotal <= 0) {
+            return null;
+        }
+
+        $discountAmount = 0.0;
+        if ($isPercentage) {
+            $discountAmount = round(($currentServicesTotal * ($amount / 100)) * $multiplier, 2);
+        } else {
+            $order->loadMissing('services');
+            $totalOrderAmount = (float) $order->services->sum(fn($os) => (float)$os->amount);
+            $ratio = $totalOrderAmount > 0 ? ($currentServicesTotal / $totalOrderAmount) : 0;
+            $fullDiscount = (float)($discountData['calculated_discount_amount'] ?? $amount);
+            $discountAmount = round($fullDiscount * $ratio * $multiplier, 2);
+        }
+
+        if ($discountAmount <= 0) {
+            return null;
+        }
+
+        $discountName = $discountData['name'] ?? 'Agent Discount';
+        $desc = "Agent Discount: {$discountName}";
+        if ($isPercentage) {
+            $desc .= " ({$amount}%)";
+        } else {
+            $desc .= " (\${$amount} OFF)";
+        }
+        if ($multiplier < 1) {
+            $desc .= " (" . round($multiplier * 100, 1) . "%)";
+        }
+
+        return [
+            'name' => $discountName,
+            'amount' => -abs($discountAmount),
+            'description' => $desc,
+            'is_percentage' => $isPercentage,
+        ];
+    }
+
     public static function createInvoice($order, $agent, $services, $taxInfo, $multiplier, $note, $splitDetails = null, $agentType = 'primary', $targetAgentId = null)
     {
         $province = 'BC';
@@ -449,6 +515,18 @@ class Invoice extends Model
             ];
         }
 
+        $agentDisc = static::resolveAgentDiscountForInvoice($order, $services, $multiplier);
+        if ($agentDisc) {
+            $preparedItems[] = [
+                'order_service' => (collect($services)->count() === 1 ? collect($services)->first() : null),
+                'service' => null,
+                'amount' => $agentDisc['amount'],
+                'description' => $agentDisc['description'],
+                'is_taxable' => true,
+                'is_agent_discount' => true,
+            ];
+        }
+
         $country = $order->property->country ?? 'CA';
         $taxCalc = \App\Services\TaxCalculationService::calculateTaxes(
             $order->organization_id,
@@ -463,6 +541,7 @@ class Invoice extends Model
             $itemTax = $calcItem['tax_amount'] ?? 0.0;
             $os = $prep['order_service'];
             $isPkgDisc = !empty($prep['is_package_discount']);
+            $isAgentDisc = !empty($prep['is_agent_discount']);
 
             $items[] = [
                 'order_service_id' => $os?->id,
@@ -473,8 +552,8 @@ class Invoice extends Model
                 'tax_amount' => $itemTax,
                 'gst_amount' => $calcItem['gst_amount'] ?? ($calcItem['tax_breakdown']['GST'] ?? 0.0),
                 'pst_amount' => $calcItem['pst_amount'] ?? ($calcItem['tax_breakdown']['PST'] ?? 0.0),
-                'is_extra' => $isPkgDisc,
-                'meta' => $isPkgDisc ? ['type' => 'package_discount', 'package_id' => $prep['package_id']] : null,
+                'is_extra' => $isPkgDisc || $isAgentDisc,
+                'meta' => $isPkgDisc ? ['type' => 'package_discount', 'package_id' => $prep['package_id']] : ($isAgentDisc ? ['type' => 'agent_discount'] : null),
             ];
         }
 
@@ -897,6 +976,46 @@ class Invoice extends Model
                     $hasChanged = true;
                 }
 
+                // 5. Sync agent discount item on consolidated invoice using all order services
+                $agentDiscount = static::resolveAgentDiscountForInvoice($order, $allOrderServices, $multiplier);
+                $existingAgentItem = $invoice->items
+                    ->filter(function($i) {
+                        return ($i->meta['type'] ?? null) === 'agent_discount' || str_starts_with($i->description ?? '', 'Agent Discount');
+                    })
+                    ->first();
+
+                if ($agentDiscount) {
+                    $expectedDiscountAmt = (float)$agentDiscount['amount'];
+                    $expectedDiscountDesc = $agentDiscount['description'];
+
+                    if ($existingAgentItem) {
+                        if ((float)$existingAgentItem->amount != $expectedDiscountAmt || (float)$existingAgentItem->unit_price != $expectedDiscountAmt || $existingAgentItem->description != $expectedDiscountDesc) {
+                            $existingAgentItem->update([
+                                'unit_price' => $expectedDiscountAmt,
+                                'amount' => $expectedDiscountAmt,
+                                'description' => $expectedDiscountDesc,
+                                'is_extra' => true,
+                                'meta' => ['type' => 'agent_discount'],
+                            ]);
+                            $hasChanged = true;
+                        }
+                    } else {
+                        $invoice->items()->create([
+                            'order_service_id' => null,
+                            'description' => $expectedDiscountDesc,
+                            'quantity' => 1,
+                            'unit_price' => $expectedDiscountAmt,
+                            'amount' => $expectedDiscountAmt,
+                            'is_extra' => true,
+                            'meta' => ['type' => 'agent_discount'],
+                        ]);
+                        $hasChanged = true;
+                    }
+                } elseif ($existingAgentItem) {
+                    $existingAgentItem->delete();
+                    $hasChanged = true;
+                }
+
                 if ($hasChanged) {
                     $invoice->recalculateTotals();
                 }
@@ -990,6 +1109,46 @@ class Invoice extends Model
                     }
                 } elseif ($existingPackageItem) {
                     $existingPackageItem->delete();
+                    $serviceInvoiceChanged = true;
+                }
+
+                // Sync agent discount item on service-specific invoice
+                $agentDiscount = static::resolveAgentDiscountForInvoice($order, collect([$os]), $multiplier);
+                $existingAgentItem = $invoice->items
+                    ->filter(function($i) {
+                        return ($i->meta['type'] ?? null) === 'agent_discount' || str_starts_with($i->description ?? '', 'Agent Discount');
+                    })
+                    ->first();
+
+                if ($agentDiscount) {
+                    $expectedDiscountAmt = (float)$agentDiscount['amount'];
+                    $expectedDiscountDesc = $agentDiscount['description'];
+
+                    if ($existingAgentItem) {
+                        if ((float)$existingAgentItem->amount != $expectedDiscountAmt || (float)$existingAgentItem->unit_price != $expectedDiscountAmt || $existingAgentItem->description != $expectedDiscountDesc) {
+                            $existingAgentItem->update([
+                                'unit_price' => $expectedDiscountAmt,
+                                'amount' => $expectedDiscountAmt,
+                                'description' => $expectedDiscountDesc,
+                                'is_extra' => true,
+                                'meta' => ['type' => 'agent_discount'],
+                            ]);
+                            $serviceInvoiceChanged = true;
+                        }
+                    } else {
+                        $invoice->items()->create([
+                            'order_service_id' => $os->id,
+                            'description' => $expectedDiscountDesc,
+                            'quantity' => 1,
+                            'unit_price' => $expectedDiscountAmt,
+                            'amount' => $expectedDiscountAmt,
+                            'is_extra' => true,
+                            'meta' => ['type' => 'agent_discount'],
+                        ]);
+                        $serviceInvoiceChanged = true;
+                    }
+                } elseif ($existingAgentItem) {
+                    $existingAgentItem->delete();
                     $serviceInvoiceChanged = true;
                 }
 
