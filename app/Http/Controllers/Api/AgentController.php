@@ -103,6 +103,9 @@ class AgentController extends Controller
                 'agent_discount.is_percentage' => 'required_with:agent_discount|boolean',
                 'agent_discount.minimum_orders' => 'nullable|integer|min:0',
                 'agent_discount.minimum_spend' => 'nullable|numeric|min:0',
+
+                'tour_settings' => 'nullable|array',
+                'tour_appearance' => 'nullable|array',
             ]);
 
             if ($validator->fails()) {
@@ -236,6 +239,9 @@ class AgentController extends Controller
                     'message' => 'Agent not found'
                 ], 404);
             }
+            $agent->effective_tour_settings = $agent->getEffectiveTourSettings();
+            $agent->effective_tour_appearance = $agent->getEffectiveTourAppearance();
+
             return response()->json([
                 'status' => true,
                 'message' => 'Agent retrieved successfully',
@@ -311,6 +317,9 @@ class AgentController extends Controller
                 'agent_discount.is_percentage' => 'required_with:agent_discount|boolean',
                 'agent_discount.minimum_orders' => 'nullable|integer|min:0',
                 'agent_discount.minimum_spend' => 'nullable|numeric|min:0',
+
+                'tour_settings' => 'nullable|array',
+                'tour_appearance' => 'nullable|array',
             ]);
 
             if ($validator->fails()) {
@@ -748,4 +757,168 @@ class AgentController extends Controller
         ], 500);
     }
 }
+
+    /**
+     * Resolve the target agent for settings (authenticated agent, or UUID for admin)
+     */
+    protected function resolveTargetAgent(?string $uuid = null): ?Agent
+    {
+        $user = auth()->user();
+        if ($uuid) {
+            $agent = Agent::where('uuid', $uuid)->first();
+            if ($agent) return $agent;
+        }
+        if ($user instanceof Agent) {
+            return $user;
+        }
+        if ($user instanceof \App\Models\SubAccount && $user->agent) {
+            return $user->agent;
+        }
+        return null;
+    }
+
+    /**
+     * GET agent default tour settings (with hierarchy: Agent -> Org -> Global)
+     */
+    public function getTourSettings(Request $request, ?string $uuid = null): JsonResponse
+    {
+        $agent = $this->resolveTargetAgent($uuid);
+        if (!$agent) {
+            return response()->json(['status' => false, 'message' => 'Agent not found'], 404);
+        }
+
+        $settingsService = app(\App\Services\SettingsService::class);
+        $orgUuid = $agent->organization?->uuid;
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Agent tour settings retrieved successfully',
+            'data' => [
+                'agent_uuid' => $agent->uuid,
+                'tour_settings' => $agent->tour_settings,
+                'effective_tour_settings' => $settingsService->getEffectiveTourSettings($orgUuid, $agent->uuid),
+                'org_defaults' => $settingsService->getEffectiveTourSettings($orgUuid, null),
+            ]
+        ]);
+    }
+
+    /**
+     * PUT/POST agent default tour settings
+     */
+    public function updateTourSettings(Request $request, ?string $uuid = null): JsonResponse
+    {
+        $agent = $this->resolveTargetAgent($uuid);
+        if (!$agent) {
+            return response()->json(['status' => false, 'message' => 'Agent not found'], 404);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'tour_settings' => 'sometimes|array',
+            'music_enabled' => 'sometimes|boolean',
+            'default_song' => 'nullable|string',
+            'default_audio_uuid' => 'nullable|string',
+            'transition_effect' => 'sometimes|array',
+            'layout_option' => 'sometimes|string',
+            'video_slideshow_enabled' => 'sometimes|boolean',
+            'letterbox_correction' => 'sometimes|boolean',
+            'aspect_ratio' => 'sometimes|string',
+            'autoplay_enabled' => 'sometimes|boolean',
+            'allow_print_download' => 'sometimes|boolean',
+            'allow_client_upload' => 'sometimes|boolean',
+            'require_payment_before_download' => 'sometimes|boolean',
+            'always_enable_sorting' => 'sometimes|boolean',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json(['status' => false, 'message' => 'Validation error', 'errors' => $validator->errors()], 422);
+        }
+
+        $payload = $request->input('tour_settings') ?: $request->all();
+        $settingsService = app(\App\Services\SettingsService::class);
+        $settingsService->setAgentTourSettings($agent->uuid, $payload);
+        $agent->refresh();
+
+        $orgUuid = $agent->organization?->uuid;
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Agent tour settings updated successfully',
+            'data' => [
+                'agent_uuid' => $agent->uuid,
+                'tour_settings' => $agent->tour_settings,
+                'effective_tour_settings' => $settingsService->getEffectiveTourSettings($orgUuid, $agent->uuid),
+            ]
+        ]);
+    }
+
+    /**
+     * GET agent tour appearance (with hierarchy: Agent -> Org -> Global)
+     */
+    public function getTourAppearance(Request $request, ?string $uuid = null): JsonResponse
+    {
+        $agent = $this->resolveTargetAgent($uuid);
+        if (!$agent) {
+            return response()->json(['status' => false, 'message' => 'Agent not found'], 404);
+        }
+
+        $settingsService = app(\App\Services\SettingsService::class);
+        $orgUuid = $agent->organization?->uuid;
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Agent tour appearance retrieved successfully',
+            'data' => [
+                'agent_uuid' => $agent->uuid,
+                'tour_appearance' => $agent->tour_appearance,
+                'effective_tour_appearance' => $settingsService->getEffectiveTourAppearance($orgUuid, $agent->uuid),
+                'org_defaults' => $settingsService->getEffectiveTourAppearance($orgUuid, null),
+            ]
+        ]);
+    }
+
+    /**
+     * PUT/POST agent tour appearance
+     */
+    public function updateTourAppearance(Request $request, ?string $uuid = null): JsonResponse
+    {
+        $agent = $this->resolveTargetAgent($uuid);
+        if (!$agent) {
+            return response()->json(['status' => false, 'message' => 'Agent not found'], 404);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'tour_appearance' => 'sometimes|array',
+            'pageBg' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+            'pageText' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+            'sidebarBg' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+            'sidebarText' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+            'sidebarHoverBg' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+            'sidebarHoverText' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+            'activeColor' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+            'pageTabColor' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+            'logo' => 'nullable|string',
+            'logoWidth' => 'nullable|string',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json(['status' => false, 'message' => 'Validation error', 'errors' => $validator->errors()], 422);
+        }
+
+        $payload = $request->input('tour_appearance') ?: $request->all();
+        $settingsService = app(\App\Services\SettingsService::class);
+        $settingsService->setAgentTourAppearance($agent->uuid, $payload);
+        $agent->refresh();
+
+        $orgUuid = $agent->organization?->uuid;
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Agent tour appearance updated successfully',
+            'data' => [
+                'agent_uuid' => $agent->uuid,
+                'tour_appearance' => $agent->tour_appearance,
+                'effective_tour_appearance' => $settingsService->getEffectiveTourAppearance($orgUuid, $agent->uuid),
+            ]
+        ]);
+    }
 }

@@ -111,6 +111,7 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api
     Route::post('orders/send-to-client', [OrderController::class, 'sendMediaToClient']);
 
     Route::get('/settings/{key}', [SettingsController::class, 'show']);
+    Route::post('/settings/{key}', [SettingsController::class, 'update']);
     Route::get('/matterport', [TourController::class, 'getMatterPortData']);
     Route::post('/matterport/{uuid}/renew', [TourController::class, 'renewMatterPort']);
     Route::post('/matterport/{uuid}/send-reminder', [TourController::class, 'sendRenewalReminder']);
@@ -480,6 +481,17 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api", "resolve
 
     // Agent self-management
     Route::match(['post', 'put', 'patch'], 'agents/{uuid}', [AgentController::class, 'update']);
+
+    // Agent Default Tour Settings & Appearance
+    Route::get('agent/tour-settings', [AgentController::class, 'getTourSettings']);
+    Route::match(['post', 'put', 'patch'], 'agent/tour-settings', [AgentController::class, 'updateTourSettings']);
+    Route::get('agent/tour-appearance', [AgentController::class, 'getTourAppearance']);
+    Route::match(['post', 'put', 'patch'], 'agent/tour-appearance', [AgentController::class, 'updateTourAppearance']);
+
+    Route::get('agents/{uuid}/tour-settings', [AgentController::class, 'getTourSettings']);
+    Route::match(['post', 'put', 'patch'], 'agents/{uuid}/tour-settings', [AgentController::class, 'updateTourSettings']);
+    Route::get('agents/{uuid}/tour-appearance', [AgentController::class, 'getTourAppearance']);
+    Route::match(['post', 'put', 'patch'], 'agents/{uuid}/tour-appearance', [AgentController::class, 'updateTourAppearance']);
 
     // Tour management for agents
     // Route::post('tours', [TourController::class, 'store']);

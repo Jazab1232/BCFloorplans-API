@@ -277,6 +277,13 @@ class TourController extends Controller
                 }
             }
 
+            $order = $tour->order ?? $tour->orders;
+            $settingsService = app(\App\Services\SettingsService::class);
+            $agentUuid = $order?->agent?->uuid;
+            $orgUuid = $order?->organization?->uuid ?? $order?->agent?->organization?->uuid;
+            $tour->effective_tour_appearance = $settingsService->getEffectiveTourAppearance($orgUuid, $agentUuid);
+            $tour->effective_tour_settings = $settingsService->getEffectiveTourSettings($orgUuid, $agentUuid);
+
             return response()->json([
                 'success' => true,
                 'data' => $tour,
@@ -373,10 +380,25 @@ class TourController extends Controller
                 $tour->save();
             } else {
                 // Create tour
+                $effectiveSlideShow = $data['slide_show'] ?? ($request->input('slide_show') ?? null);
+                if (empty($effectiveSlideShow)) {
+                    $agent = $order->agent ?? ($order->agent_id ? \App\Models\Agent::find($order->agent_id) : null);
+                    $orgUuid = $order->organization?->uuid ?? $agent?->organization?->uuid;
+                    $effectiveDefaults = app(\App\Services\SettingsService::class)->getEffectiveTourSettings($orgUuid, $agent?->uuid);
+                    $effectiveSlideShow = [
+                        'slide_delay' => 4000,
+                        'transitions' => $effectiveDefaults['transition_effect'][0] ?? 'fade-in',
+                        'background_audio' => (!empty($effectiveDefaults['default_audio_uuid'])) ? $effectiveDefaults['default_audio_uuid'] : ((!empty($effectiveDefaults['default_song'])) ? $effectiveDefaults['default_song'] : 'none'),
+                        'auto_play' => $effectiveDefaults['autoplay_enabled'] ?? true,
+                        'video_overlay' => $effectiveDefaults['video_slideshow_enabled'] ?? true,
+                        'hero_type' => 'slideshow',
+                    ];
+                }
+
                 $tour = Tour::create([
                     'uuid' => Str::uuid()->toString(),
                     'order_id' => $order->id,
-                    'slide_show' => $data['slide_show'] ?? null,
+                    'slide_show' => $effectiveSlideShow,
                     'is_publish' => $data['is_publish'] ?? false,
                 ]);
             }
@@ -1108,7 +1130,9 @@ class TourController extends Controller
                     $query->where('is_hidden', false);
                 },
                 'orders.services.vendor',
-                'orders.property'
+                'orders.property',
+                'orders.agent.organization',
+                'orders.organization'
             ])
                 ->where('is_publish', true);
 
@@ -1173,6 +1197,13 @@ class TourController extends Controller
                         return $file;
                     });
                 }
+
+                $settingsService = app(\App\Services\SettingsService::class);
+                $agentUuid = $order?->agent?->uuid;
+                $orgUuid = $order?->organization?->uuid ?? $order?->agent?->organization?->uuid;
+                $tour->effective_tour_appearance = $settingsService->getEffectiveTourAppearance($orgUuid, $agentUuid);
+                $tour->effective_tour_settings = $settingsService->getEffectiveTourSettings($orgUuid, $agentUuid);
+
                 return $tour;
             };
 

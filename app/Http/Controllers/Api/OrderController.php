@@ -3532,7 +3532,9 @@ private function createOrderNotification($order, array $changes)
                 ->with([
                     'property',
                     'tours',
-                    'agent:id,uuid,first_name,last_name,email,primary_phone,company_name,avatar,company_logo,company_banner,website'
+                    'agent:id,uuid,organization_id,first_name,last_name,email,primary_phone,company_name,avatar,company_logo,company_banner,website',
+                    'agent.organization',
+                    'organization'
                 ])
                 ->first();
 
@@ -3609,6 +3611,23 @@ private function createOrderNotification($order, array $changes)
                         }
                         return $file;
                     });
+                }
+            }
+
+            $settingsService = app(\App\Services\SettingsService::class);
+            $agentUuid = $order->agent?->uuid;
+            $orgUuid = $order->organization?->uuid ?? $order->agent?->organization?->uuid;
+
+            $effectiveAppearance = $settingsService->getEffectiveTourAppearance($orgUuid, $agentUuid);
+            $effectiveSettings = $settingsService->getEffectiveTourSettings($orgUuid, $agentUuid);
+
+            $order->effective_tour_appearance = $effectiveAppearance;
+            $order->effective_tour_settings = $effectiveSettings;
+
+            if ($order->tours) {
+                foreach ($order->tours as $tour) {
+                    $tour->effective_tour_appearance = $effectiveAppearance;
+                    $tour->effective_tour_settings = $effectiveSettings;
                 }
             }
 
