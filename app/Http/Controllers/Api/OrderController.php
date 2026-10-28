@@ -1345,8 +1345,17 @@ class OrderController extends Controller
 
             $shouldSendEmails = !empty($allowedRoles);
         } else {
-            $shouldSendEmails = $this->hasSignificantChanges($changes);
-            $allowedRoles = ['admin', 'agent', 'vendor'];
+            // Do NOT automatically send emails on every order edit/save unless explicitly instructed.
+            // Emails should only be sent when the admin or vendor explicitly requests notification.
+            $shouldSendEmails = false;
+            $allowedRoles = [];
+        }
+
+        // Do not email admin about an action they performed themselves unless explicitly requested via notify_admin
+        $currentUser = auth()->user();
+        if ($currentUser instanceof \App\Models\User && !$request->has('notify_admin') && !$request->has('inform_admin')) {
+            $allowedRoles = array_values(array_filter($allowedRoles, fn($role) => $role !== 'admin'));
+            $shouldSendEmails = !empty($allowedRoles);
         }
 
         if ($shouldSendEmails && !empty($allowedRoles)) {
@@ -3095,10 +3104,11 @@ private function createOrderNotification($order, array $changes)
                 \App\Services\NotificationService::notifyServiceCompleted($orderService, $actor);
 
                 // 2. Email dispatch via EmailDispatchService
-                // Suppress service_completed email if:
-                // - explicitly requested (e.g. auto-completion via file manager media upload)
-                // - or if media files/links already exist for this service under the order (media_uploaded is the single email)
-                $shouldSendEmail = !filter_var($request->input('skip_email', false), FILTER_VALIDATE_BOOLEAN);
+                // Only send service_completed email if explicitly requested (e.g. notify_agent = true)
+                // This prevents automatic emails when admins or vendors toggle completion status
+                $shouldSendEmail = (filter_var($request->input('notify_agent', false), FILTER_VALIDATE_BOOLEAN) ||
+                                   filter_var($request->input('inform_agent', false), FILTER_VALIDATE_BOOLEAN))
+                                   && !filter_var($request->input('skip_email', false), FILTER_VALIDATE_BOOLEAN);
 
                 if ($shouldSendEmail && $order) {
                     $tourIds = $order->tours()->pluck('id');
@@ -3532,7 +3542,9 @@ private function createOrderNotification($order, array $changes)
                 ->with([
                     'property',
                     'tours',
-                    'agent:id,uuid,first_name,last_name,email,primary_phone,company_name,avatar,company_logo,company_banner,website'
+                    'agent:id,uuid,organization_id,first_name,last_name,email,primary_phone,company_name,avatar,company_logo,company_banner,website',
+                    'agent.organization',
+                    'organization'
                 ])
                 ->first();
 
@@ -3609,6 +3621,23 @@ private function createOrderNotification($order, array $changes)
                         }
                         return $file;
                     });
+                }
+            }
+
+            $settingsService = app(\App\Services\SettingsService::class);
+            $agentUuid = $order->agent?->uuid;
+            $orgUuid = $order->organization?->uuid ?? $order->agent?->organization?->uuid;
+
+            $effectiveAppearance = $settingsService->getEffectiveTourAppearance($orgUuid, $agentUuid);
+            $effectiveSettings = $settingsService->getEffectiveTourSettings($orgUuid, $agentUuid);
+
+            $order->effective_tour_appearance = $effectiveAppearance;
+            $order->effective_tour_settings = $effectiveSettings;
+
+            if ($order->tours) {
+                foreach ($order->tours as $tour) {
+                    $tour->effective_tour_appearance = $effectiveAppearance;
+                    $tour->effective_tour_settings = $effectiveSettings;
                 }
             }
 

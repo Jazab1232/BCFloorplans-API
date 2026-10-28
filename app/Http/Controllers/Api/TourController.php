@@ -277,6 +277,13 @@ class TourController extends Controller
                 }
             }
 
+            $order = $tour->order ?? $tour->orders;
+            $settingsService = app(\App\Services\SettingsService::class);
+            $agentUuid = $order?->agent?->uuid;
+            $orgUuid = $order?->organization?->uuid ?? $order?->agent?->organization?->uuid;
+            $tour->effective_tour_appearance = $settingsService->getEffectiveTourAppearance($orgUuid, $agentUuid);
+            $tour->effective_tour_settings = $settingsService->getEffectiveTourSettings($orgUuid, $agentUuid);
+
             return response()->json([
                 'success' => true,
                 'data' => $tour,
@@ -373,10 +380,25 @@ class TourController extends Controller
                 $tour->save();
             } else {
                 // Create tour
+                $effectiveSlideShow = $data['slide_show'] ?? ($request->input('slide_show') ?? null);
+                if (empty($effectiveSlideShow)) {
+                    $agent = $order->agent ?? ($order->agent_id ? \App\Models\Agent::find($order->agent_id) : null);
+                    $orgUuid = $order->organization?->uuid ?? $agent?->organization?->uuid;
+                    $effectiveDefaults = app(\App\Services\SettingsService::class)->getEffectiveTourSettings($orgUuid, $agent?->uuid);
+                    $effectiveSlideShow = [
+                        'slide_delay' => 4000,
+                        'transitions' => $effectiveDefaults['transition_effect'][0] ?? 'fade-in',
+                        'background_audio' => (!empty($effectiveDefaults['default_audio_uuid'])) ? $effectiveDefaults['default_audio_uuid'] : ((!empty($effectiveDefaults['default_song'])) ? $effectiveDefaults['default_song'] : 'none'),
+                        'auto_play' => $effectiveDefaults['autoplay_enabled'] ?? true,
+                        'video_overlay' => $effectiveDefaults['video_slideshow_enabled'] ?? true,
+                        'hero_type' => 'slideshow',
+                    ];
+                }
+
                 $tour = Tour::create([
                     'uuid' => Str::uuid()->toString(),
                     'order_id' => $order->id,
-                    'slide_show' => $data['slide_show'] ?? null,
+                    'slide_show' => $effectiveSlideShow,
                     'is_publish' => $data['is_publish'] ?? false,
                 ]);
             }
@@ -518,63 +540,9 @@ class TourController extends Controller
 
             DB::commit();
 
-            // If links (e.g. Matterport / 3D tours) were approved/added on creation, notify agent when threshold (at least 1) is reached
-            if (!empty($newlyApprovedLinksByService)) {
-                $tour->loadMissing(['orders.agent', 'orders.property']);
-                $actorUser = auth()->user();
-                $actorName = $actorUser 
-                    ? (trim(($actorUser->first_name ?? '') . ' ' . ($actorUser->last_name ?? '')) ?: ($actorUser->name ?? 'Team'))
-                    : 'Team';
-
-                foreach ($newlyApprovedLinksByService as $svcKey => $info) {
-                    $svcObj = null;
-                    if (!empty($info['service_id'])) {
-                        $svcObj = Service::find($info['service_id']);
-                    }
-                    $count = $info['count'];
-
-                    [$shouldNotify, $targetQty, $currentApprovedCount] = \App\Services\NotificationService::checkMediaQuantityThreshold(
-                        $tour,
-                        $svcObj ?? ($info['service_id'] ?? null),
-                        $count,
-                        'link'
-                    );
-
-                    if (!$shouldNotify) {
-                        continue;
-                    }
-
-                    $throttleKey = "media_upload_notify_{$tour->id}_link_{$svcKey}";
-
-                    if (!Cache::has($throttleKey)) {
-                        Cache::put($throttleKey, true, 60);
-
-                        try {
-                            $order = $tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null));
-                            \App\Services\NotificationService::notifyMediaReady(
-                                $tour,
-                                $svcObj,
-                                $actorUser,
-                                $currentApprovedCount,
-                                ($actorUser instanceof \App\Models\User) ? 'approved' : 'uploaded'
-                            );
-                            app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
-                                'order' => $order,
-                                'service' => $svcObj,
-                                'media_count' => $currentApprovedCount,
-                                'uploaded_by' => $actorName,
-                                'is_approved' => ($actorUser instanceof \App\Models\User),
-                            ]);
-                        } catch (\Throwable $err) {
-
-                            Log::error("Failed sending media link notification on tour creation: " . $err->getMessage(), [
-                                'tour_id' => $tour->id,
-                                'service_key' => $svcKey,
-                            ]);
-                        }
-                    }
-                }
-            }
+            // NOTE: Automatic email dispatch on file/link approval has been replaced by the
+            // "Send to Client" / "Notify Agent" action (POST /orders/{uuid}/send-to-client).
+            // Admin can review, sort, and approve files and choose when to deliver to the client.
 
             // Sync created tour files via FTP 
             // uncomment filed below to enable SFTP sync on tour creation
@@ -1108,7 +1076,9 @@ class TourController extends Controller
                     $query->where('is_hidden', false);
                 },
                 'orders.services.vendor',
-                'orders.property'
+                'orders.property',
+                'orders.agent.organization',
+                'orders.organization'
             ])
                 ->where('is_publish', true);
 
@@ -1173,6 +1143,13 @@ class TourController extends Controller
                         return $file;
                     });
                 }
+
+                $settingsService = app(\App\Services\SettingsService::class);
+                $agentUuid = $order?->agent?->uuid;
+                $orgUuid = $order?->organization?->uuid ?? $order?->agent?->organization?->uuid;
+                $tour->effective_tour_appearance = $settingsService->getEffectiveTourAppearance($orgUuid, $agentUuid);
+                $tour->effective_tour_settings = $settingsService->getEffectiveTourSettings($orgUuid, $agentUuid);
+
                 return $tour;
             };
 

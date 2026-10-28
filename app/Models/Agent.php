@@ -53,6 +53,8 @@ class Agent extends Authenticatable
         'agent_type',
         'parent_agent_id',
         'linked_agent_uuids',
+        'tour_settings',
+        'tour_appearance',
     ];
 
     protected $hidden = [
@@ -76,6 +78,8 @@ class Agent extends Authenticatable
         'sync_google_calendar' => 'boolean',
         'notification_email' => 'boolean',
         'linked_agent_uuids' => 'array',
+        'tour_settings' => 'array',
+        'tour_appearance' => 'array',
     ];
 
     protected $appends = ['avatar_url', 'company_logo_url', 'company_banner_url', 'company_logos_urls', 'logo_url', 'banner_url'];
@@ -300,5 +304,25 @@ class Agent extends Authenticatable
                 'origin'            => request()?->header('Origin') ?: request()?->header('Referer'),
             ],
         ]);
+    }
+
+    /**
+     * Get effective tour settings merging Agent overrides on top of Org defaults on top of Global defaults
+     */
+    public function getEffectiveTourSettings(): array
+    {
+        $settingsService = app(\App\Services\SettingsService::class);
+        $orgUuid = $this->organization?->uuid;
+        return $settingsService->getEffectiveTourSettings($orgUuid, $this->uuid);
+    }
+
+    /**
+     * Get effective tour appearance merging Agent overrides on top of Org defaults on top of Global defaults
+     */
+    public function getEffectiveTourAppearance(): array
+    {
+        $settingsService = app(\App\Services\SettingsService::class);
+        $orgUuid = $this->organization?->uuid;
+        return $settingsService->getEffectiveTourAppearance($orgUuid, $this->uuid);
     }
 }

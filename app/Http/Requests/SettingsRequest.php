@@ -22,7 +22,8 @@ class SettingsRequest extends FormRequest
         }
 
         if ($user instanceof \App\Models\Agent) {
-            return false;
+            $allowedAgentKeys = ['tour_settings', 'tour_appearance', 'white_label_styles'];
+            return in_array($this->route('key'), $allowedAgentKeys);
         }
 
         if ($user instanceof \App\Models\Vendor) {
@@ -46,6 +47,7 @@ class SettingsRequest extends FormRequest
             'upload_limits'                 => $this->uploadLimits(),
             'white_label_styles'            => $this->whiteLabelStyles(),
             'tour_settings'                 => $this->tourSettings(),
+            'tour_appearance'               => $this->tourAppearance(),
             'portal_settings'               => $this->portalSettings(),
             default                          => $this->unknownKey(),
         };
@@ -172,6 +174,43 @@ protected function whiteLabelStyles(): array
         'value.agent.sidebarHoverText' => 'required|string|regex:/^#[0-9A-Fa-f]{6}$/',
         'value.agent.activeColor' => 'required|string|regex:/^#[0-9A-Fa-f]{6}$/',
         'value.agent.pageTabColor' => 'required|string|regex:/^#[0-9A-Fa-f]{6}$/',
+
+        /*
+        |--------------------------------------------------------------------------
+        | TOUR STYLES
+        |--------------------------------------------------------------------------
+        */
+        'value.tour' => 'nullable|array',
+        'value.tour.pageBg' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.tour.pageText' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.tour.sidebarBg' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.tour.sidebarText' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.tour.sidebarHoverBg' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.tour.sidebarHoverText' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.tour.activeColor' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.tour.pageTabColor' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.tour.logo' => 'nullable|string',
+        'value.tour.logoWidth' => 'nullable|string',
+    ];
+}
+
+/**
+ * TOUR APPEARANCE (STANDALONE)
+ */
+protected function tourAppearance(): array
+{
+    return [
+        'value' => 'required|array',
+        'value.pageBg' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.pageText' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.sidebarBg' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.sidebarText' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.sidebarHoverBg' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.sidebarHoverText' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.activeColor' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.pageTabColor' => 'nullable|string|regex:/^#[0-9A-Fa-f]{6}$/',
+        'value.logo' => 'nullable|string',
+        'value.logoWidth' => 'nullable|string',
     ];
 }
 
@@ -248,6 +287,7 @@ protected function tourSettings(): array
                     'upload_limits',
                     'white_label_styles',
                     'tour_settings',
+                    'tour_appearance',
                     'portal_settings',
                 ]
             ], 422)

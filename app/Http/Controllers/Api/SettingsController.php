@@ -7,6 +7,7 @@ use App\Http\Requests\SettingsRequest;
 use App\Services\SettingsService;
 use Illuminate\Http\JsonResponse;
 use App\Models\Organization;
+use App\Models\Agent;
 use App\Exceptions\SettingNotFoundException;
 use Illuminate\Http\Request;
 
@@ -53,31 +54,74 @@ class SettingsController extends Controller
             return null; // GLOBAL SETTINGS
         }
 
-        // $org = Organization::where('uuid', $request->org_uuid)->firstOrFail();
         return $request->org_uuid;
     }
 
     public function index(Request $request): JsonResponse
-{
-    $orgId = $this->resolveOrgId($request);
+    {
+        $orgId = $this->resolveOrgId($request);
 
-    $settings = \App\Models\Setting::when(
-        $orgId,
-        fn ($q) => $q->where('org_id', $orgId),
-        fn ($q) => $q->whereNull('org_id')
-    )->get();
+        $settings = \App\Models\Setting::when(
+            $orgId,
+            fn ($q) => $q->where('org_id', $orgId),
+            fn ($q) => $q->whereNull('org_id')
+        )->get();
 
-    return response()->json([
-        'org_uuid' => $orgId,
-        'settings' => $settings
-    ]);
-}
+        return response()->json([
+            'org_uuid' => $orgId,
+            'settings' => $settings
+        ]);
+    }
 
     // GET /settings/{key}
     public function show(Request $request, string $key): JsonResponse
     {
         try {
+            $user = auth()->user();
             $orgId = $this->resolveOrgId($request);
+            $agentUuid = null;
+
+            if ($user instanceof Agent) {
+                $agentUuid = $user->uuid;
+            } elseif ($request->filled('agent_uuid')) {
+                $agentUuid = $request->query('agent_uuid');
+            }
+
+            // Hierarchical resolution for tour_settings and tour_appearance
+            if ($key === 'tour_settings') {
+                $value = $this->settings->getEffectiveTourSettings($orgId, $agentUuid);
+                return response()->json([
+                    'key' => $key,
+                    'org_uuid' => $orgId,
+                    'agent_uuid' => $agentUuid,
+                    'value' => $value
+                ]);
+            }
+
+            if ($key === 'tour_appearance') {
+                $value = $this->settings->getEffectiveTourAppearance($orgId, $agentUuid);
+                return response()->json([
+                    'key' => $key,
+                    'org_uuid' => $orgId,
+                    'agent_uuid' => $agentUuid,
+                    'value' => $value
+                ]);
+            }
+
+            if ($key === 'white_label_styles' && $agentUuid) {
+                try {
+                    $baseStyles = $this->settings->get($orgId, $key);
+                } catch (\Throwable $e) {
+                    $baseStyles = [];
+                }
+                $baseStyles['tour'] = $this->settings->getEffectiveTourAppearance($orgId, $agentUuid);
+                return response()->json([
+                    'key' => $key,
+                    'org_uuid' => $orgId,
+                    'agent_uuid' => $agentUuid,
+                    'value' => $baseStyles
+                ]);
+            }
 
             $value = $this->settings->get($orgId, $key);
 
@@ -97,13 +141,51 @@ class SettingsController extends Controller
     // POST /settings/{key}
     public function update(SettingsRequest $request, string $key): JsonResponse
     {
+        $user = auth()->user();
         $orgId = $this->resolveOrgId($request);
+
+        // If authenticated user is an agent, or if agent_uuid is explicitly passed by admin
+        $agentUuid = ($user instanceof Agent) 
+            ? $user->uuid 
+            : ($request->filled('agent_uuid') ? $request->input('agent_uuid') : null);
+
+        if ($agentUuid) {
+            if ($key === 'tour_settings') {
+                $agent = $this->settings->setAgentTourSettings($agentUuid, $request->validated()['value']);
+                return response()->json([
+                    'message' => 'Agent tour settings updated successfully',
+                    'agent_uuid' => $agentUuid,
+                    'tour_settings' => $agent->tour_settings,
+                    'effective_tour_settings' => $this->settings->getEffectiveTourSettings($orgId, $agentUuid)
+                ]);
+            }
+
+            if ($key === 'tour_appearance') {
+                $agent = $this->settings->setAgentTourAppearance($agentUuid, $request->validated()['value']);
+                return response()->json([
+                    'message' => 'Agent tour appearance updated successfully',
+                    'agent_uuid' => $agentUuid,
+                    'tour_appearance' => $agent->tour_appearance,
+                    'effective_tour_appearance' => $this->settings->getEffectiveTourAppearance($orgId, $agentUuid)
+                ]);
+            }
+
+            if ($key === 'white_label_styles' && isset($request->validated()['value']['tour'])) {
+                $agent = $this->settings->setAgentTourAppearance($agentUuid, $request->validated()['value']['tour']);
+                return response()->json([
+                    'message' => 'Agent tour appearance updated successfully',
+                    'agent_uuid' => $agentUuid,
+                    'tour_appearance' => $agent->tour_appearance,
+                    'effective_tour_appearance' => $this->settings->getEffectiveTourAppearance($orgId, $agentUuid)
+                ]);
+            }
+        }
 
         $setting = $this->settings->set(
             $orgId,
             $key,
             $request->validated()['value'],
-            auth()->user()->uuid
+            $user ? $user->uuid : null
         );
 
         return response()->json([
