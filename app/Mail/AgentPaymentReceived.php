@@ -3,14 +3,18 @@
 namespace App\Mail;
 
 use App\Models\AgentPayment;
+use App\Models\Invoice;
 use App\Models\Order;
 use App\Models\OrderService;
+use App\Services\InvoicePdfService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Mail\Mailable;
+use Illuminate\Mail\Mailables\Attachment;
 use Illuminate\Mail\Mailables\Content;
 use Illuminate\Mail\Mailables\Envelope;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Log;
 
 class AgentPaymentReceived extends Mailable
 {
@@ -95,12 +99,70 @@ class AgentPaymentReceived extends Mailable
     }
 
     /**
+     * Resolve the Invoice instance associated with this payment or order.
+     */
+    protected function resolveInvoice(): ?Invoice
+    {
+        if ($this->payment && $this->payment->relationLoaded('invoice') && $this->payment->invoice) {
+            return $this->payment->invoice;
+        }
+
+        if ($this->payment && !empty($this->payment->invoice_id)) {
+            $inv = Invoice::find($this->payment->invoice_id);
+            if ($inv) {
+                return $inv;
+            }
+        }
+
+        if (!empty($this->data['invoice_id'])) {
+            $inv = Invoice::find($this->data['invoice_id']);
+            if ($inv) {
+                return $inv;
+            }
+        }
+
+        if (!empty($this->data['invoice_uuid'])) {
+            $inv = Invoice::where('uuid', $this->data['invoice_uuid'])->first();
+            if ($inv) {
+                return $inv;
+            }
+        }
+
+        if ($this->order) {
+            return $this->order->invoices()->latest('id')->first();
+        }
+
+        return null;
+    }
+
+    /**
      * Get the attachments for the message.
      *
      * @return array<int, \Illuminate\Mail\Mailables\Attachment>
      */
     public function attachments(): array
     {
+        try {
+            $invoice = $this->resolveInvoice();
+
+            if ($invoice) {
+                /** @var InvoicePdfService $pdfService */
+                $pdfService = app(InvoicePdfService::class);
+                $pdfBytes = $pdfService->getPdfBytes($invoice);
+                $fileName = $pdfService->getFileName($invoice);
+
+                return [
+                    Attachment::fromData(fn () => $pdfBytes, $fileName)
+                        ->withMime('application/pdf'),
+                ];
+            }
+        } catch (\Throwable $e) {
+            Log::error('Failed attaching invoice PDF to AgentPaymentReceived: ' . $e->getMessage(), [
+                'payment_id' => $this->payment?->id,
+                'trace'      => $e->getTraceAsString(),
+            ]);
+        }
+
         return [];
     }
 }

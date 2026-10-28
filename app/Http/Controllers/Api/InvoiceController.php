@@ -18,6 +18,7 @@ use Stripe\StripeClient;
 use Illuminate\Support\Str;
 use App\Models\Role;
 use Carbon\Carbon;
+use App\Services\InvoicePdfService;
 
 class InvoiceController extends Controller
 {
@@ -285,6 +286,36 @@ class InvoiceController extends Controller
         } catch (\Throwable $e) {
             Log::error('InvoiceController@show error: ' . $e->getMessage());
             return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Download or preview the invoice PDF.
+     */
+    public function downloadPdf(Request $request, string $uuid, InvoicePdfService $pdfService)
+    {
+        try {
+            $invoice = Invoice::where('uuid', $uuid)->firstOrFail();
+            $this->authorizeInvoiceAccess($invoice);
+
+            $pdf = $pdfService->generate($invoice);
+            $fileName = $pdfService->getFileName($invoice);
+
+            if ($request->query('preview') || $request->query('inline')) {
+                return $pdf->stream($fileName);
+            }
+
+            return $pdf->download($fileName);
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            return response()->json(['success' => false, 'message' => 'Invoice not found'], 404);
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], $e->getStatusCode());
+        } catch (\Throwable $e) {
+            Log::error('InvoiceController@downloadPdf error: ' . $e->getMessage(), [
+                'uuid'  => $uuid,
+                'trace' => $e->getTraceAsString(),
+            ]);
+            return response()->json(['success' => false, 'message' => 'Failed generating invoice PDF: ' . $e->getMessage()], 500);
         }
     }
 

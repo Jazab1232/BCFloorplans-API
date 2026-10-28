@@ -426,6 +426,7 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api", "resolve
         Route::get('/', [InvoiceController::class, 'index']);
         Route::get('export/csv', [InvoiceController::class, 'exportCsv']);
         Route::get('/{uuid}', [InvoiceController::class, 'show']);
+        Route::get('/{uuid}/pdf', [InvoiceController::class, 'downloadPdf']);
         Route::post('/', [InvoiceController::class, 'store']);
         Route::match(['put', 'patch'], '/{uuid}', [InvoiceController::class, 'update']);
         Route::post('/{uuid}/void', [InvoiceController::class, 'void']);
