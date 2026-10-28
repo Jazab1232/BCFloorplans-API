@@ -540,63 +540,9 @@ class TourController extends Controller
 
             DB::commit();
 
-            // If links (e.g. Matterport / 3D tours) were approved/added on creation, notify agent when threshold (at least 1) is reached
-            if (!empty($newlyApprovedLinksByService)) {
-                $tour->loadMissing(['orders.agent', 'orders.property']);
-                $actorUser = auth()->user();
-                $actorName = $actorUser 
-                    ? (trim(($actorUser->first_name ?? '') . ' ' . ($actorUser->last_name ?? '')) ?: ($actorUser->name ?? 'Team'))
-                    : 'Team';
-
-                foreach ($newlyApprovedLinksByService as $svcKey => $info) {
-                    $svcObj = null;
-                    if (!empty($info['service_id'])) {
-                        $svcObj = Service::find($info['service_id']);
-                    }
-                    $count = $info['count'];
-
-                    [$shouldNotify, $targetQty, $currentApprovedCount] = \App\Services\NotificationService::checkMediaQuantityThreshold(
-                        $tour,
-                        $svcObj ?? ($info['service_id'] ?? null),
-                        $count,
-                        'link'
-                    );
-
-                    if (!$shouldNotify) {
-                        continue;
-                    }
-
-                    $throttleKey = "media_upload_notify_{$tour->id}_link_{$svcKey}";
-
-                    if (!Cache::has($throttleKey)) {
-                        Cache::put($throttleKey, true, 60);
-
-                        try {
-                            $order = $tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null));
-                            \App\Services\NotificationService::notifyMediaReady(
-                                $tour,
-                                $svcObj,
-                                $actorUser,
-                                $currentApprovedCount,
-                                ($actorUser instanceof \App\Models\User) ? 'approved' : 'uploaded'
-                            );
-                            app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
-                                'order' => $order,
-                                'service' => $svcObj,
-                                'media_count' => $currentApprovedCount,
-                                'uploaded_by' => $actorName,
-                                'is_approved' => ($actorUser instanceof \App\Models\User),
-                            ]);
-                        } catch (\Throwable $err) {
-
-                            Log::error("Failed sending media link notification on tour creation: " . $err->getMessage(), [
-                                'tour_id' => $tour->id,
-                                'service_key' => $svcKey,
-                            ]);
-                        }
-                    }
-                }
-            }
+            // NOTE: Automatic email dispatch on file/link approval has been replaced by the
+            // "Send to Client" / "Notify Agent" action (POST /orders/{uuid}/send-to-client).
+            // Admin can review, sort, and approve files and choose when to deliver to the client.
 
             // Sync created tour files via FTP 
             // uncomment filed below to enable SFTP sync on tour creation
