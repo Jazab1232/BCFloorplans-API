@@ -643,56 +643,9 @@ class PresignedUrlController extends Controller
                     $confirmedFiles[] = $confirmedFileData;
                 }
 
-                // If media was auto-approved (admin upload or approved vendor), notify agent when target quantity is reached
-                if ($tour && !empty($approvedFilesByService)) {
-                    $order = $tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null));
-                    if ($order) {
-                        $order->loadMissing(['agent', 'property', 'organization']);
-                    }
-                    $uploader = request()->user();
-                    $uploaderName = $uploader 
-                        ? (trim(($uploader->first_name ?? '') . ' ' . ($uploader->last_name ?? '')) ?: ($uploader->name ?? 'Team'))
-                        : 'Team';
-
-                    foreach ($approvedFilesByService as $svcKey => $info) {
-                        $svcObj = $info['service'];
-                        $count = $info['count'];
-
-                        [$shouldNotify, $targetQty, $currentApprovedCount] = \App\Services\NotificationService::checkMediaQuantityThreshold(
-                            $tour,
-                            $svcObj ?? ($svcKey !== 'default' ? $svcKey : null),
-                            $count
-                        );
-
-                        if (!$shouldNotify) {
-                            continue;
-                        }
-
-                        $throttleKey = "media_upload_notify_{$tour->id}_{$svcKey}";
-
-                        if (!Cache::has($throttleKey)) {
-                            Cache::put($throttleKey, true, 60);
-
-                            try {
-                                \App\Services\NotificationService::notifyMediaReady($tour, $svcObj, $uploader, $currentApprovedCount, 'uploaded');
-                                $serviceName = $svcObj ? $svcObj->name : 'Media';
-                                app(\App\Services\EmailDispatchService::class)->dispatch('media_uploaded', $tour, [
-                                    'order' => $order,
-                                    'service' => $svcObj,
-                                    'service_name' => $serviceName,
-                                    'media_count' => $currentApprovedCount,
-                                    'uploaded_by' => $uploaderName,
-                                    'is_approved' => ($isAdminApproved ?? false),
-                                ]);
-                            } catch (\Throwable $err) {
-                                Log::error("Failed sending media upload notification: " . $err->getMessage(), [
-                                    'tour_id' => $tour->id,
-                                    'service_key' => $svcKey,
-                                ]);
-                            }
-                        }
-                    }
-                }
+                // NOTE: Automatic email notification upon upload has been removed in favor of the
+                // "Send to Client" action (POST /orders/{uuid}/send-to-client).
+                // This gives the Admin and Vendor full control to review, sort, and choose when to deliver files to the client.
             }
 
             return response()->json([

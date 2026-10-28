@@ -17,6 +17,11 @@ use App\Models\ProductOption;
 use App\Models\Package;
 use App\Models\FeatureSheet;
 use App\Models\PrintRequest;
+use App\Models\Tour;
+use App\Models\TourFile;
+use App\Models\TourLink;
+use App\Services\NotificationService;
+use App\Services\EmailDispatchService;
 use Illuminate\Support\Str;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
@@ -3207,6 +3212,287 @@ private function createOrderNotification($order, array $changes)
                 'media_access' => $orderService->media_access,
             ],
             'message' => 'Media access updated successfully: ' . ($orderService->media_access ? 'unlocked' : 'locked'),
+        ]);
+    }
+
+    /**
+     * Send uploaded media to client (Agent)
+     * Triggers the media_uploaded email and in-app notification,
+     * marks the service(s) as completed, and records delivery history.
+     *
+     * Accessible by Admin and Vendor (if vendor does not require admin approval).
+     */
+    public function sendMediaToClient(Request $request, $uuid = null): JsonResponse
+    {
+        $orderUuid = $uuid ?? $request->input('order_uuid') ?? $request->input('uuid');
+
+        $validator = Validator::make(array_merge($request->all(), ['order_uuid' => $orderUuid]), [
+            'order_uuid' => 'required|exists:orders,uuid',
+            'service_uuid' => 'nullable|string',
+            'service_id' => 'nullable',
+            'custom_message' => 'nullable|string|max:2000',
+            'recipient_emails' => 'nullable|array',
+            'recipient_emails.*' => 'email',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation error',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $user = auth()->user();
+        if (!$user) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthenticated',
+            ], 401);
+        }
+
+        // If authenticated user is an Agent, they cannot send to client
+        if ($user instanceof \App\Models\Agent) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized: Clients cannot trigger media delivery.',
+            ], 403);
+        }
+
+        // Find Order with needed relations
+        $order = Order::withoutGlobalScopes()
+            ->where('uuid', $orderUuid)
+            ->with(['agent', 'property', 'organization', 'services.service', 'services.option'])
+            ->first();
+
+        if (!$order) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Order not found',
+            ], 404);
+        }
+
+        // If user is a Vendor:
+        // 1. Verify vendor is assigned to this order or one of its services
+        // 2. Verify vendor does not require review (if review_files == true, vendor must submit for admin approval)
+        if ($user instanceof \App\Models\Vendor) {
+            $isAssigned = ($order->vendor_id && $order->vendor_id == $user->id)
+                || $order->services()->where(function($q) use ($user) {
+                    $q->where('vendor_id', $user->uuid)->orWhere('vendor_id', $user->id);
+                })->exists();
+
+            if (!$isAssigned) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unauthorized: You are not assigned to this order.',
+                ], 403);
+            }
+
+            if (!empty($user->review_files)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Your uploaded media requires Admin Approval before sending to the client. Please submit your files for admin review.',
+                ], 403);
+            }
+        }
+
+        // Find Tour
+        $tour = $order->tours()->first() 
+            ?? Tour::where('order_id', $order->id)->first()
+            ?? Tour::where('uuid', $order->uuid)->first();
+
+        if (!$tour) {
+            return response()->json([
+                'success' => false,
+                'message' => 'No tour record found for this order. Please upload media first.',
+            ], 422);
+        }
+
+        // Resolve Service if specified
+        $serviceUuid = $request->input('service_uuid');
+        $serviceIdInput = $request->input('service_id');
+        $targetService = null;
+        $targetOrderService = null;
+
+        if (!empty($serviceUuid)) {
+            $targetService = Service::where('uuid', $serviceUuid)->first();
+        } elseif (!empty($serviceIdInput)) {
+            $targetService = is_numeric($serviceIdInput) 
+                ? Service::find((int) $serviceIdInput)
+                : Service::where('uuid', $serviceIdInput)->first();
+        }
+
+        if ($targetService) {
+            $targetOrderService = OrderService::where('order_id', $order->id)
+                ->where('service_id', $targetService->id)
+                ->first();
+        }
+
+        // Count approved files and links
+        $filesQuery = TourFile::where('tour_id', $tour->id)
+            ->where('is_admin_approved', true)
+            ->where('is_hidden', false);
+
+        $linksQuery = TourLink::where('tour_id', $tour->id)
+            ->where('is_admin_approved', true);
+
+        if ($targetService) {
+            $filesQuery->where('service_id', $targetService->id);
+            $linksQuery->where('service_id', $targetService->id);
+        }
+
+        $approvedFilesCount = $filesQuery->count();
+        $approvedLinksCount = $linksQuery->count();
+        $totalApprovedCount = $approvedFilesCount + $approvedLinksCount;
+
+        if ($totalApprovedCount === 0) {
+            return response()->json([
+                'success' => false,
+                'message' => 'No approved media files or links found to send. Please make sure files are uploaded and approved before sending to the client.',
+            ], 422);
+        }
+
+        // Mark corresponding OrderService(s) as completed
+        if ($targetOrderService) {
+            $targetOrderService->update(['is_completed' => true]);
+        } else {
+            // If sending all media, mark all order services that have approved media as completed
+            $servicesWithMedia = TourFile::where('tour_id', $tour->id)
+                ->where('is_admin_approved', true)
+                ->whereNotNull('service_id')
+                ->pluck('service_id')
+                ->unique();
+
+            if ($servicesWithMedia->isNotEmpty()) {
+                OrderService::where('order_id', $order->id)
+                    ->whereIn('service_id', $servicesWithMedia)
+                    ->update(['is_completed' => true]);
+            }
+        }
+
+        // Determine sender name
+        $senderName = trim(($user->first_name ?? '') . ' ' . ($user->last_name ?? ''));
+        if (empty($senderName)) {
+            $senderName = $user->name ?? ($user instanceof \App\Models\Vendor ? 'Vendor' : 'Admin');
+        }
+
+        $serviceName = $targetService ? $targetService->name : 'Media Package';
+        $customMessage = $request->input('custom_message');
+
+        // 1. In-App Notification to Agent
+        try {
+            NotificationService::notifyMediaReady(
+                $tour,
+                $targetService,
+                $user,
+                $totalApprovedCount,
+                'approved'
+            );
+        } catch (\Throwable $notifErr) {
+            Log::error("Failed creating in-app notification on sendMediaToClient: " . $notifErr->getMessage(), [
+                'order_id' => $order->id,
+                'error' => $notifErr,
+            ]);
+        }
+
+        // 2. If sent by Vendor, notify Admin
+        if ($user instanceof \App\Models\Vendor) {
+            try {
+                Notification::create([
+                    'uuid' => (string) Str::uuid(),
+                    'organization_id' => $order->organization_id,
+                    'source' => 'Order',
+                    'source_id' => $order->uuid,
+                    'type' => 'vendor_media_delivered',
+                    'description' => "Vendor {$senderName} sent {$serviceName} ({$totalApprovedCount} items) to client for Order #{$order->id} ({$order->property_address})",
+                    'role' => 'admin',
+                    'created_by_name' => $senderName,
+                    'meta_data' => [
+                        'order_id' => $order->id,
+                        'order_uuid' => $order->uuid,
+                        'service_id' => $targetService?->uuid,
+                        'service_name' => $serviceName,
+                        'media_count' => $totalApprovedCount,
+                        'sent_by' => $senderName,
+                    ],
+                ]);
+            } catch (\Throwable $adminNotifErr) {
+                Log::error("Failed notifying admin of vendor media delivery: " . $adminNotifErr->getMessage());
+            }
+        }
+
+        // 3. Email Dispatch via EmailDispatchService
+        $emailDispatched = false;
+        try {
+            $dispatchOptions = [
+                'order' => $order,
+                'service' => $targetService,
+                'service_name' => $serviceName,
+                'media_count' => $totalApprovedCount,
+                'uploaded_by' => $senderName,
+                'is_approved' => true,
+                'custom_message' => $customMessage,
+            ];
+
+            // If custom recipient emails specified, pass them
+            if ($request->has('recipient_emails') && is_array($request->input('recipient_emails'))) {
+                $recipients = [];
+                foreach ($request->input('recipient_emails') as $email) {
+                    if (filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                        $recipients[] = [
+                            'email' => $email,
+                            'name' => $order->agent ? trim(($order->agent->first_name ?? '') . ' ' . ($order->agent->last_name ?? '')) : 'Valued Customer',
+                            'role' => 'agent',
+                        ];
+                    }
+                }
+                if (!empty($recipients)) {
+                    $dispatchOptions['recipients'] = $recipients;
+                }
+            }
+
+            $emailDispatched = app(EmailDispatchService::class)->dispatch(
+                'media_uploaded',
+                $tour,
+                $dispatchOptions
+            );
+        } catch (\Throwable $emailErr) {
+            Log::error("Failed dispatching media_uploaded email on sendMediaToClient: " . $emailErr->getMessage(), [
+                'order_id' => $order->id,
+                'error' => $emailErr,
+            ]);
+        }
+
+        // 4. Update order meta with delivery history
+        $meta = is_array($order->meta) ? $order->meta : (json_decode($order->meta, true) ?? []);
+        $history = $meta['media_delivery_history'] ?? [];
+        $deliveryRecord = [
+            'sent_at' => now()->toIsoString(),
+            'sent_by_name' => $senderName,
+            'sent_by_role' => ($user instanceof \App\Models\Vendor) ? 'vendor' : 'admin',
+            'sent_by_id' => $user->id ?? $user->uuid ?? null,
+            'service_id' => $targetService?->id,
+            'service_name' => $serviceName,
+            'media_count' => $totalApprovedCount,
+            'email_dispatched' => $emailDispatched,
+            'custom_message' => $customMessage,
+        ];
+        $history[] = $deliveryRecord;
+        $meta['media_delivery_history'] = $history;
+        $meta['last_media_sent_to_client'] = $deliveryRecord;
+        $order->update(['meta' => $meta]);
+
+        return response()->json([
+            'success' => true,
+            'message' => "Media for '{$serviceName}' successfully sent to the client.",
+            'data' => [
+                'order_id' => $order->id,
+                'order_uuid' => $order->uuid,
+                'service_name' => $serviceName,
+                'media_count' => $totalApprovedCount,
+                'email_dispatched' => $emailDispatched,
+                'delivery' => $deliveryRecord,
+            ],
         ]);
     }
 

@@ -107,6 +107,8 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api
     Route::match(['put', 'patch', 'post'], 'orders/{uuid}', [OrderController::class, 'update']);
     Route::post('orders/slots/{slot_uuid}/reassign', [OrderController::class, 'reassignSlot']);
     Route::post('orders/slots/swap', [OrderController::class, 'swapSlots']);
+    Route::post('orders/{uuid}/send-to-client', [OrderController::class, 'sendMediaToClient']);
+    Route::post('orders/send-to-client', [OrderController::class, 'sendMediaToClient']);
 
     Route::get('/settings/{key}', [SettingsController::class, 'show']);
     Route::get('/matterport', [TourController::class, 'getMatterPortData']);
