@@ -10,18 +10,18 @@
     "license": "MIT",
     "require": {
         "php": "^8.2",
+        "aws/aws-sdk-php": "^3.0",
+        "barryvdh/laravel-dompdf": "^3.1",
         "doctrine/dbal": "^4.2",
+        "intervention/image": "^3.11",
+        "intervention/image-laravel": "*",
         "laravel/framework": "^12.0",
         "laravel/passport": "^13.0",
         "laravel/tinker": "^2.10.1",
-        "quickbooks/v3-php-sdk": "^6.2",
-        "stripe/stripe-php": "^18.0",
-        "pulkitjalan/google-apiclient": "^6.3",
-        "aws/aws-sdk-php": "^3.0",
-        "intervention/image": "^3.11",
         "league/flysystem-aws-s3-v3": "^3.0",
-        "intervention/image-laravel": "*",
-        "barryvdh/laravel-dompdf": "^3.1"
+        "pulkitjalan/google-apiclient": "^6.3",
+        "quickbooks/v3-php-sdk": "^6.2",
+        "stripe/stripe-php": "^18.0"
     },
     "require-dev": {
         "fakerphp/faker": "^1.23",

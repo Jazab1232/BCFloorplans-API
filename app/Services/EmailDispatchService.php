@@ -1023,7 +1023,38 @@ class EmailDispatchService
                 $subject = str_replace('{{' . $key . '}}', (string) $val, $subject);
             }
 
-            return new \App\Mail\DynamicMailable($parsedContent, $subject, $org, $recipient['role']);
+            $dynAttachments = [];
+            if ($eventType === 'agent_payment_received' || !empty($data['invoice']) || !empty($data['invoice_id']) || !empty($data['invoice_uuid'])) {
+                try {
+                    $invoice = null;
+                    if (!empty($data['invoice']) && $data['invoice'] instanceof \App\Models\Invoice) {
+                        $invoice = $data['invoice'];
+                    } elseif (!empty($data['invoice_id'])) {
+                        $invoice = \App\Models\Invoice::find($data['invoice_id']);
+                    } elseif (!empty($data['invoice_uuid'])) {
+                        $invoice = \App\Models\Invoice::where('uuid', $data['invoice_uuid'])->first();
+                    } elseif (!empty($data['payment']) && $data['payment'] instanceof \App\Models\AgentPayment) {
+                        $invoice = $data['payment']->invoice ?: ($data['payment']->invoice_id ? \App\Models\Invoice::find($data['payment']->invoice_id) : null);
+                    }
+                    if (!$invoice && !empty($data['order']) && $data['order'] instanceof \App\Models\Order) {
+                        $invoice = $data['order']->invoices()->latest('id')->first();
+                    }
+
+                    if ($invoice) {
+                        /** @var \App\Services\InvoicePdfService $pdfService */
+                        $pdfService = app(\App\Services\InvoicePdfService::class);
+                        $pdfBytes = $pdfService->getPdfBytes($invoice);
+                        $fileName = $pdfService->getFileName($invoice);
+
+                        $dynAttachments[] = \Illuminate\Mail\Mailables\Attachment::fromData(fn () => $pdfBytes, $fileName)
+                            ->withMime('application/pdf');
+                    }
+                } catch (\Throwable $e) {
+                    \Illuminate\Support\Facades\Log::warning("Failed attaching invoice PDF to DynamicMailable: " . $e->getMessage());
+                }
+            }
+
+            return new \App\Mail\DynamicMailable($parsedContent, $subject, $org, $recipient['role'], $dynAttachments);
         }
 
         // 2. Fall back to Blade Mailable
@@ -1259,14 +1290,74 @@ class EmailDispatchService
                     $html = method_exists($mailable, 'render') ? $mailable->render() : '';
                 }
 
+                // Resolve attachments from mailable (if any)
+                $resendAttachments = [];
+                if (method_exists($mailable, 'attachments')) {
+                    try {
+                        $mailAttachments = $mailable->attachments();
+                        if (is_array($mailAttachments)) {
+                            foreach ($mailAttachments as $att) {
+                                if ($att instanceof \Illuminate\Mail\Attachment) {
+                                    $filename = $att->as ?? 'attachment.pdf';
+                                    $contentBase64 = null;
+                                    $att->attachWith(
+                                        function ($path, $attachment) use (&$contentBase64, &$filename) {
+                                            if (file_exists($path)) {
+                                                $contentBase64 = base64_encode(file_get_contents($path));
+                                                $filename = $attachment->as ?: basename($path);
+                                            }
+                                        },
+                                        function ($data, $attachment) use (&$contentBase64, &$filename) {
+                                            $raw = is_callable($data) ? $data() : $data;
+                                            if ($raw) {
+                                                $contentBase64 = base64_encode($raw);
+                                            }
+                                        }
+                                    );
+                                    if ($contentBase64 && $filename) {
+                                        $resendAttachments[] = [
+                                            'filename' => $filename,
+                                            'content'  => $contentBase64,
+                                        ];
+                                    }
+                                } elseif (is_array($att) && isset($att['content'], $att['filename'])) {
+                                    $resendAttachments[] = [
+                                        'filename' => $att['filename'],
+                                        'content'  => base64_encode($att['content']),
+                                    ];
+                                }
+                            }
+                        }
+                    } catch (\Throwable $attErr) {
+                        Log::warning("EmailDispatchService: Failed resolving attachments for Resend: " . $attErr->getMessage());
+                    }
+                }
+
+                if (!empty($mailable->rawAttachments) && is_array($mailable->rawAttachments)) {
+                    foreach ($mailable->rawAttachments as $rawAtt) {
+                        if (!empty($rawAtt['data']) && !empty($rawAtt['name'])) {
+                            $resendAttachments[] = [
+                                'filename' => $rawAtt['name'],
+                                'content'  => base64_encode(is_callable($rawAtt['data']) ? $rawAtt['data']() : $rawAtt['data']),
+                            ];
+                        }
+                    }
+                }
+
+                $payload = [
+                    'from' => "{$fromName} <{$fromEmail}>",
+                    'to' => [$toEmail],
+                    'subject' => $subject,
+                    'html' => $html,
+                ];
+
+                if (!empty($resendAttachments)) {
+                    $payload['attachments'] = $resendAttachments;
+                }
+
                 $response = \Illuminate\Support\Facades\Http::withToken($resendApiKey)
-                    ->timeout(10)
-                    ->post('https://api.resend.com/emails', [
-                        'from' => "{$fromName} <{$fromEmail}>",
-                        'to' => [$toEmail],
-                        'subject' => $subject,
-                        'html' => $html,
-                    ]);
+                    ->timeout(25)
+                    ->post('https://api.resend.com/emails', $payload);
 
                 if (!$response->successful()) {
                     throw new \Exception("Resend API error (" . $response->status() . "): " . $response->body());

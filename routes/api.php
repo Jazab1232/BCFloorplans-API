@@ -230,6 +230,13 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api
         Route::get('/sync-status', [GoogleCalendarController::class, 'getSyncStatus']);
         Route::post('/sync-manual', [GoogleCalendarController::class, 'syncManual']);
     });
+
+    // Invoices - read and PDF access for all roles (Agent, Sub-Account, Admin)
+    Route::prefix('invoices')->group(function () {
+        Route::get('/', [InvoiceController::class, 'index']);
+        Route::get('/{uuid}', [InvoiceController::class, 'show']);
+        Route::get('/{uuid}/pdf', [InvoiceController::class, 'downloadPdf']);
+    });
 });
 
 Route::get('/auth/google/callback', [GoogleCalendarController::class, 'handleGoogleCallback'])
@@ -423,12 +430,9 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api", "resolve
     // routes/api.php
     Route::get('/stripe/session', [AgentPaymentController::class, 'getSessionDetails']);
 
-    // Invoice management
+    // Invoice management (admin mutations and exports)
     Route::prefix('invoices')->group(function () {
-        Route::get('/', [InvoiceController::class, 'index']);
         Route::get('export/csv', [InvoiceController::class, 'exportCsv']);
-        Route::get('/{uuid}', [InvoiceController::class, 'show']);
-        Route::get('/{uuid}/pdf', [InvoiceController::class, 'downloadPdf']);
         Route::post('/', [InvoiceController::class, 'store']);
         Route::match(['put', 'patch'], '/{uuid}', [InvoiceController::class, 'update']);
         Route::post('/{uuid}/void', [InvoiceController::class, 'void']);

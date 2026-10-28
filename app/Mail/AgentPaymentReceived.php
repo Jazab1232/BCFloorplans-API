@@ -132,6 +132,13 @@ class AgentPaymentReceived extends Mailable
             return $this->order->invoices()->latest('id')->first();
         }
 
+        if ($this->payment && $this->payment->order_id) {
+            $order = Order::find($this->payment->order_id);
+            if ($order) {
+                return $order->invoices()->latest('id')->first();
+            }
+        }
+
         return null;
     }
 

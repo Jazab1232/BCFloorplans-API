@@ -17,16 +17,18 @@ class DynamicMailable extends Mailable
     public $subjectText;
     public $organization;
     public $recipientRole;
+    public $emailAttachments;
 
     /**
      * Create a new message instance.
      */
-    public function __construct(string $content, string $subjectText, ?Organization $org, string $recipientRole)
+    public function __construct(string $content, string $subjectText, ?Organization $org, string $recipientRole, array $attachments = [])
     {
         $this->content = $content;
         $this->subjectText = $subjectText;
         $this->organization = $org;
         $this->recipientRole = $recipientRole;
+        $this->emailAttachments = $attachments;
     }
 
     /**
@@ -54,6 +56,6 @@ class DynamicMailable extends Mailable
      */
     public function attachments(): array
     {
-        return [];
+        return $this->emailAttachments ?? [];
     }
 }
