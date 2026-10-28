@@ -160,6 +160,8 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api
     // Tours - basic access for all
     Route::get('tours/{uuid}', [TourController::class, 'show']);
     Route::get('tours/order/{order_uuid}', [TourController::class, 'getByOrder']);
+    Route::get('tours/order/{order_uuid}/processing-status', [TourController::class, 'getProcessingStatus']);
+    Route::post('tours/order/{order_uuid}/reprocess-watermarks', [TourController::class, 'reprocessWatermarks']);
     Route::post('tours', [TourController::class, 'store']);
     Route::match(['put', 'patch'], 'tours/{uuid}', [TourController::class, 'update']);
     Route::delete('tours/{uuid}', [TourController::class, 'destroy']);

@@ -73,6 +73,10 @@ class ProcessUploadedImage implements ShouldQueue, ShouldBeUnique
 
     public function handle(ImageResizeService $resizer): void
     {
+        @ini_set('max_execution_time', '0');
+        @set_time_limit(0);
+        @ignore_user_abort(true);
+
         $attempt = $this->attempts();
         Log::info("[MEDIA-JOB] START uuid={$this->tourFile->uuid} path={$this->tourFile->file_path} attempt={$attempt}");
 
@@ -110,6 +114,7 @@ class ProcessUploadedImage implements ShouldQueue, ShouldBeUnique
                 'variants' => $variants,
                 'is_processing' => false,
             ]);
+            $this->tourFile->touch();
 
             if (empty($variants)) {
                 Log::warning("[MEDIA-JOB] SKIPPED variants were empty for uuid={$this->tourFile->uuid}");
@@ -120,6 +125,10 @@ class ProcessUploadedImage implements ShouldQueue, ShouldBeUnique
         } catch (Throwable $e) {
             $memory = round(memory_get_usage() / 1024 / 1024, 2);
             Log::error("[MEDIA-JOB] FAILED uuid={$this->tourFile->uuid} error=" . $e->getMessage() . " memory={$memory}MB");
+            try {
+                $this->tourFile->update(['is_processing' => false]);
+            } catch (Throwable $ignored) {
+            }
             throw $e;
         }
     }

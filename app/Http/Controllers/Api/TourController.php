@@ -1416,6 +1416,9 @@ class TourController extends Controller
             $includeHidden = $request->boolean('include_hidden');
             $order = Order::with('services')->where('uuid', $orderUuid)->firstOrFail();
 
+            // Auto-recover any files that have been stuck in is_processing for > 10 minutes
+            \App\Services\MediaProcessingService::autoRecoverStuckFiles($order->id);
+
             // Consolidate any duplicate tours for this order
             $this->consolidateToursForOrder($order->id);
             
@@ -1515,9 +1518,33 @@ class TourController extends Controller
                 return $tour;
             });
 
+            $totalPhotos = 0;
+            $processingPhotos = 0;
+            foreach ($tours as $tour) {
+                if ($tour->files) {
+                    foreach ($tour->files as $f) {
+                        if ($f->type === 'photo') {
+                            $totalPhotos++;
+                            if (!empty($f->is_processing)) {
+                                $processingPhotos++;
+                            }
+                        }
+                    }
+                }
+            }
+            $completedPhotos = $totalPhotos - $processingPhotos;
+            $percent = $totalPhotos > 0 ? (int) round(($completedPhotos / $totalPhotos) * 100) : 100;
+
             return response()->json([
                 'success' => true,
                 'data' => $tours,
+                'processing_summary' => [
+                    'is_processing' => $processingPhotos > 0,
+                    'total' => $totalPhotos,
+                    'processing' => $processingPhotos,
+                    'completed' => $completedPhotos,
+                    'percent' => $percent,
+                ],
                 'message' => 'Tours fetched successfully',
             ]);
         } catch (\Exception $e) {
@@ -1525,6 +1552,92 @@ class TourController extends Controller
                 'success' => false,
                 'message' => 'Error: ' . $e->getMessage(),
             ], 404);
+        }
+    }
+
+    /**
+     * Get image processing status for an order
+     * GET /api/tours/order/{order_uuid}/processing-status
+     */
+    public function getProcessingStatus(Request $request, $orderUuid)
+    {
+        try {
+            $order = Order::where('uuid', $orderUuid)->firstOrFail();
+
+            // Auto-recover any files that have been stuck in is_processing for > 10 minutes
+            \App\Services\MediaProcessingService::autoRecoverStuckFiles($order->id);
+
+            $tourFiles = TourFile::where('type', 'photo')
+                ->whereHas('tour', function ($q) use ($order) {
+                    $q->where('order_id', $order->id);
+                })
+                ->get();
+
+            $totalPhotos = $tourFiles->count();
+            $processingPhotos = $tourFiles->where('is_processing', true)->count();
+            $completedPhotos = $totalPhotos - $processingPhotos;
+            $percent = $totalPhotos > 0 ? (int) round(($completedPhotos / $totalPhotos) * 100) : 100;
+
+            $filesData = $tourFiles->map(function ($f) {
+                return [
+                    'uuid' => $f->uuid,
+                    'service_id' => $f->service_id,
+                    'is_processing' => (bool) $f->is_processing,
+                    'has_variants' => !empty($f->variants),
+                    'thumbnail_url' => $f->thumbnail_url,
+                    'variant_urls' => $f->variant_urls,
+                ];
+            });
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'is_processing' => $processingPhotos > 0,
+                    'total' => $totalPhotos,
+                    'processing' => $processingPhotos,
+                    'completed' => $completedPhotos,
+                    'percent' => $percent,
+                    'files' => $filesData,
+                ],
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Error: ' . $e->getMessage(),
+            ], 404);
+        }
+    }
+
+    /**
+     * Trigger watermark removal reprocessing on demand
+     * POST /api/tours/order/{order_uuid}/reprocess-watermarks
+     */
+    public function reprocessWatermarks(Request $request, $orderUuid)
+    {
+        try {
+            $order = Order::where('uuid', $orderUuid)->firstOrFail();
+
+            $count = TourFile::where('type', 'photo')
+                ->whereHas('tour', function ($q) use ($order) {
+                    $q->where('order_id', $order->id);
+                })
+                ->count();
+
+            // Dispatch via MediaProcessingService (runs in background CLI if sync, or queues if worker is enabled)
+            \App\Services\MediaProcessingService::dispatchOrderReprocessing($order, true);
+
+            return response()->json([
+                'success' => true,
+                'message' => "Reprocessing queued for {$count} images",
+                'data' => [
+                    'queued_count' => $count,
+                ],
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Error: ' . $e->getMessage(),
+            ], 500);
         }
     }
 

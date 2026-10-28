@@ -245,7 +245,10 @@ class StripeAgentWebhookController extends Controller
                     'has_payment_object' => $payment ? true : false,
                 ]);
 
-                DB::transaction(function () use ($orderId, $amount, $paymentType, $serviceUuid, $payment) {
+                $reprocessOrder = null;
+                $targetReprocessFileIds = null;
+
+                DB::transaction(function () use (&$reprocessOrder, &$targetReprocessFileIds, $orderId, $amount, $paymentType, $serviceUuid, $payment) {
                     $order = Order::where('id', intval($orderId))
                         ->first();
 
@@ -357,7 +360,7 @@ class StripeAgentWebhookController extends Controller
                         Log::warning('Failed to check print readiness after payment: ' . $e->getMessage());
                     }
 
-                    // Trigger background reprocessing of photos to generate unwatermarked variants once paid
+                    // Identify photos that need to be reprocessed without watermarks now that payment is made
                     try {
                         $paidServiceIds = [];
                         if (($paymentType === 'service' || $paymentType === 'partial') && $serviceUuid) {
@@ -377,7 +380,7 @@ class StripeAgentWebhookController extends Controller
                                 $q->where('order_id', $order->id);
                             });
 
-                        // If the entire order is not fully paid, reprocess files for all paid order services
+                        // If the entire order is not fully paid, only reprocess files for paid order services
                         if ($order->payment_status !== 'PAID') {
                             $orderPaidServices = $order->services()
                                 ->where('payment_status', 'PAID')
@@ -388,22 +391,24 @@ class StripeAgentWebhookController extends Controller
 
                             if (!empty($allPaidServiceIds)) {
                                 $tourFilesQuery->whereIn('service_id', $allPaidServiceIds);
+                            } else {
+                                $tourFilesQuery->whereRaw('1 = 0');
                             }
                         }
 
-                        $tourFiles = $tourFilesQuery->get();
-
-                        foreach ($tourFiles as $tourFile) {
-                            \App\Jobs\ProcessUploadedImage::dispatch($tourFile)
-                                ->onQueue('image-processing')
-                                ->afterCommit();
-                            Log::info('Queued unwatermarked image reprocessing after payment commit', [
-                                'file_id' => $tourFile->id,
+                        $targetFileIds = $tourFilesQuery->pluck('id')->toArray();
+                        if (!empty($targetFileIds)) {
+                            $reprocessOrder = $order;
+                            $targetReprocessFileIds = $targetFileIds;
+                            // Mark immediately so UI sees is_processing as soon as transaction commits
+                            \App\Models\TourFile::whereIn('id', $targetFileIds)->update(['is_processing' => true]);
+                            Log::info('Marked photos as is_processing for post-payment reprocessing', [
                                 'order_id' => $order->id,
+                                'count' => count($targetFileIds),
                             ]);
                         }
                     } catch (\Throwable $e) {
-                        Log::error('Failed to queue unwatermarked image reprocessing after payment', [
+                        Log::error('Failed to prepare photos for post-payment reprocessing', [
                             'order_id' => $order->id,
                             'error' => $e->getMessage(),
                         ]);
@@ -425,6 +430,22 @@ class StripeAgentWebhookController extends Controller
                         self::createWebhookPaymentNotification($payment, $order);
                     }
                 });
+
+                // Dispatch background image reprocessing after transaction commit
+                if ($reprocessOrder && !empty($targetReprocessFileIds)) {
+                    try {
+                        \App\Services\MediaProcessingService::dispatchOrderReprocessing($reprocessOrder, true, $targetReprocessFileIds);
+                        Log::info('Dispatched post-payment unwatermarked image reprocessing', [
+                            'order_id' => $reprocessOrder->id,
+                            'photo_count' => count($targetReprocessFileIds),
+                        ]);
+                    } catch (\Throwable $e) {
+                        Log::error('Failed to dispatch post-payment image reprocessing', [
+                            'order_id' => $reprocessOrder->id,
+                            'error' => $e->getMessage(),
+                        ]);
+                    }
+                }
             } catch (\Throwable $e) {
                 Log::error(' Error updating order after payment: ' . $e->getMessage(), [
                     'order_id' => $orderId,

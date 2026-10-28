@@ -50,6 +50,7 @@ class ImageResizeService
         }
 
         try {
+            @set_time_limit(300);
             $startTime = microtime(true);
             $initialMemory = round(memory_get_usage() / 1024 / 1024, 2);
             Log::debug("[MEDIA-PROCESS] START s3_key={$originalS3Key} | memory={$initialMemory}MB");
@@ -98,6 +99,7 @@ class ImageResizeService
 
             foreach ($variants as $variantName => $config) {
                 try {
+                    @set_time_limit(300);
                     $this->checkMemoryPressure();
 
                     $vStartTime = microtime(true);

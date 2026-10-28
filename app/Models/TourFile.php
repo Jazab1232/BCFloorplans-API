@@ -96,10 +96,11 @@ class TourFile extends Model
             if ($orderPaid) {
                 return true;
             }
+            // If order exists and is unpaid and not released before payment
+            return false;
         }
 
-        // Fallback: If no service linked or no orderservice found, return true to avoid incorrectly locking old media.
-        return true;
+        return false;
     }
 
     public function tour()
@@ -142,10 +143,6 @@ class TourFile extends Model
 
     public function getThumbnailUrlAttribute()
     {
-        if ($this->is_processing) {
-            return null;
-        }
-
         // Security check: if PDF/Video and not paid, don't return thumbnail (which would be original URL for PDFs)
         if (in_array($this->type, ['pdf', 'video']) && !$this->is_paid) {
             return null;
@@ -154,6 +151,10 @@ class TourFile extends Model
         if (!empty($this->variants) && isset($this->variants['thumb'])) {
             $url = Storage::disk('s3')->url($this->variants['thumb']);
             return $this->appendCacheBuster($url);
+        }
+
+        if ($this->is_processing) {
+            return null;
         }
 
         return $this->url;

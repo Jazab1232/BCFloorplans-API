@@ -414,6 +414,7 @@ class OrderController extends Controller
             ]);
             
             $bestPackage = $packageDetectionService->getBestPackage($applicablePackages, $serviceAmounts);
+            $packageDiscountAmount = 0;
 
             // Log package detection results and apply if found
             if ($bestPackage) {
@@ -1294,22 +1295,14 @@ class OrderController extends Controller
         // Trigger background reprocessing of photos if release_media_before_payment or payment_status changed
         if (!empty($mediaSettingsChanged)) {
             try {
-                $tourFiles = \App\Models\TourFile::where('type', 'photo')
-                    ->whereHas('tour', function ($q) use ($order) {
-                        $q->where('order_id', $order->id);
-                    })->get();
-
-                foreach ($tourFiles as $tourFile) {
-                    \App\Jobs\ProcessUploadedImage::dispatch($tourFile)->onQueue('image-processing');
-                    Log::info('Queued image reprocessing after order update', [
-                        'file_id' => $tourFile->id,
-                        'order_id' => $order->id,
-                        'release_media' => $order->release_media_before_payment,
-                        'payment_status' => $order->payment_status,
-                    ]);
-                }
+                \App\Services\MediaProcessingService::dispatchOrderReprocessing($order, true);
+                Log::info('Triggered image reprocessing after order update', [
+                    'order_id' => $order->id,
+                    'release_media' => $order->release_media_before_payment,
+                    'payment_status' => $order->payment_status,
+                ]);
             } catch (\Throwable $e) {
-                Log::error('Failed to queue image reprocessing after order update', [
+                Log::error('Failed to trigger image reprocessing after order update', [
                     'order_id' => $order->id,
                     'error' => $e->getMessage(),
                 ]);
@@ -2206,6 +2199,7 @@ private function recalculateTotals($order, array $discounts, array $serviceAmoun
     $order->totals()->delete();
 
     $discountAmount = 0;
+    $packageDiscountAmount = 0;
     $orderTotals = [];
 
     // Check for package discount in meta
@@ -3176,7 +3170,35 @@ private function createOrderNotification($order, array $changes)
             ], 404);
         }
 
+        $mediaAccessChanged = $orderService->media_access !== (bool)$request->media_access;
         $orderService->update(['media_access' => $request->media_access]);
+
+        if ($mediaAccessChanged) {
+            try {
+                $targetFileIds = \App\Models\TourFile::where('service_id', $orderService->service_id)
+                    ->whereHas('tour', function($q) use ($order) {
+                        $q->where('order_id', $order->id);
+                    })
+                    ->where('type', 'photo')
+                    ->pluck('id')
+                    ->toArray();
+
+                if (!empty($targetFileIds)) {
+                    \App\Services\MediaProcessingService::dispatchOrderReprocessing($order, true, $targetFileIds);
+                    Log::info('Triggered image reprocessing after service media access change', [
+                        'order_id' => $order->id,
+                        'service_id' => $orderService->service_id,
+                        'media_access' => $orderService->media_access,
+                        'photo_count' => count($targetFileIds),
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                Log::error('Failed to trigger image reprocessing after service media access change', [
+                    'order_id' => $order->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
 
         return response()->json([
             'success' => true,
