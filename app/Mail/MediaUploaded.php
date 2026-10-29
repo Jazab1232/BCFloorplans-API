@@ -60,6 +60,7 @@ class MediaUploaded extends Mailable
         $mediaCount = $this->data['media_count'] ?? 1;
         $uploadedBy = $this->data['uploaded_by'] ?? 'Vendor';
         $isApproved = !empty($this->data['is_approved']);
+        $customMessage = $this->data['custom_message'] ?? null;
 
         return new Content(
             view: 'emails.media_uploaded',
@@ -74,6 +75,7 @@ class MediaUploaded extends Mailable
                 'mediaCount'      => $mediaCount,
                 'uploadedBy'      => $uploadedBy,
                 'isApproved'      => $isApproved,
+                'customMessage'   => $customMessage,
                 'data'            => $this->data,
             ],
         );

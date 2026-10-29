@@ -195,7 +195,7 @@ return [
             'admin' => false,
             'agent' => true,
         ],
-        'variables' => ['order_id', 'property_address', 'service_name', 'agent_name', 'service_url', 'media_count', 'uploaded_by'],
+        'variables' => ['order_id', 'property_address', 'service_name', 'agent_name', 'service_url', 'media_count', 'uploaded_by', 'custom_message'],
         'mailable_class' => \App\Mail\MediaUploaded::class,
     ],
 ];

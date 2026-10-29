@@ -47,8 +47,8 @@ class EmailDispatchService
 
         $dispatchedCount = 0;
         foreach ($recipients as $recipient) {
-            // Check notification preferences — skip if disabled
-            if (!$this->isEmailEnabled($org, $recipient, $eventType)) {
+            // Check notification preferences — skip if disabled (unless force / bypass_preferences is set)
+            if (!$this->isEmailEnabled($org, $recipient, $eventType, $options)) {
                 Log::info("EmailDispatchService: Skipping email to {$recipient['email']} (role: {$recipient['role']}) - preference disabled");
                 continue;
             }
@@ -481,8 +481,13 @@ class EmailDispatchService
     /**
      * Check if the notification email is enabled for this event and role.
      */
-    protected function isEmailEnabled(?Organization $org, array $recipient, string $eventType): bool
+    protected function isEmailEnabled(?Organization $org, array $recipient, string $eventType, array $options = []): bool
     {
+        // Explicit force or manual dispatch bypasses preferences (e.g. manual Send To Client action)
+        if (!empty($options['force']) || !empty($options['bypass_preferences'])) {
+            return true;
+        }
+
         $eventConfig = config("email-events.{$eventType}");
         if (!$eventConfig) {
             return false;
@@ -965,6 +970,7 @@ class EmailDispatchService
                 'agent_name' => $data['agent_name'] ?? $data['agentName'] ?? '',
                 'amount' => $data['amount'] ?? '',
                 'service_name' => $data['service_name'] ?? '',
+                'custom_message' => $data['custom_message'] ?? '',
                 'changes_summary' => $changesSummary,
                 // Password reset
                 'name' => $data['recipient_name'] ?? '',

@@ -3436,12 +3436,14 @@ private function createOrderNotification($order, array $changes)
         try {
             $dispatchOptions = [
                 'order' => $order,
+                'organization' => $order->organization,
                 'service' => $targetService,
                 'service_name' => $serviceName,
                 'media_count' => $totalApprovedCount,
                 'uploaded_by' => $senderName,
                 'is_approved' => true,
                 'custom_message' => $customMessage,
+                'force' => true,
             ];
 
             // If custom recipient emails specified, pass them
@@ -3453,19 +3455,36 @@ private function createOrderNotification($order, array $changes)
                             'email' => $email,
                             'name' => $order->agent ? trim(($order->agent->first_name ?? '') . ' ' . ($order->agent->last_name ?? '')) : 'Valued Customer',
                             'role' => 'agent',
+                            'model' => $order->agent,
                         ];
                     }
                 }
                 if (!empty($recipients)) {
                     $dispatchOptions['recipients'] = $recipients;
                 }
+            } else {
+                // Ensure Agent is explicitly included as the primary recipient
+                if ($order->agent && !empty($order->agent->email)) {
+                    $dispatchOptions['recipients'] = [
+                        [
+                            'email' => $order->agent->email,
+                            'name' => trim(($order->agent->first_name ?? '') . ' ' . ($order->agent->last_name ?? '')) ?: 'Valued Customer',
+                            'role' => 'agent',
+                            'model' => $order->agent,
+                        ]
+                    ];
+                }
             }
+
+            Log::info("sendMediaToClient: Dispatching media_uploaded email for Order #{$order->id} (uuid: {$order->uuid}) to agent: " . ($order->agent?->email ?? 'none'));
 
             $emailDispatched = app(EmailDispatchService::class)->dispatch(
                 'media_uploaded',
                 $tour,
                 $dispatchOptions
             );
+
+            Log::info("sendMediaToClient: EmailDispatchService returned " . ($emailDispatched ? 'SUCCESS' : 'FAILED/SKIPPED'));
         } catch (\Throwable $emailErr) {
             Log::error("Failed dispatching media_uploaded email on sendMediaToClient: " . $emailErr->getMessage(), [
                 'order_id' => $order->id,
@@ -3492,9 +3511,13 @@ private function createOrderNotification($order, array $changes)
         $meta['last_media_sent_to_client'] = $deliveryRecord;
         $order->update(['meta' => $meta]);
 
+        $responseMessage = $emailDispatched
+            ? "Media for '{$serviceName}' successfully sent to the client."
+            : "Media marked as delivered, but email notification could not be dispatched (agent email missing or service unreachable).";
+
         return response()->json([
             'success' => true,
-            'message' => "Media for '{$serviceName}' successfully sent to the client.",
+            'message' => $responseMessage,
             'data' => [
                 'order_id' => $order->id,
                 'order_uuid' => $order->uuid,

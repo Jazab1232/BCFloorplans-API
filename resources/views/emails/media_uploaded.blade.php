@@ -19,6 +19,19 @@
         @endif
     </p>
 
+    @php
+        $displayMessage = $customMessage ?? ($data['custom_message'] ?? null);
+    @endphp
+
+    @if(!empty($displayMessage))
+        <div style="background-color: #EFF6FF; border-left: 4px solid #3B82F6; padding: 14px 18px; border-radius: 6px; margin: 20px 0 25px;">
+            <p style="font-size: 12px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px; color: #1D4ED8; margin: 0 0 6px;">
+                Note from {{ $uploadedBy ?? 'Team' }}:
+            </p>
+            <p style="font-size: 14px; color: #1E3A8A; line-height: 1.6; margin: 0; white-space: pre-line;">{{ $displayMessage }}</p>
+        </div>
+    @endif
+
     <div style="background-color: #F9FAFB; padding: 20px; border-radius: 8px; border: 1px solid #E5E7EB; margin-bottom: 25px;">
         <table width="100%" style="font-size: 14px; border-collapse: collapse;">
             <tr>
