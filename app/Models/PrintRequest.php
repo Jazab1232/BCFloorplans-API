@@ -26,10 +26,18 @@ class PrintRequest extends Model
         'with_bleed',
         'additional_info',
         'status',
+        'is_read',
+        'read_at',
+        'agent_read',
+        'agent_read_at',
     ];
 
     protected $casts = [
         'with_bleed' => 'boolean',
+        'is_read' => 'boolean',
+        'read_at' => 'datetime',
+        'agent_read' => 'boolean',
+        'agent_read_at' => 'datetime',
         'amount' => 'decimal:2',
     ];
 

@@ -59,6 +59,7 @@ class GoogleCalendarService
                 'google_access_token' => $token['access_token'] ?? $model->google_access_token,
                 'google_refresh_token' => $token['refresh_token'] ?? $model->google_refresh_token,
                 'google_token_expires_at' => Carbon::now()->addSeconds($token['expires_in']),
+                'google_calendar_id' => $model->google_calendar_id ?? 'primary',
                 'sync_google_calendar' => true,
             ]);
 
@@ -629,6 +630,12 @@ class GoogleCalendarService
                     continue;
                 }
 
+                // Filter out BCFloor order events by default so they do not duplicate internal bookings
+                $eventSummary = $event->getSummary() ?? '';
+                if (($options['exclude_order_events'] ?? true) && preg_match('/^Order\s*#\d+/i', $eventSummary)) {
+                    continue;
+                }
+
                 $eventData = [
                     'id' => $event->getId(),
                     'summary' => $event->getSummary() ?? 'Untitled Event',
@@ -640,6 +647,7 @@ class GoogleCalendarService
                     'all_day' => $isAllDay,
                     'status' => $event->getStatus() ?? 'confirmed',
                     'location' => $event->getLocation() ?? '',
+                    'timezone' => $event->start->timeZone ?? $event->end->timeZone ?? null,
                     'created' => $event->getCreated() ? Carbon::parse($event->getCreated())->toDateTimeString() : null,
                     'updated' => $event->getUpdated() ? Carbon::parse($event->getUpdated())->toDateTimeString() : null,
                 ];

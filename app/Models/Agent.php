@@ -99,6 +99,11 @@ class Agent extends Authenticatable
         return 'uuid';
     }
 
+    public function getNameAttribute()
+    {
+        return trim("{$this->first_name} {$this->last_name}") ?: ($this->company_name ?: 'Agent');
+    }
+
     public function getAvatarUrlAttribute()
     {
         return $this->avatar ? Storage::disk('s3')->url('agents/' . $this->uuid . '/' . $this->avatar) : null;

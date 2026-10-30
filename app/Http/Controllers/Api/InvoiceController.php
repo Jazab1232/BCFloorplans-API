@@ -210,7 +210,7 @@ class InvoiceController extends Controller
                 'items',
                 'items.orderService:id,uuid,service_id,amount',
                 'items.orderService.service:id,name',
-                'payments:id,uuid,amount,status,paid_at,stripe_receipt_url,payment_method',
+                'payments:id,uuid,invoice_id,amount,status,paid_at,stripe_receipt_url,payment_method',
             ]);
 
             if ($isAgent) {
@@ -248,8 +248,21 @@ class InvoiceController extends Controller
                 $query->where('status', $request->status);
             }
             if ($request->filled('order_uuid')) {
-                $order = Order::where('uuid', $request->order_uuid)->first();
-                if ($order) $query->where('order_id', $order->id);
+                $orderUuid = trim((string)$request->order_uuid);
+                if (!Str::isUuid($orderUuid)) {
+                    return response()->json([
+                        'success' => true,
+                        'data'    => [],
+                    ]);
+                }
+                $order = Order::where('uuid', $orderUuid)->first();
+                if (!$order) {
+                    return response()->json([
+                        'success' => true,
+                        'data'    => [],
+                    ]);
+                }
+                $query->where('order_id', $order->id);
             }
 
             $invoices = $query->orderByDesc('created_at')->get();
@@ -274,7 +287,7 @@ class InvoiceController extends Controller
                 'items',
                 'items.orderService:id,uuid,service_id,amount',
                 'items.orderService.service:id,name',
-                'payments:id,uuid,amount,status,paid_at,stripe_receipt_url,payment_method',
+                'payments:id,uuid,invoice_id,amount,status,paid_at,stripe_receipt_url,payment_method',
             ])->where('uuid', $uuid)->firstOrFail();
 
             $this->authorizeInvoiceAccess($invoice);
@@ -367,6 +380,30 @@ class InvoiceController extends Controller
                 }
             } else {
                 $serviceUuids  = $request->service_uuids ?? null;
+
+                // Check if an unpaid invoice already exists for these exact service(s)
+                if ($serviceUuids && count($serviceUuids) === 1) {
+                    $targetOs = OrderService::where('uuid', $serviceUuids[0])->where('order_id', $order->id)->first();
+                    if ($targetOs) {
+                        $existingInvoice = Invoice::where('order_id', $order->id)
+                            ->whereIn('status', ['draft', 'issued'])
+                            ->whereHas('items', function ($q) use ($targetOs) {
+                                $q->where('order_service_id', $targetOs->id);
+                            })
+                            ->latest()
+                            ->first();
+
+                        if ($existingInvoice) {
+                            DB::rollBack();
+                            return response()->json([
+                                'success' => true,
+                                'message' => 'Existing invoice found for service.',
+                                'data'    => $existingInvoice->load('items'),
+                            ], 200);
+                        }
+                    }
+                }
+
                 $servicesQuery = $order->services()->with('service');
 
                 if ($serviceUuids) {
@@ -383,7 +420,7 @@ class InvoiceController extends Controller
                     $addOns = is_array($os->add_ons) ? $os->add_ons : [];
                     $addOnTotal = collect($addOns)->sum(fn($a) => (float)($a['amount'] ?? 0));
                     $baseAmount = max(0, (float) $os->amount - $addOnTotal);
-                    $serviceName = $os->service->name ?? 'Service';
+                    $serviceName = !empty($os->custom) ? $os->custom : ($os->service->name ?? 'Service');
 
                     $lineItems[] = [
                         'order_service_id' => $os->id,

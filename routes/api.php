@@ -226,6 +226,15 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api
         Route::post('/{featureSheetUuid}/print-request', [PrintRequestController::class, 'store']);
     });
 
+    // Print Requests (Admin & Agent read)
+    Route::prefix('admin/print-requests')->group(function () {
+        Route::get('/', [PrintRequestController::class, 'index']);
+        Route::get('/unread-count', [PrintRequestController::class, 'unreadCount']);
+        Route::get('/{request_uuid}/invoice', [PrintRequestController::class, 'getInvoice']);
+        Route::patch('/{request_uuid}/read', [PrintRequestController::class, 'markAsRead']);
+        Route::post('/mark-all-read', [PrintRequestController::class, 'markAllRead']);
+    });
+
     // Calendar Sync Status & Retrospective Sync (Vendor & Agent)
     Route::prefix('calendar')->group(function () {
         Route::get('/sync-status', [GoogleCalendarController::class, 'getSyncStatus']);
@@ -386,9 +395,8 @@ Route::group(["middleware" => ["auth:api", "resolve.org"]], function () {
         Route::delete('/{uuid}', [EmailTemplateController::class, 'destroy']);
     });
 
-    // Print Requests (Admin)
+    // Print Requests status update (Admin only)
     Route::prefix('admin/print-requests')->group(function () {
-        Route::get('/', [PrintRequestController::class, 'index']);
         Route::patch('/{request_uuid}', [PrintRequestController::class, 'update']);
     });
 

@@ -20,7 +20,7 @@ class Vendor extends Authenticatable
         'name_on_booking', 'review_files', 'sync_google_calendar', 'sync_google',
         'sync_email', 'avatar', 'status', 'coordinates',
         'stripe_account_id', 'stripe_connect','pay_outside','google_access_token',
-        'google_refresh_token', 'google_token_expires_at',
+        'google_refresh_token', 'google_token_expires_at', 'google_calendar_id',
         'organization_id', 'quickbooks_vendor_id', 'quickbooks_synced_at',
     ];
 

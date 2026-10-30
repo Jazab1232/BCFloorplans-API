@@ -26,9 +26,6 @@ class GoogleCalendarController extends Controller
     protected function getAuthenticatedModel(Request $request)
     {
         $user = $request->user();
-        if ($user instanceof Vendor || $user instanceof Agent) {
-            return $user;
-        }
 
         // 1. Prioritize explicit UUID parameters passed via payload or query string
         $agentUuid = $request->input('agent_uuid') ?? $request->query('agent_uuid') ?? $request->input('agent_id') ?? $request->query('agent_id');
@@ -43,23 +40,45 @@ class GoogleCalendarController extends Controller
             if ($vendor) return $vendor;
         }
 
-        // 2. Fallback to logged-in user guard resolution
+        // 2. Extract from redirect_back_url or Referer header if present
+        $contextUrl = $request->input('redirect_back_url') ?? $request->query('redirect_back_url') ?? $request->header('referer') ?? '';
+        $isVendorRoute = $request->is('*vendor*') || str_contains($contextUrl, 'vendor');
+        $isAgentRoute = $request->is('*agent*') || str_contains($contextUrl, 'agent');
+
+        if (!empty($contextUrl)) {
+            if ($isVendorRoute && preg_match('/(?:id=|vendors\/)([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i', $contextUrl, $matches)) {
+                $vendor = Vendor::where('uuid', $matches[1])->first();
+                if ($vendor) return $vendor;
+            }
+
+            if ($isAgentRoute && preg_match('/(?:id=|agents\/)([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i', $contextUrl, $matches)) {
+                $agent = Agent::where('uuid', $matches[1])->first();
+                if ($agent) return $agent;
+            }
+        }
+
+        // 3. Fallback to authenticated user model if directly a Vendor or Agent
+        if ($user instanceof Vendor || $user instanceof Agent) {
+            return $user;
+        }
+
+        // 4. Fallback to logged-in user guard resolution
         if ($user) {
             // Try to resolve based on common pattern if instance check fails
             if (!empty($user->uuid)) {
                 $vendor = Vendor::where('uuid', $user->uuid)->first();
-                if ($vendor) return $vendor;
+                if ($vendor && ($isVendorRoute || !$isAgentRoute)) return $vendor;
 
                 $agent = Agent::where('uuid', $user->uuid)->first();
-                if ($agent) return $agent;
+                if ($agent && ($isAgentRoute || !$isVendorRoute)) return $agent;
             }
 
             if (!empty($user->email)) {
                 $vendor = Vendor::where('email', $user->email)->first();
-                if ($vendor) return $vendor;
+                if ($vendor && ($isVendorRoute || !$isAgentRoute)) return $vendor;
 
                 $agent = Agent::where('email', $user->email)->first();
-                if ($agent) return $agent;
+                if ($agent && ($isAgentRoute || !$isVendorRoute)) return $agent;
             }
 
             return $user;
@@ -153,6 +172,16 @@ class GoogleCalendarController extends Controller
         } else {
             // Robust fallback if type is generic "User" or any other type
             $model = Agent::where('uuid', $userId)->first() ?? Vendor::where('uuid', $userId)->first();
+        }
+
+        // Secondary fallback: if model is still not found and redirect_back_url has an ID, resolve from URL
+        if (!$model && !empty($redirectBackUrl)) {
+            if (preg_match('/(?:id=|vendors\/)([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i', $redirectBackUrl, $matches)) {
+                $model = Vendor::where('uuid', $matches[1])->first();
+            }
+            if (!$model && preg_match('/(?:id=|agents\/)([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i', $redirectBackUrl, $matches)) {
+                $model = Agent::where('uuid', $matches[1])->first();
+            }
         }
 
         if (!$model) {

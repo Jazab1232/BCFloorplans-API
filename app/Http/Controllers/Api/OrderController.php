@@ -30,10 +30,12 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Arr;
 use Carbon\Carbon;
 use App\Jobs\SyncOrderCalendarEvents;
 use App\Services\PackageDetectionService;
+use App\Services\GoogleCalendarService;
 use App\Mail\OrderCreated;
 use App\Mail\OrderUpdated;
 
@@ -262,6 +264,74 @@ class OrderController extends Controller
                 'data' => null,
                 'message' => $validator->errors(),
             ], 422);
+        }
+
+        // Validate slots against vendor Google Calendar appointments
+        if ($request->filled('slots') && is_array($request->slots)) {
+            $calendarService = class_exists(\App\Services\GoogleCalendarService::class) ? app(\App\Services\GoogleCalendarService::class) : null;
+            if ($calendarService) {
+                foreach ($request->slots as $s) {
+                    $isOverride = !empty($s['schedule_override']);
+                    if ($isOverride) {
+                        continue;
+                    }
+
+                    $slotVendor = Vendor::where('uuid', $s['vendor_id'])->first();
+                    if (!$slotVendor || !$slotVendor->google_access_token || !$slotVendor->sync_google_calendar) {
+                        continue;
+                    }
+
+                    $slotDate = $s['date'] ?? null;
+                    $slotStart = $s['start_time'] ?? null;
+                    $slotEnd = $s['end_time'] ?? null;
+                    if (!$slotDate || !$slotStart || !$slotEnd) {
+                        continue;
+                    }
+
+                    $property = Property::where('uuid', $request->property_id)->first();
+                    $province = $property?->province ?? $property?->state ?? 'AB';
+                    $propertyTz = GoogleCalendarService::resolveTimezoneFromProvince(
+                        $province,
+                        $slotVendor->workHours->first()?->timezone ?? 'America/Vancouver'
+                    );
+
+                    $slotStartDt = Carbon::createFromFormat('Y-m-d H:i:s', "{$slotDate} {$slotStart}", $propertyTz);
+                    $slotEndDt = Carbon::createFromFormat('Y-m-d H:i:s', "{$slotDate} {$slotEnd}", $propertyTz);
+
+                    $cacheKey = "vendor_gcal_events_{$slotVendor->id}_{$slotDate}_{$slotDate}";
+                    try {
+                        $events = Cache::remember($cacheKey, 60, function () use ($calendarService, $slotVendor, $slotDate, $propertyTz) {
+                            $startOfDay = Carbon::createFromFormat('Y-m-d', $slotDate, $propertyTz)->startOfDay();
+                            $endOfDay = Carbon::createFromFormat('Y-m-d', $slotDate, $propertyTz)->endOfDay();
+                            return $calendarService->getEvents(
+                                $slotVendor,
+                                $startOfDay,
+                                $endOfDay,
+                                ['include_cancelled' => false]
+                            );
+                        });
+
+                        foreach ($events as $event) {
+                            if (($event['status'] ?? '') === 'cancelled') continue;
+                            $summary = (string)($event['summary'] ?? '');
+                            if (preg_match('/^Order\s*#\d+/i', $summary)) continue;
+
+                            $evStart = Carbon::parse($event['start'])->setTimezone($propertyTz);
+                            $evEnd = Carbon::parse($event['end'])->setTimezone($propertyTz);
+
+                            if ($slotStartDt->lt($evEnd) && $slotEndDt->gt($evStart)) {
+                                return response()->json([
+                                    'success' => false,
+                                    'data' => null,
+                                    'message' => "The selected time ({$slotStart} - {$slotEnd}) conflicts with an external calendar appointment for {$slotVendor->first_name} {$slotVendor->last_name}.",
+                                ], 422);
+                            }
+                        }
+                    } catch (\Exception $e) {
+                        Log::warning("Google Calendar validation check skipped due to error: " . $e->getMessage());
+                    }
+                }
+            }
         }
 
         try {
@@ -1433,7 +1503,7 @@ class OrderController extends Controller
 
         return response()->json([
             'success' => true,
-            'data' => $this->filterOrderNotes($order->fresh(['agent', 'property', 'package', 'services.service', 'services.option', 'slots', 'totals', 'areas'])),
+            'data' => $this->filterOrderNotes($order->fresh(['agent', 'property', 'package', 'services.service', 'services.option', 'slots', 'totals', 'areas', 'invoices.items'])),
             'message' => 'Order updated successfully',
             'changes' => $changes, // Return changes for frontend reference
         ]);

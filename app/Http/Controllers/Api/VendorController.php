@@ -29,6 +29,7 @@ use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Cache;
 use Carbon\Carbon;
 use App\Services\GoogleCalendarService;
 
@@ -95,8 +96,12 @@ class VendorController extends Controller
 
             $vendors = $query->get();
 
-            $startDate = Carbon::now()->startOfMonth();
-            $endDate = Carbon::now()->endOfMonth();
+            $startDate = $request->filled('start_date')
+                ? Carbon::parse($request->input('start_date'))->startOfDay()
+                : Carbon::now()->startOfMonth();
+            $endDate = $request->filled('end_date')
+                ? Carbon::parse($request->input('end_date'))->endOfDay()
+                : Carbon::now()->addMonths(2)->endOfMonth();
 
             $options = [
                 'include_cancelled' => false,
@@ -112,7 +117,7 @@ class VendorController extends Controller
             foreach ($vendors as $vendor) {
                 $this->populateFallbackPortfolioImages($vendor);
 
-                // Skip external events fetch for general vendor list queries (e.g. Agents)
+                // Skip external events fetch for general vendor list queries if not requested
                 if (!$includeEvents || ($user instanceof Vendor && $vendor->id !== $user->id && !$request->boolean('include_google_events'))) {
                     $vendor->calendar_events = [];
                     continue;
@@ -125,12 +130,47 @@ class VendorController extends Controller
                 }
 
                 try {
-                    $events = $this->calendarService->getEvents(
-                        $vendor,
-                        $startDate,
-                        $endDate,
-                        $options
-                    );
+                    $cacheKey = "vendor_gcal_events_{$vendor->id}_{$startDate->toDateString()}_{$endDate->toDateString()}";
+                    $events = Cache::remember($cacheKey, 120, function () use ($vendor, $startDate, $endDate, $options) {
+                        return $this->calendarService->getEvents(
+                            $vendor,
+                            $startDate,
+                            $endDate,
+                            $options
+                        );
+                    });
+
+                    // Filter out internal BCFloor order events so they don't duplicate bookings
+                    if (is_array($events)) {
+                        $knownOrderEventIds = \App\Models\OrderSlot::where('vendor_id', $vendor->id)
+                            ->whereNotNull('google_event_id')
+                            ->pluck('google_event_id')
+                            ->toArray();
+
+                        $events = array_values(array_filter($events, function ($ev) use ($knownOrderEventIds) {
+                            if (!empty($ev['id']) && in_array($ev['id'], $knownOrderEventIds)) {
+                                return false;
+                            }
+                            if (!empty($ev['summary']) && preg_match('/^Order\s*#\d+/i', $ev['summary'])) {
+                                return false;
+                            }
+                            return true;
+                        }));
+                    }
+
+                    // Privacy check: sanitize summary and description for non-admin and non-self users (e.g. Agents)
+                    $isPrivileged = ($user instanceof \App\Models\User && $user->role === 'admin')
+                        || ($user instanceof Vendor && $user->id === $vendor->id);
+
+                    if (!$isPrivileged && is_array($events)) {
+                        $sanitized = [];
+                        foreach ($events as $ev) {
+                            $ev['summary'] = 'External Event';
+                            $ev['description'] = '';
+                            $sanitized[] = $ev;
+                        }
+                        $events = $sanitized;
+                    }
 
                     $vendor->calendar_events = $events;
                     $vendor->calendar_events_count = count($events);

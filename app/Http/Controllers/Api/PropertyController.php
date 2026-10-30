@@ -182,13 +182,40 @@ class PropertyController extends Controller
             $data['agent_id'] = $agent->id;
             $data['organization_id'] = $agent->organization_id;
 
-            $property = Property::create($data);
+            // Enforce business rule: One property per unique address + suite combination within the organization
+            $addressNorm = strtolower(trim($data['address'] ?? ''));
+            $suiteNorm = isset($data['suite']) && trim($data['suite']) !== '' ? strtolower(trim($data['suite'])) : null;
+            $cityNorm = isset($data['city']) && trim($data['city']) !== '' ? strtolower(trim($data['city'])) : null;
+
+            $existingQuery = Property::where('organization_id', $agent->organization_id)
+                ->whereRaw('LOWER(TRIM(address)) = ?', [$addressNorm]);
+
+            if ($suiteNorm !== null) {
+                $existingQuery->whereRaw('LOWER(TRIM(suite)) = ?', [$suiteNorm]);
+            } else {
+                $existingQuery->where(function ($q) {
+                    $q->whereNull('suite')->orWhereRaw("TRIM(suite) = ''");
+                });
+            }
+
+            if ($cityNorm !== null) {
+                $existingQuery->whereRaw('LOWER(TRIM(city)) = ?', [$cityNorm]);
+            }
+
+            $existingProperty = $existingQuery->first();
+
+            if ($existingProperty) {
+                $existingProperty->update($data);
+                $property = $existingProperty->fresh();
+            } else {
+                $property = Property::create($data);
+            }
 
             return response()->json([
                 'status' => true,
-                'message' => 'Property created successfully',
+                'message' => $existingProperty ? 'Property already exists and was updated successfully' : 'Property created successfully',
                 'data' => $property
-            ], 201);
+            ], $existingProperty ? 200 : 201);
         } catch (\Exception $e) {
             Log::error('Error creating property: ' . $e->getMessage());
             return response()->json([

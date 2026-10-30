@@ -121,6 +121,11 @@ class Order extends Model
         return $this->hasMany(OrderArea::class);
     }
 
+    public function invoices(): HasMany
+    {
+        return $this->hasMany(Invoice::class, 'order_id', 'id');
+    }
+
     public function tours(): HasMany
     {
         return $this->hasMany(Tour::class, 'order_id', 'id');
