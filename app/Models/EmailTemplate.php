@@ -19,12 +19,14 @@ class EmailTemplate extends Model
         'tags',
         'type',
         'event_type',
+        'recipient_type',
         'sort_order',
         'is_active',
     ];
 
     protected $casts = [
         'tags' => 'array',
+        'recipient_type' => 'array',
         'is_active' => 'boolean',
         'sort_order' => 'integer',
     ];
@@ -51,7 +53,13 @@ class EmailTemplate extends Model
     {
         $content = $this->content;
         foreach ($data as $key => $value) {
-            $content = str_replace('{{' . $key . '}}', $value, $content);
+            if (is_array($value) || is_object($value)) {
+                continue;
+            }
+            $val = (string) $value;
+            // Match {{key}}, {{ key }}, {key}, { key } case-insensitively
+            $content = preg_replace('/\{\{\s*' . preg_quote($key, '/') . '\s*\}\}/i', $val, $content);
+            $content = preg_replace('/\{\s*' . preg_quote($key, '/') . '\s*\}/i', $val, $content);
         }
         return $content;
     }

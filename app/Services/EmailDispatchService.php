@@ -99,7 +99,7 @@ class EmailDispatchService
     /**
      * Resolve the organization context for a given model or auth state.
      */
-    protected function resolveOrganization($model): ?Organization
+    public function resolveOrganization($model): ?Organization
     {
         if (!$model) {
             return null;
@@ -930,8 +930,50 @@ class EmailDispatchService
             throw new \Exception("Event type not registered: {$eventType}");
         }
 
-        // 1. Check for DB override template (Tenant-specific first, fallback to Global)
-        $template = EmailTemplate::withoutGlobalScopes()
+        $role = $recipient['role'] ?? 'agent';
+
+        // 0. Runtime content override (e.g. from sendPreview)
+        $overrideHtml = null;
+        if (!empty($data['content_overrides']) && is_array($data['content_overrides'])) {
+            $overrideHtml = $data['content_overrides'][$role] ?? null;
+        }
+        if (!$overrideHtml && !empty($data['content_override'])) {
+            $overrideHtml = $data['content_override'];
+        }
+
+        if ($overrideHtml) {
+            $placeholders = $this->buildPlaceholders($eventType, $org, $recipient, $data);
+            $parsedContent = $overrideHtml;
+            foreach ($placeholders as $k => $val) {
+                if (is_array($val) || is_object($val)) continue;
+                $valStr = (string) $val;
+                $parsedContent = preg_replace('/\{\{\s*' . preg_quote($k, '/') . '\s*\}\}/i', $valStr, $parsedContent);
+                $parsedContent = preg_replace('/\{\s*' . preg_quote($k, '/') . '\s*\}/i', $valStr, $parsedContent);
+            }
+
+            $subject = null;
+            if (!empty($data['subject_overrides']) && is_array($data['subject_overrides'])) {
+                $subject = $data['subject_overrides'][$role] ?? null;
+            }
+            if (!$subject && !empty($data['subject_override'])) {
+                $subject = $data['subject_override'];
+            }
+            if (!$subject) {
+                $subject = $eventConfig['label'] ?? 'Notification';
+            }
+            foreach ($placeholders as $k => $val) {
+                if (is_array($val) || is_object($val)) continue;
+                $valStr = (string) $val;
+                $subject = preg_replace('/\{\{\s*' . preg_quote($k, '/') . '\s*\}\}/i', $valStr, $subject);
+                $subject = preg_replace('/\{\s*' . preg_quote($k, '/') . '\s*\}/i', $valStr, $subject);
+            }
+
+            $dynAttachments = $this->resolveDynamicAttachments($eventType, $data);
+            return new \App\Mail\DynamicMailable($parsedContent, $subject, $org, $role, $dynAttachments);
+        }
+
+        // 1. Check for DB override template (Tenant-specific first, fallback to Global; Role-specific first, fallback to all-roles)
+        $templateQuery = EmailTemplate::withoutGlobalScopes()
             ->where(function ($q) use ($org) {
                 if ($org) {
                     $q->where('organization_id', $org->id)->orWhereNull('organization_id');
@@ -943,124 +985,39 @@ class EmailDispatchService
                 $q->where('event_type', $eventType)
                     ->orWhere('type', $eventType);
             })
-            ->where('is_active', true)
+            ->where('is_active', true);
+
+        // First try to match role in recipient_type JSON array
+        $template = (clone $templateQuery)
+            ->where(function ($q) use ($role) {
+                $q->whereJsonContains('recipient_type', $role)
+                  ->orWhereJsonContains('recipient_type', strtolower($role));
+            })
             ->orderByRaw('organization_id IS NULL ASC')
             ->first();
 
+        // Fallback to template without explicit role (legacy or all roles)
+        if (!$template) {
+            $template = (clone $templateQuery)
+                ->whereNull('recipient_type')
+                ->orderByRaw('organization_id IS NULL ASC')
+                ->first();
+        }
+
         if ($template) {
-            $changesSummary = '';
-            if (!empty($data['changes_summary'])) {
-                if (is_array($data['changes_summary'])) {
-                    $changesSummary = implode(', ', array_map(function ($k, $v) {
-                        return is_numeric($k) ? (string) $v : "{$k}: {$v}";
-                    }, array_keys($data['changes_summary']), $data['changes_summary']));
-                } else {
-                    $changesSummary = (string) $data['changes_summary'];
-                }
-            }
-
-            $companyName = $org?->name ?: config('app.name', 'BC Floor Plans');
-            $placeholders = [
-                // Order & Property details
-                'order_id' => $data['order_id'] ?? '',
-                'property_address' => $data['property_address'] ?? $data['propertyAddress'] ?? '',
-                'listing_address' => $data['property_address'] ?? $data['propertyAddress'] ?? '',
-                'property_location' => $data['property_location'] ?? $data['propertyLocation'] ?? '',
-                'listing_location' => $data['property_location'] ?? $data['propertyLocation'] ?? '',
-                'agent_name' => $data['agent_name'] ?? $data['agentName'] ?? '',
-                'amount' => $data['amount'] ?? '',
-                'service_name' => $data['service_name'] ?? '',
-                'custom_message' => $data['custom_message'] ?? '',
-                'changes_summary' => $changesSummary,
-                // Password reset
-                'name' => $data['recipient_name'] ?? '',
-                'reset_link' => $data['reset_link'] ?? $data['url'] ?? '',
-                'url' => $data['url'] ?? $data['reset_link'] ?? '',
-                'organization_name' => $data['organization_name'] ?? ($org?->name ?? ''),
-                'email' => $recipient['email'] ?? '',
-
-                // Dates & times (with backwards-compatible frontend aliases)
-                'date' => $data['date'] ?? '',
-                'schedule_date' => $data['date'] ?? '',
-                'appointment_date' => $data['date'] ?? '',
-                'new_date' => $data['date'] ?? '',
-                'start_time' => $data['start_time'] ?? '',
-                'schedule_time' => $data['start_time'] ?? '',
-                'appointment_time' => $data['start_time'] ?? '',
-                'new_time' => $data['start_time'] ?? '',
-                'end_time' => $data['end_time'] ?? '',
-                'old_date' => $data['old_date'] ?? '',
-                'old_time' => $data['old_time'] ?? '',
-
-                // Recipient & Vendor
-                'recipient_name' => $data['recipient_name'] ?? $data['recipientName'] ?? '',
-                'user_name' => $data['recipient_name'] ?? $data['recipientName'] ?? '',
-                'vendor_name' => $data['vendor_name'] ?? '',
-                'vendor_number' => $data['vendor_phone'] ?? $data['vendor_number'] ?? '',
-                'vendor_phone' => $data['vendor_phone'] ?? $data['vendor_number'] ?? '',
-                'company_name' => $companyName,
-                'organization_name' => $companyName,
-
-                // Invoices & Payments
-                'payment_scope' => $data['payment_scope_description'] ?? '',
-                'invoice_number' => $data['invoice_number'] ?? '',
-                'invoice_id' => $data['invoice_id'] ?? '',
-                'receipt_url' => $data['receipt_url'] ?? '',
-                'payment_method' => $data['payment_method'] ?? '',
-                'payer_name' => $data['payer_name'] ?? '',
-
-                // Cancellation
-                'cancellation_reason' => $data['cancellation_reason'] ?? '',
-                'cancellation_fee' => $data['cancellation_fee'] ?? '',
-
-                // Matterport / 3D Tours
-                'expiry_date' => $data['expiry_date'] ?? $data['expiryDate'] ?? '',
-                'days_remaining' => (string) ($data['days_remaining'] ?? $data['daysRemaining'] ?? ''),
-                'renewal_url' => $data['renewal_url'] ?? $data['renewalUrl'] ?? '',
-                'new_expiry_date' => $data['new_expiry_date'] ?? $data['newExpiryDate'] ?? '',
-                'duration_months' => (string) ($data['duration_months'] ?? $data['durationMonths'] ?? ''),
-            ];
-
+            $placeholders = $this->buildPlaceholders($eventType, $org, $recipient, $data);
             $parsedContent = $template->parseContent($placeholders);
 
             // Also parse placeholders inside the template title (subject line)
             $subject = $template->title;
             foreach ($placeholders as $key => $val) {
+                if (is_array($val) || is_object($val)) continue;
                 $subject = str_replace('{{' . $key . '}}', (string) $val, $subject);
             }
 
-            $dynAttachments = [];
-            if ($eventType === 'agent_payment_received' || !empty($data['invoice']) || !empty($data['invoice_id']) || !empty($data['invoice_uuid'])) {
-                try {
-                    $invoice = null;
-                    if (!empty($data['invoice']) && $data['invoice'] instanceof \App\Models\Invoice) {
-                        $invoice = $data['invoice'];
-                    } elseif (!empty($data['invoice_id'])) {
-                        $invoice = \App\Models\Invoice::find($data['invoice_id']);
-                    } elseif (!empty($data['invoice_uuid'])) {
-                        $invoice = \App\Models\Invoice::where('uuid', $data['invoice_uuid'])->first();
-                    } elseif (!empty($data['payment']) && $data['payment'] instanceof \App\Models\AgentPayment) {
-                        $invoice = $data['payment']->invoice ?: ($data['payment']->invoice_id ? \App\Models\Invoice::find($data['payment']->invoice_id) : null);
-                    }
-                    if (!$invoice && !empty($data['order']) && $data['order'] instanceof \App\Models\Order) {
-                        $invoice = $data['order']->invoices()->latest('id')->first();
-                    }
+            $dynAttachments = $this->resolveDynamicAttachments($eventType, $data);
 
-                    if ($invoice) {
-                        /** @var \App\Services\InvoicePdfService $pdfService */
-                        $pdfService = app(\App\Services\InvoicePdfService::class);
-                        $pdfBytes = $pdfService->getPdfBytes($invoice);
-                        $fileName = $pdfService->getFileName($invoice);
-
-                        $dynAttachments[] = \Illuminate\Mail\Mailables\Attachment::fromData(fn () => $pdfBytes, $fileName)
-                            ->withMime('application/pdf');
-                    }
-                } catch (\Throwable $e) {
-                    \Illuminate\Support\Facades\Log::warning("Failed attaching invoice PDF to DynamicMailable: " . $e->getMessage());
-                }
-            }
-
-            return new \App\Mail\DynamicMailable($parsedContent, $subject, $org, $recipient['role'], $dynAttachments);
+            return new \App\Mail\DynamicMailable($parsedContent, $subject, $org, $role, $dynAttachments);
         }
 
         // 2. Fall back to Blade Mailable
@@ -1505,5 +1462,144 @@ class EmailDispatchService
         }
 
         return rtrim($baseUrl, '/');
+    }
+
+    /**
+     * Build standard placeholders map for template interpolation.
+     */
+    public function buildPlaceholders(string $eventType, ?Organization $org, array $recipient, array $data): array
+    {
+        $changesSummary = '';
+        if (!empty($data['changes_summary'])) {
+            if (is_array($data['changes_summary'])) {
+                $changesSummary = implode(', ', array_map(function ($k, $v) {
+                    return is_numeric($k) ? (string) $v : "{$k}: {$v}";
+                }, array_keys($data['changes_summary']), $data['changes_summary']));
+            } else {
+                $changesSummary = (string) $data['changes_summary'];
+            }
+        }
+
+        $companyName = $org?->name ?: config('app.name', 'Tojuco Solutions');
+        $companyEmail = $org?->contact_email ?: config('services.resend.from_address', 'support@tojuco.com');
+        $companyPhone = $org?->contact_phone ?: '604-788-7783';
+
+        $paymentScope = $data['payment_scope_description'] ?? ($data['payment_for'] ?? ($data['payment_scope'] ?? 'Full Order Invoice'));
+        $paymentDate = !empty($data['payment']?->paid_at) 
+            ? \Carbon\Carbon::parse($data['payment']->paid_at)->format('F j, Y g:i A') 
+            : ($data['payment_date'] ?? date('F j, Y g:i A'));
+
+        return [
+            // Order & Property details
+            'order_id'          => $data['order_id'] ?? '',
+            'property_address'  => $data['property_address'] ?? $data['propertyAddress'] ?? '',
+            'listing_address'   => $data['property_address'] ?? $data['propertyAddress'] ?? '',
+            'property_location' => $data['property_location'] ?? $data['propertyLocation'] ?? '',
+            'listing_location'  => $data['property_location'] ?? $data['propertyLocation'] ?? '',
+            'agent_name'        => $data['agent_name'] ?? $data['agentName'] ?? '',
+            'agent_email'       => $data['agent_email'] ?? '',
+            'agent_phone'       => $data['agent_phone'] ?? '',
+            'amount'            => $data['amount'] ?? '',
+            'service_name'      => $data['service_name'] ?? '',
+            'service_url'       => $data['service_url'] ?? '',
+            'custom_message'    => $data['custom_message'] ?? '',
+            'changes_summary'   => $changesSummary,
+            // Password reset
+            'name'              => $data['recipient_name'] ?? '',
+            'reset_link'        => $data['reset_link'] ?? $data['url'] ?? '',
+            'url'               => $data['url'] ?? $data['reset_link'] ?? '',
+            'organization_name' => $data['organization_name'] ?? ($org?->name ?? ''),
+            'email'             => $recipient['email'] ?? '',
+
+            // Dates & times
+            'date'              => $data['date'] ?? '',
+            'schedule_date'     => $data['date'] ?? '',
+            'appointment_date'  => $data['date'] ?? '',
+            'new_date'          => $data['new_date'] ?? ($data['date'] ?? ''),
+            'start_time'        => $data['start_time'] ?? '',
+            'schedule_time'     => $data['start_time'] ?? '',
+            'appointment_time'  => $data['start_time'] ?? '',
+            'new_time'          => $data['new_time'] ?? ($data['start_time'] ?? ''),
+            'end_time'          => $data['end_time'] ?? '',
+            'old_date'          => $data['old_date'] ?? '',
+            'old_time'          => $data['old_time'] ?? '',
+
+            // Recipient & Vendor & Company
+            'recipient_name'    => $data['recipient_name'] ?? $data['recipientName'] ?? '',
+            'user_name'         => $data['recipient_name'] ?? $data['recipientName'] ?? '',
+            'vendor_name'       => $data['vendor_name'] ?? '',
+            'vendor_number'     => $data['vendor_phone'] ?? $data['vendor_number'] ?? '',
+            'vendor_phone'      => $data['vendor_phone'] ?? $data['vendor_number'] ?? '',
+            'vendor_email'      => $data['vendor_email'] ?? '',
+            'company_name'      => $companyName,
+            'company_email'     => $companyEmail,
+            'company_phone'     => $companyPhone,
+
+            // Invoices & Payments
+            'payment_for'       => $paymentScope,
+            'payment_scope'     => $paymentScope,
+            'payment_date'      => $paymentDate,
+            'invoice_number'    => $data['invoice_number'] ?? '',
+            'invoice_id'        => $data['invoice_id'] ?? '',
+            'receipt_url'       => $data['receipt_url'] ?? '',
+            'payment_method'    => $data['payment_method'] ?? 'Credit Card',
+            'payment_id'        => $data['payment_id'] ?? ($data['payment']?->id ?? ''),
+            'transfer_id'       => $data['transfer_id'] ?? ($data['vendor_payment']?->transfer_id ?? ''),
+            'payer_name'        => $data['payer_name'] ?? '',
+
+            // Cancellation
+            'cancellation_reason' => $data['cancellation_reason'] ?? '',
+            'cancellation_fee'    => $data['cancellation_fee'] ?? '',
+
+            // Matterport / 3D Tours
+            'expiry_date'       => $data['expiry_date'] ?? $data['expiryDate'] ?? '',
+            'days_remaining'    => (string) ($data['days_remaining'] ?? $data['daysRemaining'] ?? ''),
+            'renewal_url'       => $data['renewal_url'] ?? $data['renewalUrl'] ?? '',
+            'new_expiry_date'   => $data['new_expiry_date'] ?? $data['newExpiryDate'] ?? '',
+            'duration_months'   => (string) ($data['duration_months'] ?? $data['durationMonths'] ?? ''),
+
+            // Completion & Uploads
+            'completed_by'      => $data['completed_by'] ?? ($data['vendor_name'] ?? ''),
+            'media_count'       => (string) ($data['media_count'] ?? ''),
+            'uploaded_by'       => $data['uploaded_by'] ?? 'Team',
+        ];
+    }
+
+    /**
+     * Resolve dynamic invoice attachment for DynamicMailable.
+     */
+    protected function resolveDynamicAttachments(string $eventType, array $data): array
+    {
+        $dynAttachments = [];
+        if ($eventType === 'agent_payment_received' || !empty($data['invoice']) || !empty($data['invoice_id']) || !empty($data['invoice_uuid'])) {
+            try {
+                $invoice = null;
+                if (!empty($data['invoice']) && $data['invoice'] instanceof \App\Models\Invoice) {
+                    $invoice = $data['invoice'];
+                } elseif (!empty($data['invoice_id'])) {
+                    $invoice = \App\Models\Invoice::find($data['invoice_id']);
+                } elseif (!empty($data['invoice_uuid'])) {
+                    $invoice = \App\Models\Invoice::where('uuid', $data['invoice_uuid'])->first();
+                } elseif (!empty($data['payment']) && $data['payment'] instanceof \App\Models\AgentPayment) {
+                    $invoice = $data['payment']->invoice ?: ($data['payment']->invoice_id ? \App\Models\Invoice::find($data['payment']->invoice_id) : null);
+                }
+                if (!$invoice && !empty($data['order']) && $data['order'] instanceof \App\Models\Order) {
+                    $invoice = $data['order']->invoices()->latest('id')->first();
+                }
+
+                if ($invoice) {
+                    /** @var \App\Services\InvoicePdfService $pdfService */
+                    $pdfService = app(\App\Services\InvoicePdfService::class);
+                    $pdfBytes = $pdfService->getPdfBytes($invoice);
+                    $fileName = $pdfService->getFileName($invoice);
+
+                    $dynAttachments[] = \Illuminate\Mail\Mailables\Attachment::fromData(fn () => $pdfBytes, $fileName)
+                        ->withMime('application/pdf');
+                }
+            } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::warning("Failed attaching invoice PDF to DynamicMailable: " . $e->getMessage());
+            }
+        }
+        return $dynAttachments;
     }
 }

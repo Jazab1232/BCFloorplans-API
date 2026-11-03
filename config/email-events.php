@@ -9,7 +9,7 @@ return [
             'admin' => true,
             'agent' => true,
         ],
-        'variables' => ['order_id', 'property_address', 'agent_name', 'amount'],
+        'variables' => ['order_id', 'property_address', 'property_location', 'agent_name', 'agent_email', 'agent_phone', 'amount', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\OrderCreated::class,
     ],
     'order_updated' => [
@@ -21,7 +21,7 @@ return [
             'agent' => true,
             'vendor' => true,
         ],
-        'variables' => ['order_id', 'property_address', 'changes_summary'],
+        'variables' => ['order_id', 'property_address', 'changes_summary', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\OrderUpdated::class,
     ],
     'order_cancelled' => [
@@ -33,7 +33,7 @@ return [
             'agent' => true,
             'vendor' => true,
         ],
-        'variables' => ['order_id', 'property_address', 'cancellation_reason', 'cancellation_fee'],
+        'variables' => ['order_id', 'property_address', 'cancellation_reason', 'cancellation_fee', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\OrderCancelled::class,
     ],
     'slot_booked' => [
@@ -45,7 +45,7 @@ return [
             'agent' => false,
             'vendor' => true,
         ],
-        'variables' => ['order_id', 'property_address', 'service_name', 'date', 'start_time', 'end_time'],
+        'variables' => ['order_id', 'property_address', 'service_name', 'schedule_date', 'schedule_time', 'vendor_name', 'vendor_number', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\SlotBooked::class,
     ],
     'slot_cancelled' => [
@@ -57,7 +57,7 @@ return [
             'agent' => true,
             'vendor' => true,
         ],
-        'variables' => ['order_id', 'property_address', 'service_name'],
+        'variables' => ['order_id', 'property_address', 'service_name', 'schedule_date', 'schedule_time', 'cancellation_reason', 'cancellation_fee', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\SlotCancelled::class,
     ],
     'slot_rescheduled' => [
@@ -69,7 +69,7 @@ return [
             'agent' => false,
             'vendor' => true,
         ],
-        'variables' => ['order_id', 'property_address', 'service_name', 'old_date', 'new_date', 'old_time', 'new_time'],
+        'variables' => ['order_id', 'property_address', 'service_name', 'schedule_date', 'schedule_time', 'old_date', 'old_time', 'new_date', 'new_time', 'vendor_name', 'vendor_number', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\SlotRescheduled::class,
     ],
     'booking_reminder' => [
@@ -86,7 +86,7 @@ return [
             ['value' => 24, 'unit' => 'hours'],
             ['value' => 1, 'unit' => 'hours'],
         ],
-        'variables' => ['order_id', 'property_address', 'service_name', 'date', 'start_time'],
+        'variables' => ['order_id', 'property_address', 'service_name', 'schedule_date', 'schedule_time', 'vendor_name', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\BookingReminder::class,
     ],
     'agent_payment_received' => [
@@ -97,7 +97,7 @@ return [
             'admin' => true,
             'agent' => true,
         ],
-        'variables' => ['order_id', 'property_address', 'amount', 'payment_method'],
+        'variables' => ['order_id', 'property_address', 'amount', 'payment_for', 'payment_scope', 'payment_method', 'payment_date', 'invoice_number', 'receipt_url', 'agent_name', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\AgentPaymentReceived::class,
     ],
     'vendor_payment_processed' => [
@@ -108,7 +108,7 @@ return [
             'admin' => true,
             'vendor' => true,
         ],
-        'variables' => ['amount', 'transfer_id', 'service_count'],
+        'variables' => ['amount', 'payment_id', 'payment_date', 'transfer_id', 'service_name', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\VendorPaymentProcessed::class,
     ],
     'invoice_created' => [
@@ -119,7 +119,7 @@ return [
             'admin' => false,
             'agent' => true,
         ],
-        'variables' => ['invoice_id', 'order_id', 'amount', 'property_address'],
+        'variables' => ['invoice_id', 'order_id', 'amount', 'property_address', 'agent_name', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\InvoiceCreated::class,
     ],
     'password_reset' => [
@@ -132,7 +132,7 @@ return [
             'vendor' => true,
         ],
         'always_send' => true,
-        'variables' => ['name', 'reset_link', 'organization_name', 'email'],
+        'variables' => ['name', 'reset_link', 'organization_name', 'email', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\PasswordReset::class,
     ],
     'matterport_expiry_reminder' => [
@@ -151,7 +151,7 @@ return [
             ['value' => 7, 'unit' => 'days'],
             ['value' => 1, 'unit' => 'days'],
         ],
-        'variables' => ['property_address', 'expiry_date', 'days_remaining', 'renewal_url', 'agent_name'],
+        'variables' => ['property_address', 'expiry_date', 'days_remaining', 'renewal_url', 'agent_name', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\MatterportExpiryReminder::class,
     ],
     'matterport_expired' => [
@@ -162,7 +162,7 @@ return [
             'admin' => true,
             'agent' => true,
         ],
-        'variables' => ['property_address', 'expiry_date', 'renewal_url', 'agent_name'],
+        'variables' => ['property_address', 'expiry_date', 'renewal_url', 'agent_name', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\MatterportExpired::class,
     ],
     'matterport_renewed' => [
@@ -173,7 +173,7 @@ return [
             'admin' => true,
             'agent' => true,
         ],
-        'variables' => ['property_address', 'new_expiry_date', 'duration_months', 'amount', 'agent_name'],
+        'variables' => ['property_address', 'new_expiry_date', 'duration_months', 'amount', 'agent_name', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\MatterportRenewed::class,
     ],
     'service_completed' => [
@@ -184,7 +184,7 @@ return [
             'admin' => false,
             'agent' => true,
         ],
-        'variables' => ['order_id', 'property_address', 'service_name', 'agent_name', 'service_url', 'completed_by'],
+        'variables' => ['order_id', 'property_address', 'service_name', 'agent_name', 'service_url', 'completed_by', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\ServiceCompleted::class,
     ],
     'media_uploaded' => [
@@ -195,8 +195,39 @@ return [
             'admin' => false,
             'agent' => true,
         ],
-        'variables' => ['order_id', 'property_address', 'service_name', 'agent_name', 'service_url', 'media_count', 'uploaded_by', 'custom_message'],
+        'variables' => ['order_id', 'property_address', 'service_name', 'agent_name', 'service_url', 'media_count', 'uploaded_by', 'custom_message', 'company_name', 'company_email', 'company_phone'],
         'mailable_class' => \App\Mail\MediaUploaded::class,
     ],
+    'new_print_request_submitted' => [
+        'label' => 'New Print Request Submitted',
+        'description' => 'Sent to admin when an agent submits a feature sheet print request',
+        'recipients' => ['admin'],
+        'defaults' => [
+            'admin' => true,
+        ],
+        'variables' => ['order_id', 'property_address', 'copies', 'with_bleed', 'amount', 'additional_info', 'agent_name', 'pdf_url', 'company_name', 'company_email', 'company_phone'],
+        'mailable_class' => \App\Mail\NewPrintRequestSubmitted::class,
+    ],
+    'print_request_ready' => [
+        'label' => 'Print Request Ready',
+        'description' => 'Sent to print vendors/admin when a feature sheet print request is published and paid',
+        'recipients' => ['admin', 'vendor'],
+        'defaults' => [
+            'admin' => true,
+            'vendor' => true,
+        ],
+        'variables' => ['order_id', 'property_address', 'copies', 'with_bleed', 'amount', 'additional_info', 'agent_name', 'pdf_url', 'company_name', 'company_email', 'company_phone'],
+        'mailable_class' => \App\Mail\PrintRequestReady::class,
+    ],
+    'print_request_completed' => [
+        'label' => 'Print Request Completed',
+        'description' => 'Sent to agent and admin when physical printing and fulfillment is complete',
+        'recipients' => ['admin', 'agent'],
+        'defaults' => [
+            'admin' => true,
+            'agent' => true,
+        ],
+        'variables' => ['order_id', 'property_address', 'copies', 'with_bleed', 'additional_info', 'pdf_url', 'agent_name', 'company_name', 'company_email', 'company_phone'],
+        'mailable_class' => \App\Mail\PrintRequestCompleted::class,
+    ],
 ];
-

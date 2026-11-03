@@ -203,6 +203,8 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api
     // Email Template access for all users (Agents, Vendors, Admins)
     Route::prefix('email-templates')->group(function () {
         Route::get('/', [EmailTemplateController::class, 'index']);
+        Route::get('/blade-preview/{eventType}', [EmailTemplateController::class, 'bladePreview']);
+        Route::post('/send-preview', [EmailTemplateController::class, 'sendPreview']);
         Route::get('/{uuid}', [EmailTemplateController::class, 'show']);
         Route::post('/{uuid}/preview', [EmailTemplateController::class, 'preview']);
     });

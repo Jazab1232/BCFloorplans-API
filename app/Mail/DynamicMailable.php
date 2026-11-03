@@ -18,6 +18,8 @@ class DynamicMailable extends Mailable
     public $organization;
     public $recipientRole;
     public $emailAttachments;
+    public $hideDefaultContactNote = true;
+    public $hide_default_contact_note = true;
 
     /**
      * Create a new message instance.
@@ -48,6 +50,9 @@ class DynamicMailable extends Mailable
     {
         return new Content(
             view: 'emails.dynamic',
+            with: [
+                'hideDefaultContactNote' => true,
+            ],
         );
     }
 

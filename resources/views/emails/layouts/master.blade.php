@@ -62,6 +62,7 @@
                             style="padding: 40px 30px; font-family: Arial, sans-serif; color: #3d4852; line-height: 1.6;">
                             @yield('content')
 
+                            @if(empty($hideDefaultContactNote) && empty($hide_default_contact_note))
                             <p style="font-size: 14px; color: #666; margin-top: 30px;">
                                 If you have any questions or need assistance, please contact us at <a
                                     href="mailto:{{ $orgEmail }}"
@@ -72,6 +73,7 @@
                                 Best regards,<br>
                                 <strong>{{ $orgName }} Team</strong>
                             </p>
+                            @endif
                         </td>
                     </tr>
 
