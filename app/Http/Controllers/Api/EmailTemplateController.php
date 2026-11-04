@@ -307,6 +307,19 @@ class EmailTemplateController extends Controller
             $preview['is_custom'] = false;
         }
 
+        $isRuntime = $request->boolean('is_runtime')
+            || $request->query('is_runtime') === '1'
+            || $request->query('is_runtime') === 'true'
+            || !empty($orderUuid)
+            || !empty($request->query('slot_uuid'))
+            || !empty($request->query('tour_uuid'))
+            || !empty($request->query('service_uuid'));
+
+        // If load_default is explicitly requested without a runtime entity, force template authoring mode (not runtime)
+        if ($loadDefault && empty($orderUuid) && empty($request->query('slot_uuid')) && empty($request->query('tour_uuid')) && empty($request->query('service_uuid')) && !$request->boolean('is_runtime')) {
+            $isRuntime = false;
+        }
+
         $interpolated = $this->interpolateTemplatePlaceholders(
             $preview['content'] ?? '',
             $preview['subject'] ?? '',
@@ -315,8 +328,13 @@ class EmailTemplateController extends Controller
             $org,
             $request
         );
-        $preview['content'] = $interpolated['content'];
-        $preview['subject'] = $interpolated['subject'];
+
+        if ($isRuntime) {
+            $preview['content'] = $interpolated['content'];
+            $preview['subject'] = $interpolated['subject'];
+        }
+
+        $preview['placeholder_values'] = $interpolated['placeholders'] ?? [];
 
         return response()->json([
             'success' => true,
@@ -540,6 +558,11 @@ class EmailTemplateController extends Controller
             'uploaded_by'       => $uploadedBy,
             'service_url'       => $serviceUrl,
             'changes_summary'   => $changesSummary,
+            'action_url'        => $serviceUrl ?: ($recipientRole === 'vendor' ? (app(EmailDispatchService::class)->resolvePortalBaseUrl('vendor', $org) . '/dashboard/calendar') : (app(EmailDispatchService::class)->resolvePortalBaseUrl('agent', $org) . '/dashboard')),
+            'portal_url'        => $recipientRole === 'vendor' ? app(EmailDispatchService::class)->resolvePortalBaseUrl('vendor', $org) : app(EmailDispatchService::class)->resolvePortalBaseUrl('agent', $org),
+            'order_status'      => $order?->order_status ?? 'Confirmed',
+            'payment_status'    => $order?->payment_status ?? 'UNPAID',
+            'custom_message'    => $customMessage,
         ];
 
         // Replace placeholders in content and subject with dollar-safe substitution
@@ -584,8 +607,9 @@ class EmailTemplateController extends Controller
         }
 
         return [
-            'content' => $content,
-            'subject' => $subject,
+            'content'      => $content,
+            'subject'      => $subject,
+            'placeholders' => $placeholders,
         ];
     }
 
