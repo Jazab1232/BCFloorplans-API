@@ -1428,7 +1428,7 @@ class OrderController extends Controller
             $shouldSendEmails = !empty($allowedRoles);
         }
 
-        if ($shouldSendEmails && !empty($allowedRoles)) {
+        if ($shouldSendEmails && !empty($allowedRoles) && !$request->boolean('suppress_email') && !$request->boolean('skip_email')) {
             try {
                 $order->load(['agent', 'services.service', 'services.option', 'slots.service', 'slots.vendor']);
                 
@@ -2149,47 +2149,49 @@ private function processSlots($order, array $incomingSlots): array
                     'time' => $payload['start_time'] . ' - ' . $payload['end_time'],
                 ];
 
-                // Notify vendors on slot change
-                try {
-                    $existing->load(['service', 'order.property']);
-                    if ($oldVendorId && $oldVendorId != $payload['vendor_id']) {
-                        $oldVendor = \App\Models\Vendor::withoutGlobalScopes()->find($oldVendorId);
-                        if ($oldVendor && $oldVendor->email) {
-                            app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $existing, [
-                                'recipients' => [[
-                                    'email' => $oldVendor->email,
-                                    'name' => trim($oldVendor->first_name . ' ' . $oldVendor->last_name),
-                                    'role' => 'vendor',
-                                    'model' => $oldVendor
-                                ]]
-                            ]);
-                        }
-                        if (!empty($payload['vendor_id'])) {
-                            $newVendor = \App\Models\Vendor::withoutGlobalScopes()->find($payload['vendor_id']);
-                            if ($newVendor && $newVendor->email) {
-                                app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $existing, [
+                // Notify vendors on slot change (skip if email dispatch is suppressed)
+                if (!request()->boolean('suppress_email') && !request()->boolean('skip_email')) {
+                    try {
+                        $existing->load(['service', 'order.property']);
+                        if ($oldVendorId && $oldVendorId != $payload['vendor_id']) {
+                            $oldVendor = \App\Models\Vendor::withoutGlobalScopes()->find($oldVendorId);
+                            if ($oldVendor && $oldVendor->email) {
+                                app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $existing, [
                                     'recipients' => [[
-                                        'email' => $newVendor->email,
-                                        'name' => trim($newVendor->first_name . ' ' . $newVendor->last_name),
+                                        'email' => $oldVendor->email,
+                                        'name' => trim($oldVendor->first_name . ' ' . $oldVendor->last_name),
                                         'role' => 'vendor',
-                                        'model' => $newVendor
+                                        'model' => $oldVendor
                                     ]]
                                 ]);
                             }
-                        }
-                    } elseif ($oldVendorId && ($oldDate != $payload['date'] || $oldStartTime != $payload['start_time'] || $oldEndTime != $payload['end_time'])) {
-                        // Reset previously dispatched reminders so new reminders trigger for the updated appointment time
-                        DB::table('booking_reminders')->where('order_slot_id', $existing->id)->delete();
+                            if (!empty($payload['vendor_id'])) {
+                                $newVendor = \App\Models\Vendor::withoutGlobalScopes()->find($payload['vendor_id']);
+                                if ($newVendor && $newVendor->email) {
+                                    app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $existing, [
+                                        'recipients' => [[
+                                            'email' => $newVendor->email,
+                                            'name' => trim($newVendor->first_name . ' ' . $newVendor->last_name),
+                                            'role' => 'vendor',
+                                            'model' => $newVendor
+                                        ]]
+                                    ]);
+                                }
+                            }
+                        } elseif ($oldVendorId && ($oldDate != $payload['date'] || $oldStartTime != $payload['start_time'] || $oldEndTime != $payload['end_time'])) {
+                            // Reset previously dispatched reminders so new reminders trigger for the updated appointment time
+                            DB::table('booking_reminders')->where('order_slot_id', $existing->id)->delete();
 
-                        app(\App\Services\EmailDispatchService::class)->dispatch('slot_rescheduled', $existing, [
-                            'data' => [
-                                'old_date' => $oldDate,
-                                'old_time' => $oldStartTime . ($oldEndTime ? ' - ' . $oldEndTime : ''),
-                            ]
-                        ]);
+                            app(\App\Services\EmailDispatchService::class)->dispatch('slot_rescheduled', $existing, [
+                                'data' => [
+                                    'old_date' => $oldDate,
+                                    'old_time' => $oldStartTime . ($oldEndTime ? ' - ' . $oldEndTime : ''),
+                                ]
+                            ]);
+                        }
+                    } catch (\Throwable $e) {
+                        Log::warning("Failed to dispatch vendor email on slot update: " . $e->getMessage());
                     }
-                } catch (\Throwable $e) {
-                    Log::warning("Failed to dispatch vendor email on slot update: " . $e->getMessage());
                 }
             }
         }
@@ -2210,7 +2212,7 @@ private function processSlots($order, array $incomingSlots): array
             ];
 
             // Notify newly assigned vendor
-            if (!empty($payload['vendor_id'])) {
+            if (!empty($payload['vendor_id']) && !request()->boolean('suppress_email') && !request()->boolean('skip_email')) {
                 try {
                     $newSlot->load(['service', 'order.property', 'vendor']);
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $newSlot);
@@ -2238,7 +2240,7 @@ private function processSlots($order, array $incomingSlots): array
             $deletedSlotIds[] = $existing->id;
             
             // Dispatch slot_cancelled to vendor prior to deletion
-            if ($existing->vendor_id) {
+            if ($existing->vendor_id && !request()->boolean('suppress_email') && !request()->boolean('skip_email')) {
                 try {
                     $removedVendor = \App\Models\Vendor::withoutGlobalScopes()->find($existing->vendor_id);
                     if ($removedVendor && $removedVendor->email) {
@@ -2890,64 +2892,66 @@ private function createOrderNotification($order, array $changes)
             }
 
             // 9. Dispatch service cancellation/removal notification email
-            try {
-                $notificationSlot = $slot ?: new OrderSlot([
-                    'order_id' => $order->id,
-                    'service_id' => $serviceId,
-                    'date' => now()->toDateString(),
-                    'start_time' => 'N/A',
-                    'end_time' => 'N/A',
-                ]);
-                $notificationSlot->setRelation('order', $order);
-                $order->loadMissing(['agent', 'property', 'organization']);
-                if ($serviceModel) {
-                    $notificationSlot->setRelation('service', $serviceModel);
-                }
-                if ($vendor) {
-                    $notificationSlot->setRelation('vendor', $vendor);
-                }
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email')) {
+                try {
+                    $notificationSlot = $slot ?: new OrderSlot([
+                        'order_id' => $order->id,
+                        'service_id' => $serviceId,
+                        'date' => now()->toDateString(),
+                        'start_time' => 'N/A',
+                        'end_time' => 'N/A',
+                    ]);
+                    $notificationSlot->setRelation('order', $order);
+                    $order->loadMissing(['agent', 'property', 'organization']);
+                    if ($serviceModel) {
+                        $notificationSlot->setRelation('service', $serviceModel);
+                    }
+                    if ($vendor) {
+                        $notificationSlot->setRelation('vendor', $vendor);
+                    }
 
-                $recipients = [];
-                // Admin
-                $adminEmail = $order->organization ? $order->organization->contact_email : null;
-                if (!$adminEmail) {
-                    $adminEmail = config('mail.from.address', 'support@bcfpsoftware.com');
-                }
-                $recipients[] = [
-                    'email' => $adminEmail,
-                    'name' => 'Admin',
-                    'role' => 'admin',
-                ];
-
-                // Agent
-                if ($order->agent && $order->agent->email) {
+                    $recipients = [];
+                    // Admin
+                    $adminEmail = $order->organization ? $order->organization->contact_email : null;
+                    if (!$adminEmail) {
+                        $adminEmail = config('mail.from.address', 'support@bcfpsoftware.com');
+                    }
                     $recipients[] = [
-                        'email' => $order->agent->email,
-                        'name' => trim($order->agent->first_name . ' ' . $order->agent->last_name),
-                        'role' => 'agent',
-                        'model' => $order->agent,
+                        'email' => $adminEmail,
+                        'name' => 'Admin',
+                        'role' => 'admin',
                     ];
-                }
 
-                // Vendor (if assigned)
-                if ($vendor && !empty($vendor->email)) {
-                    $recipients[] = [
-                        'email' => $vendor->email,
-                        'name' => trim($vendor->first_name . ' ' . $vendor->last_name),
-                        'role' => 'vendor',
-                        'model' => $vendor,
-                    ];
-                }
+                    // Agent
+                    if ($order->agent && $order->agent->email) {
+                        $recipients[] = [
+                            'email' => $order->agent->email,
+                            'name' => trim($order->agent->first_name . ' ' . $order->agent->last_name),
+                            'role' => 'agent',
+                            'model' => $order->agent,
+                        ];
+                    }
 
-                app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $notificationSlot, [
-                    'recipients' => $recipients,
-                    'data' => [
-                        'cancellation_reason' => "Service '{$serviceName}' removed from order #{$order->id}",
-                        'service_name' => $serviceName,
-                    ]
-                ]);
-            } catch (\Throwable $notifErr) {
-                Log::warning('Failed to dispatch service cancellation notification on removeService: ' . $notifErr->getMessage());
+                    // Vendor (if assigned)
+                    if ($vendor && !empty($vendor->email)) {
+                        $recipients[] = [
+                            'email' => $vendor->email,
+                            'name' => trim($vendor->first_name . ' ' . $vendor->last_name),
+                            'role' => 'vendor',
+                            'model' => $vendor,
+                        ];
+                    }
+
+                    app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $notificationSlot, [
+                        'recipients' => $recipients,
+                        'data' => [
+                            'cancellation_reason' => "Service '{$serviceName}' removed from order #{$order->id}",
+                            'service_name' => $serviceName,
+                        ]
+                    ]);
+                } catch (\Throwable $notifErr) {
+                    Log::warning('Failed to dispatch service cancellation notification on removeService: ' . $notifErr->getMessage());
+                }
             }
 
             return response()->json([
@@ -3005,6 +3009,18 @@ private function createOrderNotification($order, array $changes)
             $serviceName = $orderService->service->name ?? $orderService->custom ?? 'Service';
             $basePrice = (float)$orderService->amount;
 
+            $slot = OrderSlot::where('order_id', $order->id)->where('service_id', $orderService->service_id)->with('vendor')->first();
+            $vendor = $slot?->vendor;
+            $vendorPayload = $vendor ? [
+                'uuid' => $vendor->uuid,
+                'name' => trim(($vendor->first_name ?? '') . ' ' . ($vendor->last_name ?? '')),
+                'email' => $vendor->email,
+            ] : null;
+            $agentPayload = $order->agent ? [
+                'name' => trim(($order->agent->first_name ?? '') . ' ' . ($order->agent->last_name ?? '')),
+                'email' => $order->agent->email,
+            ] : null;
+
             // Check if there are individual service invoice(s)
             $serviceInvoices = Invoice::where('order_id', $order->id)
                 ->whereHas('items', function ($q) use ($orderService) {
@@ -3034,6 +3050,9 @@ private function createOrderNotification($order, array $changes)
                         'final_total' => round($finalTotal, 2),
                         'invoice_type' => 'individual',
                         'invoice_number' => $serviceInvoices->map(fn($i) => '#' . ($i->invoice_number ?? $i->id))->implode(', '),
+                        'slot_uuid' => $slot?->uuid,
+                        'vendor' => $vendorPayload,
+                        'agent' => $agentPayload,
                     ]
                 ]);
             }
@@ -3115,6 +3134,9 @@ private function createOrderNotification($order, array $changes)
                     'final_total' => $finalTotal,
                     'invoice_type' => 'consolidated',
                     'invoice_number' => $activeInvoice ? ('#' . ($activeInvoice->invoice_number ?? $activeInvoice->id)) : null,
+                    'slot_uuid' => $slot?->uuid,
+                    'vendor' => $vendorPayload,
+                    'agent' => $agentPayload,
                 ]
             ]);
 
@@ -3178,7 +3200,8 @@ private function createOrderNotification($order, array $changes)
                 // This prevents automatic emails when admins or vendors toggle completion status
                 $shouldSendEmail = (filter_var($request->input('notify_agent', false), FILTER_VALIDATE_BOOLEAN) ||
                                    filter_var($request->input('inform_agent', false), FILTER_VALIDATE_BOOLEAN))
-                                   && !filter_var($request->input('skip_email', false), FILTER_VALIDATE_BOOLEAN);
+                                   && !filter_var($request->input('skip_email', false), FILTER_VALIDATE_BOOLEAN)
+                                   && !filter_var($request->input('suppress_email', false), FILTER_VALIDATE_BOOLEAN);
 
                 if ($shouldSendEmail && $order) {
                     $tourIds = $order->tours()->pluck('id');
@@ -3546,15 +3569,19 @@ private function createOrderNotification($order, array $changes)
                 }
             }
 
-            Log::info("sendMediaToClient: Dispatching media_uploaded email for Order #{$order->id} (uuid: {$order->uuid}) to agent: " . ($order->agent?->email ?? 'none'));
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email')) {
+                Log::info("sendMediaToClient: Dispatching media_uploaded email for Order #{$order->id} (uuid: {$order->uuid}) to agent: " . ($order->agent?->email ?? 'none'));
 
-            $emailDispatched = app(EmailDispatchService::class)->dispatch(
-                'media_uploaded',
-                $tour,
-                $dispatchOptions
-            );
+                $emailDispatched = app(EmailDispatchService::class)->dispatch(
+                    'media_uploaded',
+                    $tour,
+                    $dispatchOptions
+                );
 
-            Log::info("sendMediaToClient: EmailDispatchService returned " . ($emailDispatched ? 'SUCCESS' : 'FAILED/SKIPPED'));
+                Log::info("sendMediaToClient: EmailDispatchService returned " . ($emailDispatched ? 'SUCCESS' : 'FAILED/SKIPPED'));
+            } else {
+                Log::info("sendMediaToClient: Email dispatch suppressed by request flag for Order #{$order->id}");
+            }
         } catch (\Throwable $emailErr) {
             Log::error("Failed dispatching media_uploaded email on sendMediaToClient: " . $emailErr->getMessage(), [
                 'order_id' => $order->id,
@@ -4062,7 +4089,7 @@ private function createOrderNotification($order, array $changes)
             $oldEventId = $slot->google_event_id;
 
             // Notify old vendor of cancellation/unassignment
-            if ($oldVendor && $oldVendor->email) {
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email') && $oldVendor && $oldVendor->email) {
                 try {
                     $slot->loadMissing(['service', 'order.property']);
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $slot, [
@@ -4119,7 +4146,7 @@ private function createOrderNotification($order, array $changes)
             $slot->save();
 
             // Notify new vendor of booking assignment
-            if ($newVendor && $newVendor->email) {
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email') && $newVendor && $newVendor->email) {
                 try {
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot, [
                         'recipients' => [[
@@ -4135,7 +4162,7 @@ private function createOrderNotification($order, array $changes)
             }
 
             // Notify agent that their appointment slot has updated with new vendor
-            if ($slot->order && $slot->order->agent && $slot->order->agent->email) {
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email') && $slot->order && $slot->order->agent && $slot->order->agent->email) {
                 try {
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot, [
                         'recipients' => [[
@@ -4206,7 +4233,7 @@ private function createOrderNotification($order, array $changes)
             $event2Id = $s2->google_event_id;
 
             // Notify both vendors of cancellation/unassignment from previous slots
-            if ($vendor1 && $vendor1->email) {
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email') && $vendor1 && $vendor1->email) {
                 try {
                     $s1->loadMissing(['service', 'order.property']);
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $s1, [
@@ -4222,7 +4249,7 @@ private function createOrderNotification($order, array $changes)
                 }
             }
 
-            if ($vendor2 && $vendor2->email) {
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email') && $vendor2 && $vendor2->email) {
                 try {
                     $s2->loadMissing(['service', 'order.property']);
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $s2, [
@@ -4272,7 +4299,7 @@ private function createOrderNotification($order, array $changes)
             });
 
             // Notify both vendors of their new bookings
-            if ($vendor2 && $vendor2->email) {
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email') && $vendor2 && $vendor2->email) {
                 try {
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot1, [
                         'recipients' => [[
@@ -4287,7 +4314,7 @@ private function createOrderNotification($order, array $changes)
                 }
             }
 
-            if ($vendor1 && $vendor1->email) {
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email') && $vendor1 && $vendor1->email) {
                 try {
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot2, [
                         'recipients' => [[
@@ -4303,7 +4330,7 @@ private function createOrderNotification($order, array $changes)
             }
 
             // Notify agent that their slots have updated with the swapped vendors
-            if ($slot1->order && $slot1->order->agent && $slot1->order->agent->email) {
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email') && $slot1->order && $slot1->order->agent && $slot1->order->agent->email) {
                 try {
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot1, [
                         'recipients' => [[
@@ -4318,7 +4345,7 @@ private function createOrderNotification($order, array $changes)
                 }
             }
 
-            if ($slot2->order && $slot2->order->agent && $slot2->order->agent->email) {
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email') && $slot2->order && $slot2->order->agent && $slot2->order->agent->email) {
                 try {
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot2, [
                         'recipients' => [[
@@ -4458,44 +4485,46 @@ private function createOrderNotification($order, array $changes)
             $orderService->save();
 
             // Email notifications for vendor on slot change
-            try {
-                $slot->load(['service', 'order.property', 'vendor']);
-                if ($oldVendorId && $oldVendorId != $vendor->id) {
-                    // Reassigned to a different vendor: cancel old vendor, book new vendor
-                    if ($oldVendor && $oldVendor->email) {
-                        app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $slot, [
-                            'recipients' => [[
-                                'email' => $oldVendor->email,
-                                'name' => trim($oldVendor->first_name . ' ' . $oldVendor->last_name),
-                                'role' => 'vendor',
-                                'model' => $oldVendor
-                            ]]
-                        ]);
-                    }
-                    if ($vendor && $vendor->email) {
-                        app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot, [
-                            'recipients' => [[
-                                'email' => $vendor->email,
-                                'name' => trim($vendor->first_name . ' ' . $vendor->last_name),
-                                'role' => 'vendor',
-                                'model' => $vendor
-                            ]]
-                        ]);
-                    }
-                } elseif ($oldVendorId && ($oldDate != $request->date || $oldStartTime != $request->start_time || $oldEndTime != $request->end_time)) {
-                    // Reset previously dispatched reminders so new reminders trigger for the updated appointment time
-                    DB::table('booking_reminders')->where('order_slot_id', $slot->id)->delete();
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email')) {
+                try {
+                    $slot->load(['service', 'order.property', 'vendor']);
+                    if ($oldVendorId && $oldVendorId != $vendor->id) {
+                        // Reassigned to a different vendor: cancel old vendor, book new vendor
+                        if ($oldVendor && $oldVendor->email) {
+                            app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $slot, [
+                                'recipients' => [[
+                                    'email' => $oldVendor->email,
+                                    'name' => trim($oldVendor->first_name . ' ' . $oldVendor->last_name),
+                                    'role' => 'vendor',
+                                    'model' => $oldVendor
+                                ]]
+                            ]);
+                        }
+                        if ($vendor && $vendor->email) {
+                            app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot, [
+                                'recipients' => [[
+                                    'email' => $vendor->email,
+                                    'name' => trim($vendor->first_name . ' ' . $vendor->last_name),
+                                    'role' => 'vendor',
+                                    'model' => $vendor
+                                ]]
+                            ]);
+                        }
+                    } elseif ($oldVendorId && ($oldDate != $request->date || $oldStartTime != $request->start_time || $oldEndTime != $request->end_time)) {
+                        // Reset previously dispatched reminders so new reminders trigger for the updated appointment time
+                        DB::table('booking_reminders')->where('order_slot_id', $slot->id)->delete();
 
-                    // Rescheduled date/time with the same vendor
-                    app(\App\Services\EmailDispatchService::class)->dispatch('slot_rescheduled', $slot, [
-                        'data' => [
-                            'old_date' => $oldDate,
-                            'old_time' => $oldStartTime . ($oldEndTime ? ' - ' . $oldEndTime : ''),
-                        ]
-                    ]);
+                        // Rescheduled date/time with the same vendor
+                        app(\App\Services\EmailDispatchService::class)->dispatch('slot_rescheduled', $slot, [
+                            'data' => [
+                                'old_date' => $oldDate,
+                                'old_time' => $oldStartTime . ($oldEndTime ? ' - ' . $oldEndTime : ''),
+                            ]
+                        ]);
+                    }
+                } catch (\Throwable $emailError) {
+                    Log::warning("Failed to dispatch vendor email notification in updateSlotTime: " . $emailError->getMessage());
                 }
-            } catch (\Throwable $emailError) {
-                Log::warning("Failed to dispatch vendor email notification in updateSlotTime: " . $emailError->getMessage());
             }
 
             // Trigger calendar sync

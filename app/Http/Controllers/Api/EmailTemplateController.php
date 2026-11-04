@@ -6,9 +6,13 @@ use App\Http\Controllers\Controller;
 use App\Models\EmailTemplate;
 use App\Models\Order;
 use App\Models\OrderService;
+use App\Models\OrderSlot;
+use App\Models\Organization;
 use App\Models\Tour;
+use App\Models\Vendor;
 use App\Services\BladePreviewService;
 use App\Services\EmailDispatchService;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 
@@ -220,6 +224,53 @@ class EmailTemplateController extends Controller
             $org = \App\Models\Organization::withoutGlobalScopes()->find($user->organization_id);
         }
 
+        if (!$org && !empty($orderUuid)) {
+            $order = Order::withoutGlobalScopes()->where('uuid', $orderUuid)->first()
+                ?: (is_numeric($orderUuid) ? Order::withoutGlobalScopes()->find((int)$orderUuid) : null);
+            if ($order && $order->organization_id) {
+                $org = \App\Models\Organization::withoutGlobalScopes()->find($order->organization_id);
+            }
+        }
+
+        $loadDefault = $request->boolean('load_default')
+            || $request->query('load_default') === '1'
+            || $request->query('load_default') === 'true'
+            || $request->query('mode') === 'default';
+
+        $customTemplate = null;
+        if (!$loadDefault) {
+            $templateQuery = EmailTemplate::withoutGlobalScopes()
+                ->where(function ($q) use ($org) {
+                    if ($org) {
+                        $q->where('organization_id', $org->id)->orWhereNull('organization_id');
+                    }
+                })
+                ->where(function ($q) use ($eventType) {
+                    $q->where('event_type', $eventType)
+                      ->orWhere('type', $eventType);
+                })
+                ->where('is_active', true);
+
+            // 1. Check role-specific template
+            $customTemplate = (clone $templateQuery)
+                ->where(function ($q) use ($recipientRole) {
+                    $q->whereJsonContains('recipient_type', $recipientRole)
+                      ->orWhereJsonContains('recipient_type', strtolower($recipientRole));
+                })
+                ->orderByRaw('organization_id IS NULL ASC')
+                ->orderByDesc('updated_at')
+                ->first();
+
+            // 2. Fallback to template without explicit role (general / all roles)
+            if (!$customTemplate) {
+                $customTemplate = (clone $templateQuery)
+                    ->whereNull('recipient_type')
+                    ->orderByRaw('organization_id IS NULL ASC')
+                    ->orderByDesc('updated_at')
+                    ->first();
+            }
+        }
+
         $preview = $bladeService->render(
             $eventType,
             $recipientRole,
@@ -235,10 +286,307 @@ class EmailTemplateController extends Controller
             ], 404);
         }
 
+        if ($customTemplate) {
+            $preview['is_custom'] = true;
+            $preview['template_uuid'] = $customTemplate->uuid;
+            $preview['template_title'] = $customTemplate->title;
+            $preview['subject'] = $customTemplate->title;
+            $preview['content'] = $customTemplate->content;
+
+            try {
+                $preview['full_html'] = view('emails.dynamic', [
+                    'content'       => $customTemplate->content,
+                    'recipientRole' => $recipientRole,
+                    'subject'       => $customTemplate->title,
+                    'organization'  => $org,
+                ])->render();
+            } catch (\Throwable $e) {
+                // If rendering dynamic layout fails, retain preview full_html
+            }
+        } else {
+            $preview['is_custom'] = false;
+        }
+
+        $interpolated = $this->interpolateTemplatePlaceholders(
+            $preview['content'] ?? '',
+            $preview['subject'] ?? '',
+            $eventType,
+            $recipientRole,
+            $org,
+            $request
+        );
+        $preview['content'] = $interpolated['content'];
+        $preview['subject'] = $interpolated['subject'];
+
         return response()->json([
             'success' => true,
             'data' => $preview
         ]);
+    }
+
+    /**
+     * Resolve all context models and interpolate live values into placeholders
+     * in template content and subject for runtime editing.
+     */
+    protected function interpolateTemplatePlaceholders(
+        string $content,
+        string $subject,
+        string $eventType,
+        string $recipientRole,
+        ?Organization $org,
+        Request $request
+    ): array {
+        $orderUuid = $request->query('order_uuid');
+        $slotUuid = $request->query('slot_uuid');
+        $serviceUuid = $request->query('service_uuid');
+        $tourUuid = $request->query('tour_uuid');
+
+        $order = null;
+        if (!empty($orderUuid)) {
+            $order = Order::withoutGlobalScopes()->where('uuid', $orderUuid)->first()
+                ?: (is_numeric($orderUuid) ? Order::withoutGlobalScopes()->find((int)$orderUuid) : null);
+        }
+
+        $slot = null;
+        if (!empty($slotUuid)) {
+            $slot = OrderSlot::withoutGlobalScopes()->where('uuid', $slotUuid)->first()
+                ?: (is_numeric($slotUuid) ? OrderSlot::withoutGlobalScopes()->find((int)$slotUuid) : null);
+            if ($slot && !$order && $slot->order) {
+                $order = $slot->order;
+            }
+        }
+
+        $orderService = null;
+        if (!empty($serviceUuid)) {
+            $orderService = OrderService::withoutGlobalScopes()->where('uuid', $serviceUuid)->first()
+                ?: (is_numeric($serviceUuid) ? OrderService::withoutGlobalScopes()->find((int)$serviceUuid) : null);
+            if ($orderService && !$order && $orderService->order) {
+                $order = $orderService->order;
+            }
+        }
+
+        $tour = null;
+        if (!empty($tourUuid)) {
+            $tour = Tour::withoutGlobalScopes()->where('uuid', $tourUuid)->first()
+                ?: (is_numeric($tourUuid) ? Tour::withoutGlobalScopes()->find((int)$tourUuid) : null);
+            if ($tour && !$order && $tour->orders) {
+                $order = $tour->orders;
+            }
+        }
+
+        if ($order) {
+            $order->loadMissing([
+                'agent',
+                'slots.vendor',
+                'slots.service',
+                'services.service',
+                'services.option',
+                'property',
+                'invoices',
+                'tours.links',
+            ]);
+            if (!$slot && $order->slots && $order->slots->isNotEmpty()) {
+                if ($orderService) {
+                    $slot = $order->slots->first(fn($s) => $s->service_id == $orderService->service_id);
+                }
+                if (!$slot) {
+                    $slot = $order->slots->first();
+                }
+            }
+            if (!$orderService && $order->services && $order->services->isNotEmpty()) {
+                if ($slot) {
+                    $orderService = $order->services->first(fn($os) => $os->service_id == $slot->service_id);
+                }
+                if (!$orderService) {
+                    $orderService = $order->services->first();
+                }
+            }
+            if (!$tour && $order->tours && $order->tours->isNotEmpty()) {
+                $tour = $order->tours->first();
+            }
+        }
+
+        // Target recipient details
+        $recipientName = 'Valued Customer';
+        $agentName = $order?->agent ? trim(($order->agent->first_name ?? '') . ' ' . ($order->agent->last_name ?? '')) : 'Agent';
+        $agentEmail = $order?->agent?->email ?? '';
+        $agentPhone = $order?->agent?->primary_phone ?? '';
+
+        $vendor = $slot?->vendor ?: ($order?->vendor_id ? Vendor::withoutGlobalScopes()->find($order->vendor_id) : null);
+        if (!$vendor && $request->filled('vendor_uuid')) {
+            $vendor = Vendor::withoutGlobalScopes()->where('uuid', $request->query('vendor_uuid'))->first();
+        }
+        $vendorName = $vendor ? trim(($vendor->first_name ?? '') . ' ' . ($vendor->last_name ?? '')) : 'Vendor';
+        $vendorEmail = $vendor?->email ?? '';
+        $vendorPhone = $vendor?->primary_phone ?? $vendor?->phone ?? '';
+
+        if ($recipientRole === 'vendor') {
+            $recipientName = $vendorName;
+        } elseif ($recipientRole === 'agent') {
+            $recipientName = $agentName;
+        } elseif ($recipientRole === 'admin') {
+            $recipientName = 'Administrator';
+        }
+
+        // Timing
+        $slotDate = $slot?->date ? \Carbon\Carbon::parse($slot->date)->format('F j, Y') : ($request->query('date') ?? '');
+        $startTime = $slot?->start_time ?? ($request->query('start_time') ?? '');
+        $endTime = $slot?->end_time ?? ($request->query('end_time') ?? '');
+        $oldDate = $request->query('old_date') ?? '';
+        $oldTime = $request->query('old_time') ?? '';
+
+        // Tour / Matterport Details
+        $daysRemaining = 30;
+        $expiryDate = date('F j, Y', strtotime('+30 days'));
+        $renewalUrl = '';
+        if ($tour) {
+            $primaryLink = $tour->links?->first(fn($l) => in_array($l->type, ['branded', 'unbranded']) && !empty($l->link)) ?: $tour->links?->first();
+            if ($primaryLink && $primaryLink->expiry_date) {
+                $exp = \Carbon\Carbon::parse($primaryLink->expiry_date);
+                $daysRemaining = max(0, \Carbon\Carbon::today()->diffInDays($exp, false));
+                $expiryDate = $exp->format('F j, Y');
+            }
+            $agentDomain = app(EmailDispatchService::class)->resolvePortalBaseUrl('agent', $org);
+            $renewalUrl = $agentDomain . '/dashboard/matterport?tour=' . ($tour->uuid ?? '');
+        }
+
+        $serviceName = $orderService?->service?->name ?? $slot?->service?->name ?? ($request->query('service_name') ?? 'Service');
+        $orderId = $order?->id ? (string)$order->id : ($request->query('order_id') ?? '1001');
+        $propAddr = $order ? ($order->property_address ?? ($order->property ? $order->property->address : 'Property Address')) : '123 Main Street, Vancouver, BC';
+        $cancellationReason = $order?->cancellation_reason ?? ($request->query('cancellation_reason') ?? ($request->query('reason') ?? ''));
+        $extraData = $request->query('data', []);
+        if (empty($extraData) || !is_array($extraData)) {
+            $extraData = $request->all();
+        }
+        $passedAmount = $request->query('amount') ?? ($extraData['amount'] ?? ($request->query('total_amount') ?? ($extraData['total_amount'] ?? null)));
+        if ($passedAmount !== null && $passedAmount !== '' && $recipientRole !== 'vendor') {
+            $amount = is_numeric($passedAmount) ? ('$' . number_format((float)$passedAmount, 2)) : (str_starts_with((string)$passedAmount, '$') ? (string)$passedAmount : ('$' . $passedAmount));
+        } else {
+            $amount = ($recipientRole !== 'vendor' && $order) ? ('$' . number_format((float)$order->amount, 2)) : '';
+        }
+        $customMessage = $request->query('custom_message') ?? ($extraData['custom_message'] ?? '');
+        $mediaCount = $request->query('media_count') ?? ($extraData['media_count'] ?? '');
+        if (($mediaCount === '' || $mediaCount === null) && $order) {
+            try {
+                $tourId = $tour?->id ?: (\App\Models\Tour::where('order_id', $order->id)->value('id'));
+                if ($tourId) {
+                    $q = \App\Models\TourFile::where('tour_id', $tourId)->where('is_hidden', false);
+                    if ($orderService) {
+                        $q->where('service_id', $orderService->service_id);
+                    }
+                    $c = $q->count();
+                    if ($c > 0) {
+                        $mediaCount = (string)$c;
+                    }
+                }
+            } catch (\Throwable $e) {}
+        }
+        $changesSummary = $request->query('changes_summary') ?? ($extraData['changes_summary'] ?? 'Order details and package updated.');
+        $uploadedBy = $request->query('uploaded_by') ?? ($extraData['uploaded_by'] ?? ($vendorName ?: 'Vendor'));
+        $serviceUrl = $request->query('service_url') ?? ($extraData['service_url'] ?? '');
+        if (empty($serviceUrl) && $order) {
+            $agentDomain = app(EmailDispatchService::class)->resolvePortalBaseUrl('agent', $org);
+            $serviceUrl = $agentDomain . '/dashboard/file-manager/' . $order->uuid;
+        }
+
+        $oldDate = (!empty($request->query('old_date'))) ? $request->query('old_date') : (!empty($extraData['old_date']) ? $extraData['old_date'] : $slotDate);
+        $oldTime = (!empty($request->query('old_time'))) ? $request->query('old_time') : (!empty($extraData['old_time']) ? $extraData['old_time'] : ($startTime . ($endTime ? " - {$endTime}" : '')));
+        $newDate = (!empty($request->query('new_date'))) ? $request->query('new_date') : (!empty($extraData['new_date']) ? $extraData['new_date'] : $slotDate);
+        $newTime = (!empty($request->query('new_time'))) ? $request->query('new_time') : (!empty($extraData['new_time']) ? $extraData['new_time'] : ($startTime . ($endTime ? " - {$endTime}" : '')));
+
+        $invoiceId = $order?->invoices?->first()?->invoice_number ?? ($order?->invoices?->first()?->id ?? '');
+        $cancellationFee = $request->query('cancellation_fee') ?? ($extraData['cancellation_fee'] ?? '$0.00');
+
+        $placeholders = [
+            'order_id'          => $orderId,
+            'property_address'  => $propAddr,
+            'listing_address'   => $propAddr,
+            'property_location' => $order?->property_location ?? '',
+            'listing_location'  => $order?->property_location ?? '',
+            'service_name'      => $serviceName,
+            'recipient_name'    => $recipientName,
+            'user_name'         => $recipientName,
+            'agent_name'        => $agentName,
+            'agent_email'       => $agentEmail,
+            'agent_phone'       => $agentPhone,
+            'vendor_name'       => $vendorName,
+            'vendor_number'     => $vendorPhone,
+            'vendor_phone'      => $vendorPhone,
+            'vendor_email'      => $vendorEmail,
+            'company_name'      => $org?->name ?: config('app.name', 'Tojuco Solutions'),
+            'company_email'     => $org?->contact_email ?: config('mail.from.address', 'support@tojuco.com'),
+            'company_phone'     => $org?->contact_phone ?: '604-788-7783',
+            'date'              => $slotDate,
+            'schedule_date'     => $slotDate,
+            'appointment_date'  => $slotDate,
+            'start_time'        => $startTime,
+            'schedule_time'     => $startTime . ($endTime ? " - {$endTime}" : ''),
+            'appointment_time'  => $startTime . ($endTime ? " - {$endTime}" : ''),
+            'end_time'          => $endTime,
+            'new_date'          => $newDate,
+            'new_time'          => $newTime,
+            'old_date'          => $oldDate,
+            'old_time'          => $oldTime,
+            'days_remaining'    => (string)$daysRemaining,
+            'expiry_date'       => $expiryDate,
+            'renewal_url'       => $renewalUrl,
+            'amount'            => $amount,
+            'total_amount'      => $amount,
+            'cancellation_reason' => $cancellationReason ?: 'Cancelled by Administrator',
+            'cancellation_fee'  => $cancellationFee,
+            'invoice_id'        => $invoiceId ? "#{$invoiceId}" : "#{$orderId}",
+            'invoice_number'    => $invoiceId ? "#{$invoiceId}" : "#{$orderId}",
+            'media_count'       => $mediaCount !== '' ? (string)$mediaCount : 'all',
+            'uploaded_by'       => $uploadedBy,
+            'service_url'       => $serviceUrl,
+            'changes_summary'   => $changesSummary,
+        ];
+
+        // Replace placeholders in content and subject with dollar-safe substitution
+        foreach ($placeholders as $k => $val) {
+            if (is_array($val) || is_object($val)) continue;
+            $valStr = (string) $val;
+            if ($valStr === '') continue;
+
+            // If replacement value already starts with '$', strip preceding '$' in content like '${{amount}}'
+            if (str_starts_with($valStr, '$')) {
+                $dollarTags = ['${{' . $k . '}}', '${{ ' . $k . ' }}', '${' . $k . '}', '${ ' . $k . ' }'];
+                $content = str_ireplace($dollarTags, $valStr, $content);
+                $subject = str_ireplace($dollarTags, $valStr, $subject);
+            }
+
+            // Literal string replace first (immune to $ regex backreference issues)
+            $tags = ["{{" . $k . "}}", "{{ " . $k . " }}", "{" . $k . "}", "{ " . $k . " }"];
+            $content = str_ireplace($tags, $valStr, $content);
+            $subject = str_ireplace($tags, $valStr, $subject);
+
+            // Regex replace with escaped $ for any irregular whitespace
+            $safeVal = str_replace('$', '\$', $valStr);
+            $content = preg_replace('/\{\{\s*' . preg_quote($k, '/') . '\s*\}\}/i', $safeVal, $content);
+            $content = preg_replace('/\{\s*' . preg_quote($k, '/') . '\s*\}/i', $safeVal, $content);
+            $subject = preg_replace('/\{\{\s*' . preg_quote($k, '/') . '\s*\}\}/i', $safeVal, $subject);
+            $subject = preg_replace('/\{\s*' . preg_quote($k, '/') . '\s*\}/i', $safeVal, $subject);
+        }
+
+        if (!empty($customMessage)) {
+            $safeMsg = str_replace('$', '\$', $customMessage);
+            $content = preg_replace('/\{\{\s*custom_message\s*\}\}/i', $safeMsg, $content);
+            $content = preg_replace('/\{\s*custom_message\s*\}/i', $safeMsg, $content);
+            $subject = preg_replace('/\{\{\s*custom_message\s*\}\}/i', $safeMsg, $subject);
+            $subject = preg_replace('/\{\s*custom_message\s*\}/i', $safeMsg, $subject);
+        } else {
+            // Remove Note from Vendor block if empty
+            $content = preg_replace('/<div[^>]*style="[^"]*background-color:\s*#EFF6FF[^"]*"[^>]*>[\s\S]*?Note from Vendor:[\s\S]*?\{\{\s*custom_message\s*\}\}[\s\S]*?<\/div>/i', '', $content);
+            $content = preg_replace('/\{\{\s*custom_message\s*\}\}/i', '', $content);
+            $content = preg_replace('/\{\s*custom_message\s*\}/i', '', $content);
+            $subject = preg_replace('/\{\{\s*custom_message\s*\}\}/i', '', $subject);
+            $subject = preg_replace('/\{\s*custom_message\s*\}/i', '', $subject);
+        }
+
+        return [
+            'content' => $content,
+            'subject' => $subject,
+        ];
     }
 
     /**
@@ -299,6 +647,37 @@ class EmailTemplateController extends Controller
                 if (!$order && $svc->order) {
                     $order = $svc->order;
                 }
+            }
+        }
+
+        if ($request->filled('slot_uuid')) {
+            $slotUuid = $request->input('slot_uuid');
+            $slot = OrderSlot::withoutGlobalScopes()->where('uuid', $slotUuid)->first()
+                ?: (is_numeric($slotUuid) ? OrderSlot::withoutGlobalScopes()->find((int)$slotUuid) : null);
+            if ($slot) {
+                if (in_array($eventType, ['slot_rescheduled', 'slot_cancelled', 'slot_booked'])) {
+                    $model = $slot;
+                }
+                if (!$order && $slot->order) {
+                    $order = $slot->order;
+                }
+            }
+        }
+
+        // If slot-based event and model is still Order, find appropriate slot
+        if (in_array($eventType, ['slot_rescheduled', 'slot_cancelled', 'slot_booked']) && $order && !($model instanceof OrderSlot)) {
+            $matchingSlot = null;
+            if ($request->filled('service_uuid')) {
+                $svc = OrderService::where('uuid', $request->input('service_uuid'))->first();
+                if ($svc) {
+                    $matchingSlot = $order->slots()->where('service_id', $svc->service_id)->first();
+                }
+            }
+            if (!$matchingSlot) {
+                $matchingSlot = $order->slots()->first();
+            }
+            if ($matchingSlot) {
+                $model = $matchingSlot;
             }
         }
 

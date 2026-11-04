@@ -314,23 +314,25 @@ class AdminStripePaymentController extends Controller
                 );
 
                 // Send email notification
-                try {
-                    // Load order services with relationships for email
-                    $orderServices = \App\Models\OrderService::with(['service', 'option', 'order.property', 'order.agent'])
-                        ->whereIn('id', $services->pluck('id'))
-                        ->get();
+                if (!$request->boolean('suppress_email') && !$request->boolean('skip_email')) {
+                    try {
+                        // Load order services with relationships for email
+                        $orderServices = \App\Models\OrderService::with(['service', 'option', 'order.property', 'order.agent'])
+                            ->whereIn('id', $services->pluck('id'))
+                            ->get();
 
-                    app(\App\Services\EmailDispatchService::class)->dispatch('vendor_payment_processed', $lastVendorPayment, [
-                        'data' => [
-                            'services' => $orderServices,
-                        ]
-                    ]);
-                } catch (\Exception $emailError) {
-                    // Log email errors but don't fail the payment processing
-                    Log::error('Failed to send vendor payment emails via dispatch service', [
-                        'vendor_uuid' => $vendor->uuid,
-                        'error' => $emailError->getMessage(),
-                    ]);
+                        app(\App\Services\EmailDispatchService::class)->dispatch('vendor_payment_processed', $lastVendorPayment, [
+                            'data' => [
+                                'services' => $orderServices,
+                            ]
+                        ]);
+                    } catch (\Exception $emailError) {
+                        // Log email errors but don't fail the payment processing
+                        Log::error('Failed to send vendor payment emails via dispatch service', [
+                            'vendor_uuid' => $vendor->uuid,
+                            'error' => $emailError->getMessage(),
+                        ]);
+                    }
                 }
             });
 

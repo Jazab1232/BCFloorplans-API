@@ -2618,7 +2618,7 @@ class TourController extends Controller
             }
 
             // Dispatch confirmation email if already paid
-            if ($isPaid) {
+            if ($isPaid && !$request->boolean('suppress_email') && !$request->boolean('skip_email')) {
                 try {
                     $propertyAddress = $order ? ($order->property_address ?? ($order->property ? $order->property->address : 'Property')) : 'Property';
                     $agentName = $agent ? trim($agent->first_name . ' ' . $agent->last_name) : 'Agent';
@@ -2708,20 +2708,22 @@ class TourController extends Controller
             $eventType = $isExpired ? 'matterport_expired' : 'matterport_expiry_reminder';
 
             // 1. Dispatch email notification to Agent (and Admin if configured)
-            app(EmailDispatchService::class)->dispatch($eventType, $tour, [
-                'data' => [
-                    'propertyAddress' => $propertyAddress,
-                    'property_address' => $propertyAddress,
-                    'expiryDate' => $formattedExpiryDate,
-                    'expiry_date' => $formattedExpiryDate,
-                    'daysRemaining' => $remainingDays,
-                    'days_remaining' => $remainingDays,
-                    'agentName' => $agentName,
-                    'agent_name' => $agentName,
-                    'renewalUrl' => $renewalUrl,
-                    'renewal_url' => $renewalUrl,
-                ],
-            ]);
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email')) {
+                app(EmailDispatchService::class)->dispatch($eventType, $tour, [
+                    'data' => [
+                        'propertyAddress' => $propertyAddress,
+                        'property_address' => $propertyAddress,
+                        'expiryDate' => $formattedExpiryDate,
+                        'expiry_date' => $formattedExpiryDate,
+                        'daysRemaining' => $remainingDays,
+                        'days_remaining' => $remainingDays,
+                        'agentName' => $agentName,
+                        'agent_name' => $agentName,
+                        'renewalUrl' => $renewalUrl,
+                        'renewal_url' => $renewalUrl,
+                    ],
+                ]);
+            }
 
             // 2. Create in-portal notification for the agent if linked
             if ($agent && $agent->uuid) {

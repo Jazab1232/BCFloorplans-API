@@ -332,7 +332,9 @@ class OrderCancellationController extends Controller
                 Log::error('Failed to dispatch SyncOrderCalendarEvents job on cancellation: ' . $e->getMessage());
             }
 
-            $this->sendCancellationEmails($order, $cancellationFee, $request->reason);
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email')) {
+                $this->sendCancellationEmails($order, $cancellationFee, $request->reason);
+            }
 
             return response()->json([
                 'success' => true,
@@ -539,7 +541,9 @@ class OrderCancellationController extends Controller
             }
 
             // Send notification email (only to agent, admins, and the specific vendor affected)
-            $this->sendSingleServiceCancellationEmails($order, $orderService, $vendor, $cancellationFee, $request->reason, $slot);
+            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email')) {
+                $this->sendSingleServiceCancellationEmails($order, $orderService, $vendor, $cancellationFee, $request->reason, $slot);
+            }
 
             return response()->json([
                 'success' => true,
