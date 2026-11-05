@@ -519,9 +519,10 @@ class BladePreviewService
      */
     protected function renderFullPreview(string $contentWithPlaceholders, ?Organization $org, string $recipientRole, string $eventType): string
     {
-        $orgName = $org?->name ?: 'commerx';
-        $orgEmail = $org?->contact_email ?: 'moazam@commerx.com';
-        $orgPhone = $org?->contact_phone ?: '123456789';
+        $orgName = $org?->name ?: config('app.name', 'BC Floor Plans');
+        $orgEmail = $org?->contact_email ?: config('mail.from.address', 'mail@bcfloorplans.com');
+        $orgPhone = $org?->contact_phone ?: '604-788-7783';
+        $orgSlug = strtoupper($org?->slug ?: 'BCF');
 
         $dummyMap = [
             'order_id'            => '1001',
@@ -557,7 +558,7 @@ class BladePreviewService
             'payment_date'        => date('F j, Y g:i A'),
             'payment_id'          => 'PAY-8821',
             'transfer_id'         => 'tr_1Nxy2Z9Sample',
-            'invoice_number'      => '#INV-COMMERX-2026-00329',
+            'invoice_number'      => "#INV-{$orgSlug}-2026-00329",
             'invoice_id'          => '1001',
             'receipt_url'         => 'https://billing.stripe.com/receipt/sample',
             'cancellation_reason' => 'Client requested reschedule due to weather',

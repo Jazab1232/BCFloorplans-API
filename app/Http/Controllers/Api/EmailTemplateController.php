@@ -224,12 +224,28 @@ class EmailTemplateController extends Controller
             $org = \App\Models\Organization::withoutGlobalScopes()->find($user->organization_id);
         }
 
+        $orgUuid = $request->query('organization_id')
+            ?? $request->query('organization_uuid')
+            ?? $request->query('org_uuid')
+            ?? $request->header('X-Organization-Id');
+
+        if (!$org && !empty($orgUuid)) {
+            $org = \App\Models\Organization::withoutGlobalScopes()->where('uuid', $orgUuid)->first()
+                ?: (is_numeric($orgUuid) ? \App\Models\Organization::withoutGlobalScopes()->find((int)$orgUuid) : null);
+        }
+
         if (!$org && !empty($orderUuid)) {
             $order = Order::withoutGlobalScopes()->where('uuid', $orderUuid)->first()
                 ?: (is_numeric($orderUuid) ? Order::withoutGlobalScopes()->find((int)$orderUuid) : null);
             if ($order && $order->organization_id) {
                 $org = \App\Models\Organization::withoutGlobalScopes()->find($order->organization_id);
             }
+        }
+
+        if (!$org) {
+            $org = \App\Models\Organization::withoutGlobalScopes()->where('slug', 'bcfloorplans')->first()
+                ?? \App\Models\Organization::withoutGlobalScopes()->where('is_active', true)->first()
+                ?? \App\Models\Organization::withoutGlobalScopes()->first();
         }
 
         $loadDefault = $request->boolean('load_default')
