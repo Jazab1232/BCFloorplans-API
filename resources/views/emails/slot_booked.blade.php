@@ -41,4 +41,33 @@
             @endif
         </table>
     </div>
+
+    @php
+        $orderMeta = is_string($slot->order?->meta) ? json_decode($slot->order->meta, true) : ($slot->order?->meta ?? []);
+        $floorplanAreas = $orderMeta['floorplan_areas'] ?? [];
+        $floorplanNotes = $orderMeta['floorplan_notes'] ?? '';
+        $sName = strtolower($slot->service->name ?? '');
+        $cName = strtolower($slot->service->category?->name ?? '');
+        $isFloorplanSlot = str_contains($sName, 'floor') || str_contains($cName, 'floor');
+    @endphp
+
+    @if($isFloorplanSlot && (!empty($floorplanAreas) || !empty($floorplanNotes)))
+    <!-- Floor Plan Areas to Measure -->
+    <div style="background-color: #EFF6FF; padding: 18px; border-radius: 8px; border: 1px solid #BFDBFE; margin-bottom: 25px;">
+        <h3 style="font-size: 15px; margin: 0 0 10px; color: #1E40AF; border-bottom: 1px solid #DBEAFE; padding-bottom: 8px;">
+            📐 Floor Plan - Other Areas to Measure
+        </h3>
+        @if(!empty($floorplanAreas))
+            <p style="margin: 0 0 6px; font-size: 14px; color: #1E3A8A;">
+                <strong>Requested Areas:</strong> 
+                {{ is_array($floorplanAreas) ? implode(', ', $floorplanAreas) : $floorplanAreas }}
+            </p>
+        @endif
+        @if(!empty($floorplanNotes))
+            <p style="margin: 0; font-size: 14px; color: #1E3A8A;">
+                <strong>Special Instructions:</strong> {{ $floorplanNotes }}
+            </p>
+        @endif
+    </div>
+    @endif
 @endsection

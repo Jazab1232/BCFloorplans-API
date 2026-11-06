@@ -765,6 +765,69 @@ class EmailDispatchService
             $data['slots'] = $order->slots;
             $data['notes'] = $order->notes;
             $data['show_internal_notes'] = ($role === 'admin');
+
+            $order->loadMissing(['slots.service', 'slots.vendor', 'services.service', 'services.option']);
+
+            $orderMeta = is_string($order->meta) ? json_decode($order->meta, true) : ($order->meta ?? []);
+            $fpAreas = $orderMeta['floorplan_areas'] ?? [];
+            $fpNotes = $orderMeta['floorplan_notes'] ?? '';
+
+            $data['floorplan_areas'] = is_array($fpAreas) ? implode(', ', $fpAreas) : (string) $fpAreas;
+            $data['floorplan_notes'] = (string) $fpNotes;
+
+            $fpSectionHtml = '';
+            if (!empty($fpAreas) || !empty($fpNotes)) {
+                $fpSectionHtml .= '<div style="background-color: #EFF6FF; padding: 18px; border-radius: 8px; border: 1px solid #BFDBFE; margin-bottom: 20px;">';
+                $fpSectionHtml .= '<h3 style="font-size: 15px; margin: 0 0 10px; color: #1E40AF; border-bottom: 1px solid #DBEAFE; padding-bottom: 8px;">📐 Floor Plan - Other Areas to Measure</h3>';
+                if (!empty($fpAreas)) {
+                    $areasStr = is_array($fpAreas) ? implode(', ', $fpAreas) : $fpAreas;
+                    $fpSectionHtml .= '<p style="margin: 0 0 6px; font-size: 14px; color: #1E3A8A;"><strong>Requested Areas:</strong> ' . htmlspecialchars($areasStr) . '</p>';
+                }
+                if (!empty($fpNotes)) {
+                    $fpSectionHtml .= '<p style="margin: 0; font-size: 14px; color: #1E3A8A;"><strong>Special Instructions:</strong> ' . htmlspecialchars($fpNotes) . '</p>';
+                }
+                $fpSectionHtml .= '</div>';
+            }
+            $data['floorplan_section'] = $fpSectionHtml;
+
+            $appointmentsHtml = '';
+            if ($order->slots && $order->slots->isNotEmpty()) {
+                foreach ($order->slots as $s) {
+                    $sService = $s->service ? htmlspecialchars($s->service->name) : 'Service';
+                    $sDate = $s->date ? \Carbon\Carbon::parse($s->date)->format('F j, Y') : 'TBD';
+                    $sTime = htmlspecialchars(($s->start_time ?? '') . ($s->end_time ? ' - ' . $s->end_time : ''));
+                    $sVendor = $s->vendor ? htmlspecialchars(trim(($s->vendor->first_name ?? '') . ' ' . ($s->vendor->last_name ?? ''))) : 'Unassigned';
+
+                    $appointmentsHtml .= '<div style="padding: 8px 0; border-bottom: 1px solid #E5E7EB; font-size: 14px;">';
+                    $appointmentsHtml .= '<p style="margin: 0 0 4px; font-weight: bold; color: #111827;">' . $sService . '</p>';
+                    $appointmentsHtml .= '<p style="margin: 0 0 2px; color: #4B5563;">Date: ' . $sDate . '</p>';
+                    $appointmentsHtml .= '<p style="margin: 0 0 2px; color: #4B5563;">Time: ' . $sTime . '</p>';
+                    if ($role !== 'vendor') {
+                        $appointmentsHtml .= '<p style="margin: 0; color: #4B5563;">Vendor: ' . $sVendor . '</p>';
+                    }
+                    $appointmentsHtml .= '</div>';
+                }
+
+                if (!$slot) {
+                    $firstSlot = $order->slots->first();
+                    if ($firstSlot) {
+                        if (empty($data['date']) && $firstSlot->date) {
+                            $data['date'] = \Carbon\Carbon::parse($firstSlot->date)->format('F j, Y');
+                        }
+                        if (empty($data['start_time']) && $firstSlot->start_time) {
+                            $data['start_time'] = $firstSlot->start_time . ($firstSlot->end_time ? ' - ' . $firstSlot->end_time : '');
+                            $data['end_time'] = $firstSlot->end_time;
+                        }
+                        if (empty($data['service_name']) && $firstSlot->service) {
+                            $data['service_name'] = $firstSlot->service->name;
+                        }
+                        if (empty($data['vendor_name']) && $firstSlot->vendor) {
+                            $data['vendor_name'] = trim(($firstSlot->vendor->first_name ?? '') . ' ' . ($firstSlot->vendor->last_name ?? ''));
+                        }
+                    }
+                }
+            }
+            $data['scheduled_appointments'] = $appointmentsHtml;
         }
 
         if ($slot) {
@@ -776,7 +839,7 @@ class EmailDispatchService
 
             // Resolve vendor for this slot / recipient
             $slotVendor = null;
-            if ($recipient['model'] instanceof \App\Models\Vendor && ($role === 'vendor' || $eventType === 'slot_cancelled')) {
+            if (!empty($recipient['model']) && $recipient['model'] instanceof \App\Models\Vendor && ($role === 'vendor' || $eventType === 'slot_cancelled')) {
                 $slotVendor = $recipient['model'];
             } elseif (!empty($preSeededData['vendor_uuid'])) {
                 $slotVendor = \App\Models\Vendor::withoutGlobalScopes()->where('uuid', $preSeededData['vendor_uuid'])->first();
@@ -816,6 +879,46 @@ class EmailDispatchService
             if (empty($data['service_name'])) {
                 $data['service_name'] = $serviceObj->name;
             }
+        }
+
+        // Filter out floorplan measurement areas if this notification is NOT for a floorplan service
+        $isFloorplanRelevant = false;
+        $targetService = $slot?->service ?? ($serviceObj ?? null);
+
+        if ($targetService) {
+            // Service/Slot-specific event (e.g. slot_booked, slot_rescheduled)
+            $sName = strtolower($targetService->name ?? '');
+            $cName = strtolower($targetService->category?->name ?? '');
+            $isFloorplanRelevant = str_contains($sName, 'floor') || str_contains($cName, 'floor');
+        } elseif ($role === 'vendor' && $order) {
+            // Vendor recipient: only show if this vendor is assigned to a floorplan slot
+            $vendorModel = $recipient['model'] ?? null;
+            $vendorEmail = $recipient['email'] ?? null;
+            $isFloorplanRelevant = $order->slots->contains(function ($s) use ($vendorModel, $vendorEmail) {
+                $matchVendor = ($vendorModel && $s->vendor_id == $vendorModel->id) ||
+                               ($vendorEmail && $s->vendor && $s->vendor->email === $vendorEmail);
+                if (!$matchVendor) return false;
+                $sName = strtolower($s->service?->name ?? '');
+                $cName = strtolower($s->service?->category?->name ?? '');
+                return str_contains($sName, 'floor') || str_contains($cName, 'floor');
+            });
+        } elseif ($order) {
+            // Order-level event for Admin / Agent: only show if the order includes a floorplan service
+            $isFloorplanRelevant = $order->services->contains(function ($s) {
+                $sName = strtolower($s->service?->name ?? '');
+                $cName = strtolower($s->service?->category?->name ?? '');
+                return str_contains($sName, 'floor') || str_contains($cName, 'floor');
+            }) || $order->slots->contains(function ($s) {
+                $sName = strtolower($s->service?->name ?? '');
+                $cName = strtolower($s->service?->category?->name ?? '');
+                return str_contains($sName, 'floor') || str_contains($cName, 'floor');
+            });
+        }
+
+        if (!$isFloorplanRelevant) {
+            $data['floorplan_areas'] = '';
+            $data['floorplan_notes'] = '';
+            $data['floorplan_section'] = '';
         }
 
         if ($order) {
@@ -1612,6 +1715,12 @@ class EmailDispatchService
             'completed_by'      => $data['completed_by'] ?? ($data['vendor_name'] ?? ''),
             'media_count'       => (string) ($data['media_count'] ?? ''),
             'uploaded_by'       => $data['uploaded_by'] ?? 'Team',
+
+            // Floor Plan Areas & Scheduled Appointments
+            'floorplan_areas'        => $data['floorplan_areas'] ?? '',
+            'floorplan_notes'        => $data['floorplan_notes'] ?? '',
+            'floorplan_section'      => $data['floorplan_section'] ?? '',
+            'scheduled_appointments' => $data['scheduled_appointments'] ?? '',
         ];
     }
 

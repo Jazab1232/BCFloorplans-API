@@ -93,7 +93,36 @@
     </div>
     @endif
 
-    @if($recipientRole !== 'vendor' && $order->slots && $order->slots->count() > 0)
+    @php
+        $orderMeta = is_string($order->meta) ? json_decode($order->meta, true) : ($order->meta ?? []);
+        $floorplanAreas = $orderMeta['floorplan_areas'] ?? [];
+        $floorplanNotes = $orderMeta['floorplan_notes'] ?? '';
+        $orderHasFloorplan = $order->services->contains(function ($s) {
+            $sName = strtolower($s->service?->name ?? '');
+            $cName = strtolower($s->service?->category?->name ?? '');
+            return str_contains($sName, 'floor') || str_contains($cName, 'floor');
+        });
+    @endphp
+
+    @if($orderHasFloorplan && (!empty($floorplanAreas) || !empty($floorplanNotes)))
+    <!-- Floor Plan Areas to Measure -->
+    <div style="background-color: #EFF6FF; padding: 18px; border-radius: 8px; border: 1px solid #BFDBFE; margin-bottom: 20px;">
+        <h3 style="font-size: 15px; margin: 0 0 10px; color: #1E40AF; border-bottom: 1px solid #DBEAFE; padding-bottom: 8px;">
+            📐 Floor Plan - Other Areas to Measure
+        </h3>
+        @if(!empty($floorplanAreas))
+            <p style="margin: 0 0 6px; font-size: 14px; color: #1E3A8A;">
+                <strong>Requested Areas:</strong> 
+                {{ is_array($floorplanAreas) ? implode(', ', $floorplanAreas) : $floorplanAreas }}
+            </p>
+        @endif
+        @if(!empty($floorplanNotes))
+            <p style="margin: 0; font-size: 14px; color: #1E3A8A;">
+                <strong>Special Instructions:</strong> {{ $floorplanNotes }}
+            </p>
+        @endif
+    </div>
+    @endif
     <!-- Scheduled Slots -->
     <div style="background-color: #F9FAFB; padding: 20px; border-radius: 8px; border: 1px solid #E5E7EB; margin-bottom: 20px;">
         <h3 style="font-size: 15px; margin: 0 0 12px; color: #111827; border-bottom: 1px solid #E5E7EB; padding-bottom: 8px;">Scheduled Appointments</h3>

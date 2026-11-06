@@ -397,6 +397,16 @@ class OrderController extends Controller
                 $meta['agent_discount'] = $agent->agent_discount;
             }
 
+            // Save Floor Plan Areas snapshot
+            if ($request->has('floorplan_areas') && !empty($request->floorplan_areas)) {
+                $meta['floorplan_areas'] = is_array($request->floorplan_areas)
+                    ? array_values(array_filter($request->floorplan_areas))
+                    : [$request->floorplan_areas];
+            }
+            if ($request->has('floorplan_notes') && !empty($request->floorplan_notes)) {
+                $meta['floorplan_notes'] = trim((string)$request->floorplan_notes);
+            }
+
             // Note: Package info will be added after package detection
             if (!empty($meta)) {
                 $data['meta'] = $meta;
@@ -1535,7 +1545,7 @@ private function prepareOrderData(Request $request, $order = null): array
     if ($request->filled('agent_id')) {
         $data['agent_id'] = Agent::where('uuid', $request->agent_id)->value('id');
     }
-    $meta = [];
+    $meta = ($order && is_array($order->meta)) ? $order->meta : [];
 
             // Save raw discounts snapshot
     if ($request->has('discounts')) {
@@ -1544,6 +1554,15 @@ private function prepareOrderData(Request $request, $order = null): array
             // Save agent discount snapshot (object or array)
     if ($request->has('agent_discount')) {
         $meta['agent_discount'] = $request->agent_discount;
+    }
+
+    if ($request->has('floorplan_areas')) {
+        $meta['floorplan_areas'] = is_array($request->floorplan_areas)
+            ? array_values(array_filter($request->floorplan_areas))
+            : [$request->floorplan_areas];
+    }
+    if ($request->has('floorplan_notes')) {
+        $meta['floorplan_notes'] = trim((string)$request->floorplan_notes);
     }
 
     if (!empty($meta)) {
