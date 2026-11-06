@@ -10,6 +10,9 @@ use App\Traits\BelongsToOrganization;
 class FeatureSheet extends Model
 {
     use BelongsToOrganization;
+
+    public bool $orgScopeIncludesGlobal = true;
+
     protected $fillable = [
         'uuid',
         'organization_id',

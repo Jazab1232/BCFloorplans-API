@@ -70,16 +70,19 @@ class SyncOrderCalendarEvents implements ShouldQueue
                 $this->handleDeletedSlots($calendarService, $this->deletedSlotIds);
             }
 
+            // Filter out cancelled slots so they are not synced as active bookings
+            $activeSlots = $order->slots->filter(fn($s) => ($s->status ?? 'booked') !== 'cancelled');
+
             // If order has no remaining slots, exit early
-            if ($order->slots->isEmpty()) {
-                Log::info('Order has no remaining slots to sync to calendar', [
+            if ($activeSlots->isEmpty()) {
+                Log::info('Order has no remaining active slots to sync to calendar', [
                     'order_id' => $this->orderId,
                 ]);
                 return;
             }
 
             // Group slots by vendor and sync
-            $slotsByVendor = $order->slots->groupBy('vendor_id');
+            $slotsByVendor = $activeSlots->groupBy('vendor_id');
             
             Log::info('Grouped slots by vendor', [
                 'order_id' => $this->orderId,

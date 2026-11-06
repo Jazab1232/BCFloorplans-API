@@ -28,6 +28,7 @@ class OrderSlot extends Model
         'address',
         'location',
         'date',
+        'status',
         'custom_duration',
         'custom_end_time',
         'buffer_minutes',

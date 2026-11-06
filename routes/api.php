@@ -68,13 +68,13 @@ Route::get('services', [ServiceController::class, 'index'])->middleware(['resolv
 Route::get('vendors', [VendorController::class, 'index'])->middleware(['resolve.org', 'throttle:30,1']);
 Route::post('public/tax-preview', [TaxSettingsController::class, 'calculatePreview'])->middleware(['resolve.org']);
 Route::get('twilight-window', [OrderController::class, 'getTwilightWindow'])->middleware(['resolve.org']);
+Route::get('global-settings', [TourController::class, 'getAllGlobalTourSettings'])->middleware(['resolve.org']);
 Route::get('feature-sheets/order/{orderUuid}', [FeatureSheetController::class, 'indexByOrder'])->middleware(['resolve.org', 'throttle:60,1']);
 Route::get('feature-sheets/{featureSheetUuid}', [FeatureSheetController::class, 'show'])->middleware(['resolve.org', 'throttle:60,1']);
 Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api", "resolve.org"]], function () {
     // Moved from public — now org-scoped
     Route::get('/order-slots', [OrderController::class, 'getAllOrderSlots']);
     Route::get('/discounts', [DiscountController::class, 'index']);
-    Route::get('global-settings', [TourController::class, 'getAllGlobalTourSettings']);
 
     // Organization and Settings access for all roles
     Route::get('/organizations', [OrganizationController::class, 'index']);

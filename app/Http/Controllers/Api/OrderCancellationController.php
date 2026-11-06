@@ -414,8 +414,8 @@ class OrderCancellationController extends Controller
 
             DB::beginTransaction();
 
-            // Track deleted slot for calendar sync and email notifications
-            $deletedSlotId = null;
+            // Track slot for calendar sync and email notifications
+            $cancelledSlotId = null;
             $slot = OrderSlot::withoutGlobalScopes()
                 ->where('order_id', $order->id)
                 ->where('service_id', $orderService->service_id)
@@ -424,9 +424,23 @@ class OrderCancellationController extends Controller
             $vendor = null;
             if ($slot) {
                 $slot->loadMissing(['service', 'order.property', 'vendor']);
-                $deletedSlotId = $slot->id;
+                $cancelledSlotId = $slot->id;
                 $vendor = $slot->vendor;
-                $slot->delete();
+
+                // Delete Google Calendar event for the vendor so vendor calendar is freed
+                $oldEventId = $slot->google_event_id;
+                if ($vendor && $oldEventId && $vendor->google_access_token && class_exists(\App\Services\GoogleCalendarService::class)) {
+                    try {
+                        $calendarService = app(\App\Services\GoogleCalendarService::class);
+                        $calendarService->deleteEvent($vendor, $oldEventId);
+                    } catch (\Throwable $e) {
+                        Log::warning("Failed to delete google calendar event for vendor during service cancel: " . $e->getMessage());
+                    }
+                }
+
+                $slot->google_event_id = null;
+                $slot->status = 'cancelled';
+                $slot->save();
             }
 
             if (!$vendor && !empty($orderService->vendor_id)) {
@@ -498,21 +512,26 @@ class OrderCancellationController extends Controller
                 }
             }
 
-            // Update order totals and record fee
+            // Mark service as cancelled and disable media access for agent
             $serviceAmount = $orderService->amount;
-            $orderService->delete();
+            $orderService->update([
+                'status' => 'cancelled',
+                'media_access' => false,
+            ]);
 
             $order->update([
                 'amount' => max(0.0, $order->amount - $serviceAmount),
                 'cancellation_fee' => ($order->cancellation_fee ?? 0.0) + $cancellationFee
             ]);
 
-            // Sync main (consolidated) invoices (removes deleted service from consolidated invoices)
+            // Sync main (consolidated) invoices (removes cancelled service from consolidated invoices)
             Invoice::syncOrderInvoices($order);
 
-            // If no more services exist, cancel the entire order
-            $remainingServicesCount = OrderService::where('order_id', $order->id)->count();
-            if ($remainingServicesCount === 0) {
+            // If no more active services exist, cancel the entire order
+            $remainingActiveServicesCount = OrderService::where('order_id', $order->id)
+                ->where('status', '!=', 'cancelled')
+                ->count();
+            if ($remainingActiveServicesCount === 0) {
                 $order->update([
                     'order_status' => 'Cancelled',
                     'cancelled_at' => now(),
@@ -525,9 +544,9 @@ class OrderCancellationController extends Controller
             DB::commit();
 
             // Dispatch Calendar Event deletion
-            if ($deletedSlotId) {
+            if ($cancelledSlotId) {
                 try {
-                    SyncOrderCalendarEvents::dispatch($order->id, [$deletedSlotId]);
+                    SyncOrderCalendarEvents::dispatch($order->id, [$cancelledSlotId]);
                 } catch (\Throwable $e) {
                     Log::error('Failed to dispatch SyncOrderCalendarEvents job on service cancellation: ' . $e->getMessage());
                 }

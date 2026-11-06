@@ -173,8 +173,9 @@ class FeatureSheetController extends Controller
                 if (!$includeHidden) $query->where('is_hidden', false);
             }])->firstOrFail();
 
-            // If public request and not published, deny access
-            if ($isPublic && !$sheet->is_published) {
+            // If public request and not published (and not preview mode), deny access
+            $isPreview = $request->boolean('preview');
+            if ($isPublic && !$sheet->is_published && !$isPreview) {
                 return response()->json([
                     'status'  => false,
                     'message' => 'Feature sheet is in draft and has not been published yet.',

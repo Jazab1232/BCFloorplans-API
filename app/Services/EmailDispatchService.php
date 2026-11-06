@@ -250,24 +250,40 @@ class EmailDispatchService
             $order = $options['order'];
         } elseif ($model instanceof \App\Models\Order) {
             $order = $model;
-        } elseif ($model instanceof \App\Models\OrderSlot) {
+        }
+
+        if ($model instanceof \App\Models\OrderSlot) {
             $slot = $model;
-            $order = $model->order;
+            if (!$order) {
+                $order = $model->order;
+            }
         } elseif ($model instanceof \App\Models\Tour) {
-            $order = $model->orders ?: ($model->order ?: ($model->order_id ? \App\Models\Order::withoutGlobalScopes()->find($model->order_id) : null));
+            if (!$order) {
+                $order = $model->orders ?: ($model->order ?: ($model->order_id ? \App\Models\Order::withoutGlobalScopes()->find($model->order_id) : null));
+            }
         } elseif ($model instanceof \App\Models\TourLink) {
-            $tour = $model->tour;
-            $order = $tour ? ($tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null))) : null;
+            if (!$order) {
+                $tour = $model->tour;
+                $order = $tour ? ($tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null))) : null;
+            }
         } elseif ($model instanceof \App\Models\TourFile) {
-            $tour = $model->tour;
-            $order = $tour ? ($tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null))) : null;
+            if (!$order) {
+                $tour = $model->tour;
+                $order = $tour ? ($tour->orders ?: ($tour->order ?: ($tour->order_id ? \App\Models\Order::withoutGlobalScopes()->find($tour->order_id) : null))) : null;
+            }
         } elseif ($model instanceof \App\Models\OrderService) {
-            $order = $model->order ?: ($model->order_id ? \App\Models\Order::withoutGlobalScopes()->find($model->order_id) : null);
+            if (!$order) {
+                $order = $model->order ?: ($model->order_id ? \App\Models\Order::withoutGlobalScopes()->find($model->order_id) : null);
+            }
         } elseif ($model instanceof \App\Models\AgentPayment) {
             $payment = $model;
-            $order = $model->order ?: ($model->invoice ? $model->invoice->order : null);
+            if (!$order) {
+                $order = $model->order ?: ($model->invoice ? $model->invoice->order : null);
+            }
         } elseif ($model instanceof \App\Models\Invoice) {
-            $order = $model->order;
+            if (!$order) {
+                $order = $model->order;
+            }
         }
 
 
@@ -372,7 +388,26 @@ class EmailDispatchService
 
         // 3. Resolve Vendor
         if (in_array('vendor', $allowedRoles)) {
-            if ($slot && $slot->vendor_id) {
+            $specificVendor = null;
+            if (!empty($options['vendor_uuid'])) {
+                $specificVendor = \App\Models\Vendor::withoutGlobalScopes()->where('uuid', $options['vendor_uuid'])->first();
+            } elseif (!empty($options['vendor_id'])) {
+                $specificVendor = is_numeric($options['vendor_id'])
+                    ? \App\Models\Vendor::withoutGlobalScopes()->find($options['vendor_id'])
+                    : \App\Models\Vendor::withoutGlobalScopes()->where('uuid', $options['vendor_id'])->first();
+            }
+
+            if ($specificVendor) {
+                $vendorEmails = $this->getVendorEmails($specificVendor);
+                foreach ($vendorEmails as $vEmail) {
+                    $recipients[] = [
+                        'email' => $vEmail,
+                        'name' => trim($specificVendor->first_name . ' ' . $specificVendor->last_name),
+                        'role' => 'vendor',
+                        'model' => $specificVendor,
+                    ];
+                }
+            } elseif ($slot && $slot->vendor_id) {
                 // Fetch the vendor directly, bypassing global organization scopes (in case vendor has null or different org ID)
                 $vendor = \App\Models\Vendor::withoutGlobalScopes()->find($slot->vendor_id);
                 if ($vendor) {
@@ -738,9 +773,24 @@ class EmailDispatchService
             $data['start_time'] = $slot->start_time;
             $data['end_time'] = $slot->end_time;
             $data['service_name'] = $slot->service ? $slot->service->name : 'Service';
-            if ($slot->vendor) {
-                $data['vendor_name'] = trim($slot->vendor->first_name . ' ' . $slot->vendor->last_name);
-                $data['vendor_phone'] = $slot->vendor->primary_phone ?? $slot->vendor->phone ?? '';
+
+            // Resolve vendor for this slot / recipient
+            $slotVendor = null;
+            if ($recipient['model'] instanceof \App\Models\Vendor && ($role === 'vendor' || $eventType === 'slot_cancelled')) {
+                $slotVendor = $recipient['model'];
+            } elseif (!empty($preSeededData['vendor_uuid'])) {
+                $slotVendor = \App\Models\Vendor::withoutGlobalScopes()->where('uuid', $preSeededData['vendor_uuid'])->first();
+            } else {
+                $slotVendor = $slot->vendor;
+            }
+
+            if ($slotVendor) {
+                $data['vendor_name'] = trim($slotVendor->first_name . ' ' . $slotVendor->last_name);
+                $data['vendor_phone'] = $slotVendor->primary_phone ?? $slotVendor->phone ?? '';
+                $data['vendor_email'] = $slotVendor->email ?? '';
+                if ($role === 'vendor' || $eventType === 'slot_cancelled') {
+                    $slot->setRelation('vendor', $slotVendor);
+                }
             }
         }
 

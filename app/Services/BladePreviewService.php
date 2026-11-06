@@ -70,7 +70,7 @@ class BladePreviewService
         }
 
         // Build model objects (real or mock with placeholders)
-        $models = $this->buildContextModels($realOrder, $extraData);
+        $models = $this->buildContextModels($realOrder, $extraData, $recipientRole);
         $recipientName = $models['recipient_name'];
 
         // Instantiate mailable
@@ -148,14 +148,43 @@ class BladePreviewService
     /**
      * Build context models (real or mock with standard variables).
      */
-    protected function buildContextModels(?Order $realOrder, array $extraData = []): array
+    protected function buildContextModels(?Order $realOrder, array $extraData = [], string $recipientRole = 'agent'): array
     {
         if ($realOrder) {
-            $slot = $realOrder->slots->first() ?? new OrderSlot();
+            $slot = null;
+            if (!empty($extraData['slot_uuid'])) {
+                $slot = $realOrder->slots->first(fn($s) => $s->uuid === $extraData['slot_uuid']);
+            }
+            if (!$slot) {
+                $slot = $realOrder->slots->first() ?? new OrderSlot();
+            }
+
+            if (!empty($extraData['vendor_uuid'])) {
+                $specificVendor = Vendor::withoutGlobalScopes()->where('uuid', $extraData['vendor_uuid'])->first();
+                if ($specificVendor && $slot) {
+                    $slot->setRelation('vendor', $specificVendor);
+                }
+            } elseif (!empty($extraData['old_vendor_uuid']) && ($extraData['event_type'] ?? '') === 'slot_cancelled') {
+                $specificVendor = Vendor::withoutGlobalScopes()->where('uuid', $extraData['old_vendor_uuid'])->first();
+                if ($specificVendor && $slot) {
+                    $slot->setRelation('vendor', $specificVendor);
+                }
+            }
+
             $orderService = $realOrder->services->first() ?? new OrderService();
             $invoice = $realOrder->invoices->first() ?? new Invoice();
 
             $agentName = $realOrder->agent ? trim($realOrder->agent->first_name . ' ' . $realOrder->agent->last_name) : 'Valued Customer';
+            $vendorName = ($slot && $slot->vendor) ? trim($slot->vendor->first_name . ' ' . $slot->vendor->last_name) : 'Vendor';
+
+            if ($recipientRole === 'vendor') {
+                $recipientName = !empty($extraData['recipient_name']) ? $extraData['recipient_name'] : $vendorName;
+            } elseif ($recipientRole === 'admin') {
+                $recipientName = 'Administrator';
+            } else {
+                $recipientName = !empty($extraData['recipient_name']) ? $extraData['recipient_name'] : $agentName;
+            }
+
             $tour = Tour::where('order_id', $realOrder->id)->first() ?? new Tour();
             $tour->order = $realOrder;
 
@@ -167,7 +196,7 @@ class BladePreviewService
                 'order_service'  => $orderService,
                 'payment'        => new AgentPayment(['amount' => $realOrder->amount, 'payment_method' => 'Credit Card']),
                 'vendor_payment' => new VendorPayment(['amount' => 150.00, 'transfer_id' => 'tr_sample']),
-                'recipient_name' => $agentName,
+                'recipient_name' => $recipientName,
             ];
         }
 

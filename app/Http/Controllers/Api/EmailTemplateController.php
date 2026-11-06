@@ -216,7 +216,7 @@ class EmailTemplateController extends Controller
     {
         $recipientRole = $request->query('recipient_role', 'agent');
         $orderUuid = $request->query('order_uuid');
-        $extraData = $request->query('data', []);
+        $extraData = array_merge($request->query('data', []), $request->all());
 
         $org = null;
         $user = auth()->user();
@@ -446,18 +446,37 @@ class EmailTemplateController extends Controller
         $agentEmail = $order?->agent?->email ?? '';
         $agentPhone = $order?->agent?->primary_phone ?? '';
 
-        $vendor = $slot?->vendor ?: ($order?->vendor_id ? Vendor::withoutGlobalScopes()->find($order->vendor_id) : null);
-        if (!$vendor && $request->filled('vendor_uuid')) {
+        // Resolve vendor prioritizing explicit request parameters
+        $vendor = null;
+        if ($request->filled('vendor_uuid')) {
             $vendor = Vendor::withoutGlobalScopes()->where('uuid', $request->query('vendor_uuid'))->first();
+        } elseif ($eventType === 'slot_cancelled' && $request->filled('old_vendor_uuid')) {
+            $vendor = Vendor::withoutGlobalScopes()->where('uuid', $request->query('old_vendor_uuid'))->first();
+        } elseif ($eventType === 'slot_booked' && $request->filled('new_vendor_uuid')) {
+            $vendor = Vendor::withoutGlobalScopes()->where('uuid', $request->query('new_vendor_uuid'))->first();
         }
-        $vendorName = $vendor ? trim(($vendor->first_name ?? '') . ' ' . ($vendor->last_name ?? '')) : 'Vendor';
-        $vendorEmail = $vendor?->email ?? '';
-        $vendorPhone = $vendor?->primary_phone ?? $vendor?->phone ?? '';
+
+        if (!$vendor && $slot) {
+            $vendor = $slot->vendor;
+        }
+
+        if (!$vendor && $order && $order->vendor_id) {
+            $vendor = Vendor::withoutGlobalScopes()->find($order->vendor_id);
+        }
+
+        $fallbackVendorName = ($eventType === 'slot_cancelled' && $request->filled('old_vendor_name'))
+            ? $request->query('old_vendor_name')
+            : ($request->query('vendor_name') ?? 'Vendor');
+
+        $vendorName = $vendor ? trim(($vendor->first_name ?? '') . ' ' . ($vendor->last_name ?? '')) : $fallbackVendorName;
+        $vendorEmail = $vendor?->email ?? ($request->query('vendor_email') ?? '');
+        $vendorPhone = $vendor?->primary_phone ?? $vendor?->phone ?? ($request->query('vendor_phone') ?? '');
 
         if ($recipientRole === 'vendor') {
-            $recipientName = $vendorName;
+            $recipientName = $request->query('recipient_name')
+                ?: (($eventType === 'slot_cancelled' && $request->filled('old_vendor_name')) ? $request->query('old_vendor_name') : $vendorName);
         } elseif ($recipientRole === 'agent') {
-            $recipientName = $agentName;
+            $recipientName = $request->query('recipient_name') ?: $agentName;
         } elseif ($recipientRole === 'admin') {
             $recipientName = 'Administrator';
         }
@@ -644,6 +663,8 @@ class EmailTemplateController extends Controller
             'order_uuid'        => 'nullable|string',
             'tour_uuid'         => 'nullable|string',
             'service_uuid'      => 'nullable|string',
+            'slot_uuid'         => 'nullable|string',
+            'vendor_uuid'       => 'nullable|string',
             'options'           => 'nullable|array',
         ]);
 
@@ -731,6 +752,10 @@ class EmailTemplateController extends Controller
 
         if ($order) {
             $dispatchOptions['order'] = $order;
+        }
+
+        if ($request->filled('vendor_uuid')) {
+            $dispatchOptions['vendor_uuid'] = $request->input('vendor_uuid');
         }
 
         $success = $dispatchService->dispatch($eventType, $model, $dispatchOptions);

@@ -850,7 +850,7 @@ class Invoice extends Model
             ->with(['items'])
             ->get();
 
-        $allOrderServices = $order->services;
+        $allOrderServices = $order->services->filter(fn($os) => ($os->status ?? 'active') !== 'cancelled');
         $allOrderServiceIds = $allOrderServices->pluck('id')->toArray();
 
         foreach ($activeInvoices as $invoice) {

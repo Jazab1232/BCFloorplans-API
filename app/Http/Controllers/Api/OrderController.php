@@ -3784,6 +3784,9 @@ private function createOrderNotification($order, array $changes)
 
             $slots = OrderSlot::with([ 'service', 'vendor'])
                 ->whereDate('date', '>=', $today)
+                ->where(function ($q) {
+                    $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                })
                 ->orderBy('date', 'asc')
                 ->get();
 
@@ -3944,7 +3947,10 @@ private function createOrderNotification($order, array $changes)
 
         // Check existing slots
         $query = OrderSlot::where('vendor_id', $vendor->id)
-            ->whereDate('date', $date);
+            ->whereDate('date', $date)
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+            });
             
         if ($excludeSlotUuid) {
             $query->where('uuid', '!=', $excludeSlotUuid);
@@ -3981,7 +3987,10 @@ private function createOrderNotification($order, array $changes)
 
         // Get existing slots from DB
         $dbSlotsQuery = OrderSlot::where('vendor_id', $vendor->id)
-            ->whereDate('date', $date);
+            ->whereDate('date', $date)
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+            });
             
         if ($excludeOrderUuid) {
             if (is_numeric($excludeOrderUuid)) {
@@ -4088,17 +4097,24 @@ private function createOrderNotification($order, array $changes)
             $oldVendor = $slot->vendor ?: ($slot->vendor_id ? Vendor::withoutGlobalScopes()->find($slot->vendor_id) : null);
             $oldEventId = $slot->google_event_id;
 
+            $isSuppressed = $request->boolean('suppress_email') || $request->boolean('skip_email');
+            $notifyOldVendor = $request->has('notify_old_vendor') ? $request->boolean('notify_old_vendor') : !$isSuppressed;
+            $notifyNewVendor = $request->has('notify_new_vendor') ? $request->boolean('notify_new_vendor') : !$isSuppressed;
+            $notifyAgent     = $request->has('notify_agent') ? $request->boolean('notify_agent') : !$isSuppressed;
+
             // Notify old vendor of cancellation/unassignment
-            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email') && $oldVendor && $oldVendor->email) {
+            if ($notifyOldVendor && $oldVendor && $oldVendor->email) {
                 try {
-                    $slot->loadMissing(['service', 'order.property']);
+                    $slot->loadMissing(['service', 'order.property', 'order.agent']);
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_cancelled', $slot, [
                         'recipients' => [[
                             'email' => $oldVendor->email,
                             'name' => trim($oldVendor->first_name . ' ' . $oldVendor->last_name),
                             'role' => 'vendor',
                             'model' => $oldVendor
-                        ]]
+                        ]],
+                        'force' => true,
+                        'bypass_preferences' => true,
                     ]);
                 } catch (\Throwable $e) {
                     Log::warning("Failed to dispatch slot_cancelled email for old vendor during reassign: " . $e->getMessage());
@@ -4145,16 +4161,26 @@ private function createOrderNotification($order, array $changes)
 
             $slot->save();
 
+            // Also synchronize corresponding OrderService vendor_id
+            if ($slot->service_id && $slot->order_id) {
+                OrderService::where('order_id', $slot->order_id)
+                    ->where('service_id', $slot->service_id)
+                    ->update(['vendor_id' => $newVendor->uuid]);
+            }
+
             // Notify new vendor of booking assignment
-            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email') && $newVendor && $newVendor->email) {
+            if ($notifyNewVendor && $newVendor && $newVendor->email) {
                 try {
+                    $slot->loadMissing(['service', 'order.property', 'order.agent']);
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot, [
                         'recipients' => [[
                             'email' => $newVendor->email,
                             'name' => trim($newVendor->first_name . ' ' . $newVendor->last_name),
                             'role' => 'vendor',
                             'model' => $newVendor
-                        ]]
+                        ]],
+                        'force' => true,
+                        'bypass_preferences' => true,
                     ]);
                 } catch (\Throwable $e) {
                     Log::warning("Failed to dispatch slot_booked email for new vendor during reassign: " . $e->getMessage());
@@ -4162,15 +4188,18 @@ private function createOrderNotification($order, array $changes)
             }
 
             // Notify agent that their appointment slot has updated with new vendor
-            if (!$request->boolean('suppress_email') && !$request->boolean('skip_email') && $slot->order && $slot->order->agent && $slot->order->agent->email) {
+            $agent = $slot->order?->agent ?: ($slot->order?->agent_id ? \App\Models\Agent::withoutGlobalScopes()->find($slot->order->agent_id) : null);
+            if ($notifyAgent && $agent && $agent->email) {
                 try {
                     app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot, [
                         'recipients' => [[
-                            'email' => $slot->order->agent->email,
-                            'name' => trim($slot->order->agent->first_name . ' ' . $slot->order->agent->last_name),
+                            'email' => $agent->email,
+                            'name' => trim($agent->first_name . ' ' . $agent->last_name),
                             'role' => 'agent',
-                            'model' => $slot->order->agent
-                        ]]
+                            'model' => $agent
+                        ]],
+                        'force' => true,
+                        'bypass_preferences' => true,
                     ]);
                 } catch (\Throwable $e) {
                     Log::warning("Failed to dispatch slot_booked email for agent during reassign: " . $e->getMessage());

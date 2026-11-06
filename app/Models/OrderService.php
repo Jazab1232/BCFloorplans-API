@@ -25,6 +25,7 @@ class OrderService extends Model
         'media_access',
         'vendor_id',
         'is_completed',
+        'status',
         'vendor_paid',
         'vendor_paid_at',
         'vendor_invoice_id',
