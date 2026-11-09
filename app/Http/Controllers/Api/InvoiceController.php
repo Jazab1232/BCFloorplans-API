@@ -756,14 +756,15 @@ class InvoiceController extends Controller
                     $allowedServiceIds = $invoice->items()->where('is_extra', false)->pluck('order_service_id')->toArray();
                 }
 
-                // Clear old extra items (only extra media items, preserve package discounts)
+                // Clear old extra items (only extra media items, preserve package discounts and agent discounts)
                 $invoice->items()
                     ->where('is_extra', true)
                     ->where(function($q) {
                         $q->whereNull('meta')
-                          ->orWhere('meta->type', '!=', 'package_discount');
+                          ->orWhereNotIn('meta->type', ['package_discount', 'agent_discount']);
                     })
                     ->where('description', 'not like', 'Package Discount%')
+                    ->where('description', 'not like', 'Agent Discount%')
                     ->delete();
 
                 // Insert new extra items

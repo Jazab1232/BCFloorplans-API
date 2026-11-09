@@ -1347,14 +1347,31 @@ class OrderController extends Controller
                     // Always update unpaid invoices if they exist
                     foreach ($invoices as $invoice) {
                         if ($invoice->status !== 'paid') {
-                            $item = $invoice->items()->where('order_service_id', $orderService->id)->first();
+                            $item = $invoice->items()
+                                ->where('order_service_id', $orderService->id)
+                                ->where('is_extra', false)
+                                ->first();
+
                             if ($item) {
                                 $item->update([
                                     'unit_price' => $newAmount,
                                     'amount' => $newAmount
                                 ]);
-                                $invoice->recalculateTotals();
                             }
+
+                            // Clean up previous extra media items for this service, since the package was modified/upgraded
+                            $invoice->items()
+                                ->where('order_service_id', $orderService->id)
+                                ->where('is_extra', true)
+                                ->where(function($q) {
+                                    $q->whereNull('meta')
+                                      ->orWhereNotIn('meta->type', ['package_discount', 'agent_discount']);
+                                })
+                                ->where('description', 'not like', 'Package Discount%')
+                                ->where('description', 'not like', 'Agent Discount%')
+                                ->delete();
+
+                            $invoice->recalculateTotals();
                         }
                     }
                 }
