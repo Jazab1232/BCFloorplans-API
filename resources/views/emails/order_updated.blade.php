@@ -83,6 +83,8 @@
         @endif
     </div>
     @endif
+
+    @if($showInternalNotes && $order->notes)
     <!-- Internal Notes (Admin Only) -->
     <div style="background-color: #FEF3C7; padding: 20px; border-radius: 8px; border: 1px solid #FDE68A; margin-bottom: 20px;">
         <h3 style="font-size: 15px; margin: 0 0 12px; color: #92400E; border-bottom: 1px solid #FDE68A; padding-bottom: 8px;">Order Notes (Internal)</h3>

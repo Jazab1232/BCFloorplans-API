@@ -26,7 +26,7 @@ class DynamicMailable extends Mailable
      */
     public function __construct(string $content, string $subjectText, ?Organization $org, string $recipientRole, array $attachments = [])
     {
-        $this->content = $content;
+        $this->content = app(\App\Services\EmailTemplateSanitizerService::class)->sanitize($content);
         $this->subjectText = $subjectText;
         $this->organization = $org;
         $this->recipientRole = $recipientRole;

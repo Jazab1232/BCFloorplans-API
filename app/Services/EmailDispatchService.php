@@ -1406,6 +1406,9 @@ class EmailDispatchService
                     $html = method_exists($mailable, 'render') ? $mailable->render() : '';
                 }
 
+                // Sanitize and minify HTML to prevent email clipping in Gmail/Outlook
+                $html = app(\App\Services\EmailTemplateSanitizerService::class)->sanitize($html);
+
                 // Resolve attachments from mailable (if any)
                 $resendAttachments = [];
                 if (method_exists($mailable, 'attachments')) {

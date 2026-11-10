@@ -123,6 +123,8 @@
         @endif
     </div>
     @endif
+
+    @if($recipientRole !== 'vendor' && $order->slots && $order->slots->count() > 0)
     <!-- Scheduled Slots -->
     <div style="background-color: #F9FAFB; padding: 20px; border-radius: 8px; border: 1px solid #E5E7EB; margin-bottom: 20px;">
         <h3 style="font-size: 15px; margin: 0 0 12px; color: #111827; border-bottom: 1px solid #E5E7EB; padding-bottom: 8px;">Scheduled Appointments</h3>

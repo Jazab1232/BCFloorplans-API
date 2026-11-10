@@ -97,6 +97,11 @@ class EmailTemplateController extends Controller
             }
         }
 
+        // Sanitize content: auto-extract Base64 images to S3 & strip Tailwind CSS bloat
+        if (isset($data['content']) && is_string($data['content'])) {
+            $data['content'] = app(\App\Services\EmailTemplateSanitizerService::class)->sanitize($data['content']);
+        }
+
         $template = EmailTemplate::create($data);
 
         return response()->json([
@@ -157,6 +162,11 @@ class EmailTemplateController extends Controller
             } elseif (!is_array($data['recipient_type']) && !is_null($data['recipient_type'])) {
                 $data['recipient_type'] = (array) $data['recipient_type'];
             }
+        }
+
+        // Sanitize content: auto-extract Base64 images to S3 & strip Tailwind CSS bloat
+        if (array_key_exists('content', $data) && is_string($data['content'])) {
+            $data['content'] = app(\App\Services\EmailTemplateSanitizerService::class)->sanitize($data['content']);
         }
 
         $template->update($data);
