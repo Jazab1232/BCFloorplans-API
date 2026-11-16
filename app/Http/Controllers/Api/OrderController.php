@@ -3416,9 +3416,8 @@ private function createOrderNotification($order, array $changes)
         // 2. Verify vendor does not require review (if review_files == true, vendor must submit for admin approval)
         if ($user instanceof \App\Models\Vendor) {
             $isAssigned = ($order->vendor_id && $order->vendor_id == $user->id)
-                || $order->services()->where(function($q) use ($user) {
-                    $q->where('vendor_id', $user->uuid)->orWhere('vendor_id', $user->id);
-                })->exists();
+                || $order->slots()->where('vendor_id', $user->id)->exists()
+                || (!empty($user->uuid) && $order->services()->where('vendor_id', $user->uuid)->exists());
 
             if (!$isAssigned) {
                 return response()->json([

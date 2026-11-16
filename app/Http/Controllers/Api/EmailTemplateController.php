@@ -226,32 +226,65 @@ class EmailTemplateController extends Controller
     {
         $recipientRole = $request->query('recipient_role', 'agent');
         $orderUuid = $request->query('order_uuid');
+        $tourUuid = $request->query('tour_uuid');
+        $serviceUuid = $request->query('service_uuid');
+        $slotUuid = $request->query('slot_uuid');
+        $vendorUuid = $request->query('vendor_uuid');
         $extraData = array_merge($request->query('data', []), $request->all());
 
         $org = null;
-        $user = auth()->user();
-        if ($user && !empty($user->organization_id)) {
-            $org = \App\Models\Organization::withoutGlobalScopes()->find($user->organization_id);
-        }
 
+        // 1. Explicit organization parameter
         $orgUuid = $request->query('organization_id')
             ?? $request->query('organization_uuid')
             ?? $request->query('org_uuid')
             ?? $request->header('X-Organization-Id');
 
-        if (!$org && !empty($orgUuid)) {
+        if (!empty($orgUuid)) {
             $org = \App\Models\Organization::withoutGlobalScopes()->where('uuid', $orgUuid)->first()
                 ?: (is_numeric($orgUuid) ? \App\Models\Organization::withoutGlobalScopes()->find((int)$orgUuid) : null);
         }
 
+        // 2. Resolve from Order / Tour / Service / Slot (the email is for this entity)
         if (!$org && !empty($orderUuid)) {
             $order = Order::withoutGlobalScopes()->where('uuid', $orderUuid)->first()
                 ?: (is_numeric($orderUuid) ? Order::withoutGlobalScopes()->find((int)$orderUuid) : null);
-            if ($order && $order->organization_id) {
-                $org = \App\Models\Organization::withoutGlobalScopes()->find($order->organization_id);
+            if ($order) {
+                $org = app(EmailDispatchService::class)->resolveOrganization($order);
             }
         }
 
+        if (!$org && !empty($tourUuid)) {
+            $tour = Tour::where('uuid', $tourUuid)->first();
+            if ($tour) {
+                $org = app(EmailDispatchService::class)->resolveOrganization($tour);
+            }
+        }
+
+        if (!$org && !empty($serviceUuid)) {
+            $svc = OrderService::where('uuid', $serviceUuid)->first();
+            if ($svc) {
+                $org = app(EmailDispatchService::class)->resolveOrganization($svc);
+            }
+        }
+
+        if (!$org && !empty($slotUuid)) {
+            $slot = OrderSlot::withoutGlobalScopes()->where('uuid', $slotUuid)->first()
+                ?: (is_numeric($slotUuid) ? OrderSlot::withoutGlobalScopes()->find((int)$slotUuid) : null);
+            if ($slot) {
+                $org = app(EmailDispatchService::class)->resolveOrganization($slot);
+            }
+        }
+
+        // 3. Fallback to auth user organization if not resolved by entity
+        if (!$org) {
+            $user = auth()->user();
+            if ($user && !empty($user->organization_id)) {
+                $org = \App\Models\Organization::withoutGlobalScopes()->find($user->organization_id);
+            }
+        }
+
+        // 4. Default platform fallback
         if (!$org) {
             $org = \App\Models\Organization::withoutGlobalScopes()->where('slug', 'bcfloorplans')->first()
                 ?? \App\Models\Organization::withoutGlobalScopes()->where('is_active', true)->first()

@@ -42,11 +42,6 @@ class BladePreviewService
             return null;
         }
 
-        // Resolve auth org if not provided
-        if (!$org && auth()->check() && auth()->user()->organization_id) {
-            $org = Organization::withoutGlobalScopes()->find(auth()->user()->organization_id);
-        }
-
         // Try to resolve real order if orderUuid is provided
         $realOrder = null;
         if (!empty($orderUuid)) {
@@ -67,6 +62,11 @@ class BladePreviewService
                     $org = app(EmailDispatchService::class)->resolveOrganization($realOrder);
                 }
             }
+        }
+
+        // Resolve auth org if not provided and not determined from order
+        if (!$org && auth()->check() && auth()->user()->organization_id) {
+            $org = Organization::withoutGlobalScopes()->find(auth()->user()->organization_id);
         }
 
         // Build model objects (real or mock with placeholders)
@@ -132,6 +132,20 @@ class BladePreviewService
             $subject
         );
 
+        $logoUrl = null;
+        if ($org && !empty($org->company_logos_urls)) {
+            $logos = collect($org->company_logos_urls);
+            $primary = $logos->firstWhere('type', 'primary_logo') ?? $logos->first();
+            $logoUrl = $primary['url'] ?? null;
+        }
+
+        if (!$logoUrl && $org) {
+            $setting = \App\Models\Setting::where('org_id', $org->uuid)->where('key', 'branding')->first();
+            if ($setting && is_array($setting->value) && !empty($setting->value['logo'])) {
+                $logoUrl = $setting->value['logo'];
+            }
+        }
+
         return [
             'event_type'      => $eventType,
             'event_label'     => $eventConfig['label'] ?? $eventType,
@@ -142,6 +156,17 @@ class BladePreviewService
             'subject'         => $subject,
             'content'         => $contentHtml,
             'full_html'       => $fullHtml,
+            'organization'    => $org ? [
+                'id'                 => $org->id,
+                'uuid'               => $org->uuid,
+                'name'               => $org->name,
+                'logo_url'           => $logoUrl,
+                'company_logos_urls' => $org->company_logos_urls,
+                'primary_color'      => $org->primary_color ?: '#2563EB',
+                'contact_email'      => $org->contact_email,
+                'contact_phone'      => $org->contact_phone,
+                'is_whitelabel'      => (bool)$org->is_whitelabel,
+            ] : null,
         ];
     }
 
