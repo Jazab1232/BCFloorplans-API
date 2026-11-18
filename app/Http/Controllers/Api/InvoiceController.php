@@ -209,7 +209,8 @@ class InvoiceController extends Controller
                 'agent:id,uuid,first_name,last_name,email',
                 'items',
                 'items.orderService:id,uuid,service_id,amount',
-                'items.orderService.service:id,name',
+                'items.orderService.service:id,name,category_id',
+                'items.orderService.service.category:id,name',
                 'payments:id,uuid,invoice_id,amount,status,paid_at,stripe_receipt_url,payment_method',
             ]);
 
@@ -286,7 +287,8 @@ class InvoiceController extends Controller
                 'agent:id,uuid,first_name,last_name,email',
                 'items',
                 'items.orderService:id,uuid,service_id,amount',
-                'items.orderService.service:id,name',
+                'items.orderService.service:id,name,category_id',
+                'items.orderService.service.category:id,name',
                 'payments:id,uuid,invoice_id,amount,status,paid_at,stripe_receipt_url,payment_method',
             ])->where('uuid', $uuid)->firstOrFail();
 
@@ -701,7 +703,8 @@ class InvoiceController extends Controller
                     'agent:id,uuid,first_name,last_name,email',
                     'items',
                     'items.orderService:id,uuid,service_id,amount',
-                    'items.orderService.service:id,name',
+                    'items.orderService.service:id,name,category_id',
+                    'items.orderService.service.category:id,name',
                     'payments:id,uuid,amount,status,paid_at,stripe_receipt_url,payment_method',
                 ]),
                 'message' => 'Invoice updated successfully.',
@@ -756,15 +759,17 @@ class InvoiceController extends Controller
                     $allowedServiceIds = $invoice->items()->where('is_extra', false)->pluck('order_service_id')->toArray();
                 }
 
-                // Clear old extra items (only extra media items, preserve package discounts and agent discounts)
+                // Clear old extra media items — preserve all discount line items (package, agent, code)
+                // so that syncOrderInvoices (called below) can re-evaluate the winning discount correctly.
                 $invoice->items()
                     ->where('is_extra', true)
                     ->where(function($q) {
                         $q->whereNull('meta')
-                          ->orWhereNotIn('meta->type', ['package_discount', 'agent_discount']);
+                          ->orWhereNotIn('meta->type', ['package_discount', 'agent_discount', 'code_discount']);
                     })
                     ->where('description', 'not like', 'Package Discount%')
                     ->where('description', 'not like', 'Agent Discount%')
+                    ->where('description', 'not like', 'Coupon Discount%')
                     ->delete();
 
                 // Insert new extra items

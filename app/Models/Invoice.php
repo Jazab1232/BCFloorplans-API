@@ -252,7 +252,7 @@ class Invoice extends Model
     {
         if ($orderServices->isEmpty()) return null;
 
-        $order->load(['agent', 'property']);
+        $order->load(['services.service', 'agent', 'property']);
         $agent = $order->agent;
         $province = $agent->headquarter_province ?? $order->property->province ?? 'ON';
         $taxInfo = (new \App\Http\Controllers\Api\InvoiceController)->getCanadaTaxRate($province);
@@ -413,13 +413,16 @@ class Invoice extends Model
 
     /**
      * Resolve agent discount for the given services being invoiced on an order.
+     *
+     * IMPORTANT: Only reads agent_discount from order->meta (snapshotted at order time).
+     * Does NOT fall back to the live agent profile to prevent the agent discount from
+     * appearing on invoices when a package discount was selected as the winner instead.
+     * The snapshot in order->meta['agent_discount'] is only written when agent discount
+     * was actually applied (i.e., it won over any package discount).
      */
     public static function resolveAgentDiscountForInvoice(Order $order, $services, float $multiplier = 1.0): ?array
     {
         $discountData = $order->meta['agent_discount'] ?? null;
-        if (empty($discountData) && $order->agent && !empty($order->agent->agent_discount)) {
-            $discountData = $order->agent->agent_discount;
-        }
 
         if (empty($discountData)) {
             return null;
@@ -438,6 +441,8 @@ class Invoice extends Model
         $isPercentage = filter_var($discountData['is_percentage'] ?? true, FILTER_VALIDATE_BOOLEAN);
 
         $servicesCollection = collect($services);
+        // os->amount stores the already-calculated service total (e.g. 2500 sqft × $0.10 = $250).
+        // option->amount is the per-unit RATE ($0.10), NOT the total — never use it as the base.
         $currentServicesTotal = (float) $servicesCollection->sum(fn($os) => (float)$os->amount);
         if ($currentServicesTotal <= 0) {
             return null;
@@ -477,6 +482,139 @@ class Invoice extends Model
         ];
     }
 
+    /**
+     * Resolve coupon/code discounts for the given services being invoiced on an order.
+     * Code discounts apply additively on top of package/agent discounts.
+     */
+    public static function resolveCodeDiscountsForInvoice(Order $order, $services, float $multiplier = 1.0): ?array
+    {
+        $discountsData = $order->meta['discounts'] ?? [];
+        if (empty($discountsData)) {
+            // Also check OrderTotal records if meta['discounts'] is missing
+            $orderTotals = \App\Models\OrderTotal::where('order_id', $order->id)
+                ->whereNotNull('discount_id')
+                ->with('discount')
+                ->get();
+            if ($orderTotals->isNotEmpty()) {
+                $discountsData = $orderTotals->map(function ($ot) {
+                    return [
+                        'discount_id' => $ot->discount?->uuid,
+                        'value' => (float)$ot->discount_value,
+                        'type' => $ot->discount_type,
+                    ];
+                })->filter(fn($d) => !empty($d['discount_id']))->values()->toArray();
+            }
+        }
+
+        if (empty($discountsData)) {
+            return null;
+        }
+
+        $servicesCollection = collect($services);
+        // os->amount stores the already-calculated service total (e.g. 2500 sqft × $0.10 = $250).
+        // option->amount is the per-unit RATE ($0.10), NOT the total — never use it as the base.
+        $currentServicesTotal = (float) $servicesCollection->sum(fn($os) => (float)$os->amount);
+        if ($currentServicesTotal <= 0) {
+            return null;
+        }
+
+        $order->loadMissing('services');
+        $totalOrderAmount = (float) $order->services->sum(fn($os) => (float)$os->amount);
+        $ratio = $totalOrderAmount > 0 ? ($currentServicesTotal / $totalOrderAmount) : 1.0;
+
+        $totalDiscountAmount = 0.0;
+        $discountNames = [];
+
+        foreach ($discountsData as $disc) {
+            $discountId = $disc['discount_id'] ?? null;
+            if (!$discountId) continue;
+
+            $discModel = is_numeric($discountId)
+                ? \App\Models\Discount::find((int)$discountId)
+                : \App\Models\Discount::where('uuid', $discountId)->first();
+
+            $val = (float)($disc['value'] ?? $discModel?->percentage ?? $discModel?->quantity ?? 0);
+            $type = $disc['type'] ?? $discModel?->type ?? 'manual';
+
+            // Service-scoped discount: check if this service matches
+            $serviceId = $disc['service_id'] ?? null;
+            if ($serviceId) {
+                $matchingService = $servicesCollection->first(function ($os) use ($serviceId) {
+                    return $os->id == $serviceId || $os->service_id == $serviceId || ($os->service?->uuid === $serviceId);
+                });
+                if (!$matchingService) {
+                    continue;
+                }
+                // Use os->amount (the calculated total) — option->amount is just the per-unit rate
+                $svcAmount = (float)$matchingService->amount;
+                $discAmt = match ($type) {
+                    'quantity', 'code' => min($svcAmount, $val),
+                    'manual' => round($svcAmount * ($val / 100), 2),
+                    default => 0,
+                };
+                $totalDiscountAmount += round($discAmt * $multiplier, 2);
+            } else {
+                // Order-wide discount: distribute proportionally
+                $fullDiscAmt = match ($type) {
+                    'quantity', 'code' => min($totalOrderAmount, $val),
+                    'manual' => round($totalOrderAmount * ($val / 100), 2),
+                    default => 0,
+                };
+                $totalDiscountAmount += round($fullDiscAmt * $ratio * $multiplier, 2);
+            }
+
+            $name = $discModel?->name ?? $discModel?->code_key ?? 'Coupon';
+            if (!in_array($name, $discountNames)) {
+                $discountNames[] = $name;
+            }
+        }
+
+        if ($totalDiscountAmount <= 0) {
+            return null;
+        }
+
+        $nameStr = implode(', ', $discountNames);
+        $desc = "Coupon Discount: {$nameStr}";
+        if ($multiplier < 1) {
+            $desc .= " (" . round($multiplier * 100, 1) . "%)";
+        }
+
+        return [
+            'amount' => -abs($totalDiscountAmount),
+            'description' => $desc,
+            'names' => $discountNames,
+        ];
+    }
+
+    /**
+     * Given resolved package discount, agent discount, and code/coupon discount (any may be null),
+     * return which discount should appear on the invoice: 'package', 'agent', 'code', or 'none'.
+     *
+     * Rule: Only ONE discount ever applies to an order/invoice — whichever discount gives
+     * the LARGEST absolute savings amount wins.
+     * Tie-breaking preference: agent >= package >= code.
+     */
+    private static function pickWinningDiscount(?array $pkgDiscount, ?array $agentDisc, ?array $codeDisc = null): string
+    {
+        $rawPkg   = $pkgDiscount ? abs((float)($pkgDiscount['amount'] ?? 0)) : 0.0;
+        $rawAgent = $agentDisc   ? abs((float)($agentDisc['amount']   ?? 0)) : 0.0;
+        $rawCode  = $codeDisc    ? abs((float)($codeDisc['amount']    ?? 0)) : 0.0;
+
+        $maxVal = max($rawPkg, $rawAgent, $rawCode);
+        if ($maxVal <= 0) {
+            return 'none';
+        }
+
+        // Check in order of preference
+        if ($rawAgent >= $maxVal) {
+            return 'agent';
+        }
+        if ($rawPkg >= $maxVal) {
+            return 'package';
+        }
+        return 'code';
+    }
+
     public static function createInvoice($order, $agent, $services, $taxInfo, $multiplier, $note, $splitDetails = null, $agentType = 'primary', $targetAgentId = null)
     {
         $province = 'BC';
@@ -490,6 +628,8 @@ class Invoice extends Model
 
         $preparedItems = [];
         foreach ($services as $os) {
+            // os->amount stores the already-calculated service total (e.g. 2500 sqft × $0.10 = $250).
+            // option->amount is the per-unit RATE — NEVER use it as the invoice line amount.
             $amount = (float)$os->amount * $multiplier;
             $serviceModel = $os->service ?? null;
             $itemDescription = ($os->custom ?: ($serviceModel->name ?? 'Service')) . ($multiplier < 1 ? " (" . ($multiplier * 100) . "%)" : "");
@@ -503,7 +643,11 @@ class Invoice extends Model
         }
 
         $pkgDiscount = static::resolvePackageDiscountForServices($order, $services, $multiplier);
-        if ($pkgDiscount) {
+        $agentDisc   = static::resolveAgentDiscountForInvoice($order, $services, $multiplier);
+        $codeDisc    = static::resolveCodeDiscountsForInvoice($order, $services, $multiplier);
+        $winner      = static::pickWinningDiscount($pkgDiscount, $agentDisc, $codeDisc);
+
+        if ($winner === 'package' && $pkgDiscount) {
             $preparedItems[] = [
                 'order_service' => (collect($services)->count() === 1 ? collect($services)->first() : null),
                 'service' => null,
@@ -515,8 +659,7 @@ class Invoice extends Model
             ];
         }
 
-        $agentDisc = static::resolveAgentDiscountForInvoice($order, $services, $multiplier);
-        if ($agentDisc) {
+        if ($winner === 'agent' && $agentDisc) {
             $preparedItems[] = [
                 'order_service' => (collect($services)->count() === 1 ? collect($services)->first() : null),
                 'service' => null,
@@ -524,6 +667,17 @@ class Invoice extends Model
                 'description' => $agentDisc['description'],
                 'is_taxable' => true,
                 'is_agent_discount' => true,
+            ];
+        }
+
+        if ($winner === 'code' && $codeDisc) {
+            $preparedItems[] = [
+                'order_service' => (collect($services)->count() === 1 ? collect($services)->first() : null),
+                'service' => null,
+                'amount' => $codeDisc['amount'],
+                'description' => $codeDisc['description'],
+                'is_taxable' => true,
+                'is_code_discount' => true,
             ];
         }
 
@@ -542,6 +696,16 @@ class Invoice extends Model
             $os = $prep['order_service'];
             $isPkgDisc = !empty($prep['is_package_discount']);
             $isAgentDisc = !empty($prep['is_agent_discount']);
+            $isCodeDisc = !empty($prep['is_code_discount']);
+
+            $meta = null;
+            if ($isPkgDisc) {
+                $meta = ['type' => 'package_discount', 'package_id' => $prep['package_id']];
+            } elseif ($isAgentDisc) {
+                $meta = ['type' => 'agent_discount'];
+            } elseif ($isCodeDisc) {
+                $meta = ['type' => 'code_discount'];
+            }
 
             $items[] = [
                 'order_service_id' => $os?->id,
@@ -552,8 +716,8 @@ class Invoice extends Model
                 'tax_amount' => $itemTax,
                 'gst_amount' => $calcItem['gst_amount'] ?? ($calcItem['tax_breakdown']['GST'] ?? 0.0),
                 'pst_amount' => $calcItem['pst_amount'] ?? ($calcItem['tax_breakdown']['PST'] ?? 0.0),
-                'is_extra' => $isPkgDisc || $isAgentDisc,
-                'meta' => $isPkgDisc ? ['type' => 'package_discount', 'package_id' => $prep['package_id']] : ($isAgentDisc ? ['type' => 'agent_discount'] : null),
+                'is_extra' => $isPkgDisc || $isAgentDisc || $isCodeDisc,
+                'meta' => $meta,
             ];
         }
 
@@ -886,6 +1050,8 @@ class Invoice extends Model
                 // 1. Add or Update items (consolidated invoice contains all order services)
                 foreach ($allOrderServices as $os) {
                     $isPerSqftRate = static::isPerSqftRateService($os);
+                    // os->amount stores the calculated total (e.g. 2500 sqft × $0.10 = $250).
+                    // option->amount is only the per-unit RATE — never use it as the invoice amount.
                     $effectiveServiceAmount = $isPerSqftRate 
                         ? ((float)$os->amount + $totalAreaCharges)
                         : (float)$os->amount;
@@ -936,16 +1102,34 @@ class Invoice extends Model
                     }
                 }
 
-                // 4. Sync package discount item on consolidated invoice using all order services
-                $pkgDiscount = static::resolvePackageDiscountForServices($order, $allOrderServices, $multiplier);
+                // 4. Sync package/agent/code discount item on consolidated invoice — only the SINGLE WINNING discount shows.
+                // Rule: whichever gives the largest absolute saving wins (agent >= package >= code on tie).
+                $pkgDiscount   = static::resolvePackageDiscountForServices($order, $allOrderServices, $multiplier);
+                $agentDiscount = static::resolveAgentDiscountForInvoice($order, $allOrderServices, $multiplier);
+                $codeDiscount  = static::resolveCodeDiscountsForInvoice($order, $allOrderServices, $multiplier);
+                $winner        = static::pickWinningDiscount($pkgDiscount, $agentDiscount, $codeDiscount);
+
                 $existingPackageItem = $invoice->items
                     ->filter(function($i) {
                         return ($i->meta['type'] ?? null) === 'package_discount' || str_starts_with($i->description ?? '', 'Package Discount');
                     })
                     ->first();
 
-                if ($pkgDiscount) {
-                    $expectedDiscountAmt = (float)$pkgDiscount['amount'];
+                $existingAgentItem = $invoice->items
+                    ->filter(function($i) {
+                        return ($i->meta['type'] ?? null) === 'agent_discount' || str_starts_with($i->description ?? '', 'Agent Discount');
+                    })
+                    ->first();
+
+                $existingCodeItem = $invoice->items
+                    ->filter(function($i) {
+                        return ($i->meta['type'] ?? null) === 'code_discount' || str_starts_with($i->description ?? '', 'Coupon Discount');
+                    })
+                    ->first();
+
+                // Apply winner and delete losers
+                if ($winner === 'package' && $pkgDiscount) {
+                    $expectedDiscountAmt  = (float)$pkgDiscount['amount'];
                     $expectedDiscountDesc = $pkgDiscount['description'];
 
                     if ($existingPackageItem) {
@@ -971,21 +1155,16 @@ class Invoice extends Model
                         ]);
                         $hasChanged = true;
                     }
-                } elseif ($existingPackageItem) {
-                    $existingPackageItem->delete();
-                    $hasChanged = true;
-                }
-
-                // 5. Sync agent discount item on consolidated invoice using all order services
-                $agentDiscount = static::resolveAgentDiscountForInvoice($order, $allOrderServices, $multiplier);
-                $existingAgentItem = $invoice->items
-                    ->filter(function($i) {
-                        return ($i->meta['type'] ?? null) === 'agent_discount' || str_starts_with($i->description ?? '', 'Agent Discount');
-                    })
-                    ->first();
-
-                if ($agentDiscount) {
-                    $expectedDiscountAmt = (float)$agentDiscount['amount'];
+                    if ($existingAgentItem) {
+                        $existingAgentItem->delete();
+                        $hasChanged = true;
+                    }
+                    if ($existingCodeItem) {
+                        $existingCodeItem->delete();
+                        $hasChanged = true;
+                    }
+                } elseif ($winner === 'agent' && $agentDiscount) {
+                    $expectedDiscountAmt  = (float)$agentDiscount['amount'];
                     $expectedDiscountDesc = $agentDiscount['description'];
 
                     if ($existingAgentItem) {
@@ -1011,9 +1190,63 @@ class Invoice extends Model
                         ]);
                         $hasChanged = true;
                     }
-                } elseif ($existingAgentItem) {
-                    $existingAgentItem->delete();
-                    $hasChanged = true;
+                    if ($existingPackageItem) {
+                        $existingPackageItem->delete();
+                        $hasChanged = true;
+                    }
+                    if ($existingCodeItem) {
+                        $existingCodeItem->delete();
+                        $hasChanged = true;
+                    }
+                } elseif ($winner === 'code' && $codeDiscount) {
+                    $expectedDiscountAmt  = (float)$codeDiscount['amount'];
+                    $expectedDiscountDesc = $codeDiscount['description'];
+
+                    if ($existingCodeItem) {
+                        if ((float)$existingCodeItem->amount != $expectedDiscountAmt || (float)$existingCodeItem->unit_price != $expectedDiscountAmt || $existingCodeItem->description != $expectedDiscountDesc) {
+                            $existingCodeItem->update([
+                                'unit_price' => $expectedDiscountAmt,
+                                'amount' => $expectedDiscountAmt,
+                                'description' => $expectedDiscountDesc,
+                                'is_extra' => true,
+                                'meta' => ['type' => 'code_discount'],
+                            ]);
+                            $hasChanged = true;
+                        }
+                    } else {
+                        $invoice->items()->create([
+                            'order_service_id' => null,
+                            'description' => $expectedDiscountDesc,
+                            'quantity' => 1,
+                            'unit_price' => $expectedDiscountAmt,
+                            'amount' => $expectedDiscountAmt,
+                            'is_extra' => true,
+                            'meta' => ['type' => 'code_discount'],
+                        ]);
+                        $hasChanged = true;
+                    }
+                    if ($existingPackageItem) {
+                        $existingPackageItem->delete();
+                        $hasChanged = true;
+                    }
+                    if ($existingAgentItem) {
+                        $existingAgentItem->delete();
+                        $hasChanged = true;
+                    }
+                } else {
+                    // No discount applicable — remove all if present
+                    if ($existingPackageItem) {
+                        $existingPackageItem->delete();
+                        $hasChanged = true;
+                    }
+                    if ($existingAgentItem) {
+                        $existingAgentItem->delete();
+                        $hasChanged = true;
+                    }
+                    if ($existingCodeItem) {
+                        $existingCodeItem->delete();
+                        $hasChanged = true;
+                    }
                 }
 
                 if ($hasChanged) {
@@ -1036,6 +1269,8 @@ class Invoice extends Model
                 $serviceInvoiceChanged = false;
 
                 if ($os->payment_status !== 'PAID') {
+                    // os->amount stores the calculated total (e.g. 2500 sqft × $0.10 = $250).
+                    // option->amount is only the per-unit RATE — never use it as the invoice amount.
                     $expectedAmount = round((float)$os->amount * $multiplier, 2);
                     $itemDescription = ($os->custom ?: ($os->service->name ?? 'Service')) . ($multiplier < 1 ? " (" . ($multiplier * 100) . "%)" : "");
 
@@ -1072,15 +1307,31 @@ class Invoice extends Model
                     }
                 }
 
-                // Sync package discount item on service-specific invoice
-                $pkgDiscount = static::resolvePackageDiscountForServices($order, collect([$os]), $multiplier);
+                // Sync package/agent/code discount item on service-specific invoice — only the SINGLE WINNING discount shows.
+                $pkgDiscount   = static::resolvePackageDiscountForServices($order, collect([$os]), $multiplier);
+                $agentDiscount = static::resolveAgentDiscountForInvoice($order, collect([$os]), $multiplier);
+                $codeDiscount  = static::resolveCodeDiscountsForInvoice($order, collect([$os]), $multiplier);
+                $winner        = static::pickWinningDiscount($pkgDiscount, $agentDiscount, $codeDiscount);
+
                 $existingPackageItem = $invoice->items
                     ->filter(function($i) {
                         return ($i->meta['type'] ?? null) === 'package_discount' || str_starts_with($i->description ?? '', 'Package Discount');
                     })
                     ->first();
 
-                if ($pkgDiscount) {
+                $existingAgentItem = $invoice->items
+                    ->filter(function($i) {
+                        return ($i->meta['type'] ?? null) === 'agent_discount' || str_starts_with($i->description ?? '', 'Agent Discount');
+                    })
+                    ->first();
+
+                $existingCodeItem = $invoice->items
+                    ->filter(function($i) {
+                        return ($i->meta['type'] ?? null) === 'code_discount' || str_starts_with($i->description ?? '', 'Coupon Discount');
+                    })
+                    ->first();
+
+                if ($winner === 'package' && $pkgDiscount) {
                     $expectedDiscountAmt = (float)$pkgDiscount['amount'];
                     $expectedDiscountDesc = $pkgDiscount['description'];
 
@@ -1107,20 +1358,15 @@ class Invoice extends Model
                         ]);
                         $serviceInvoiceChanged = true;
                     }
-                } elseif ($existingPackageItem) {
-                    $existingPackageItem->delete();
-                    $serviceInvoiceChanged = true;
-                }
-
-                // Sync agent discount item on service-specific invoice
-                $agentDiscount = static::resolveAgentDiscountForInvoice($order, collect([$os]), $multiplier);
-                $existingAgentItem = $invoice->items
-                    ->filter(function($i) {
-                        return ($i->meta['type'] ?? null) === 'agent_discount' || str_starts_with($i->description ?? '', 'Agent Discount');
-                    })
-                    ->first();
-
-                if ($agentDiscount) {
+                    if ($existingAgentItem) {
+                        $existingAgentItem->delete();
+                        $serviceInvoiceChanged = true;
+                    }
+                    if ($existingCodeItem) {
+                        $existingCodeItem->delete();
+                        $serviceInvoiceChanged = true;
+                    }
+                } elseif ($winner === 'agent' && $agentDiscount) {
                     $expectedDiscountAmt = (float)$agentDiscount['amount'];
                     $expectedDiscountDesc = $agentDiscount['description'];
 
@@ -1147,9 +1393,62 @@ class Invoice extends Model
                         ]);
                         $serviceInvoiceChanged = true;
                     }
-                } elseif ($existingAgentItem) {
-                    $existingAgentItem->delete();
-                    $serviceInvoiceChanged = true;
+                    if ($existingPackageItem) {
+                        $existingPackageItem->delete();
+                        $serviceInvoiceChanged = true;
+                    }
+                    if ($existingCodeItem) {
+                        $existingCodeItem->delete();
+                        $serviceInvoiceChanged = true;
+                    }
+                } elseif ($winner === 'code' && $codeDiscount) {
+                    $expectedDiscountAmt = (float)$codeDiscount['amount'];
+                    $expectedDiscountDesc = $codeDiscount['description'];
+
+                    if ($existingCodeItem) {
+                        if ((float)$existingCodeItem->amount != $expectedDiscountAmt || (float)$existingCodeItem->unit_price != $expectedDiscountAmt || $existingCodeItem->description != $expectedDiscountDesc) {
+                            $existingCodeItem->update([
+                                'unit_price' => $expectedDiscountAmt,
+                                'amount' => $expectedDiscountAmt,
+                                'description' => $expectedDiscountDesc,
+                                'is_extra' => true,
+                                'meta' => ['type' => 'code_discount'],
+                            ]);
+                            $serviceInvoiceChanged = true;
+                        }
+                    } else {
+                        $invoice->items()->create([
+                            'order_service_id' => $os->id,
+                            'description' => $expectedDiscountDesc,
+                            'quantity' => 1,
+                            'unit_price' => $expectedDiscountAmt,
+                            'amount' => $expectedDiscountAmt,
+                            'is_extra' => true,
+                            'meta' => ['type' => 'code_discount'],
+                        ]);
+                        $serviceInvoiceChanged = true;
+                    }
+                    if ($existingPackageItem) {
+                        $existingPackageItem->delete();
+                        $serviceInvoiceChanged = true;
+                    }
+                    if ($existingAgentItem) {
+                        $existingAgentItem->delete();
+                        $serviceInvoiceChanged = true;
+                    }
+                } else {
+                    if ($existingPackageItem) {
+                        $existingPackageItem->delete();
+                        $serviceInvoiceChanged = true;
+                    }
+                    if ($existingAgentItem) {
+                        $existingAgentItem->delete();
+                        $serviceInvoiceChanged = true;
+                    }
+                    if ($existingCodeItem) {
+                        $existingCodeItem->delete();
+                        $serviceInvoiceChanged = true;
+                    }
                 }
 
                 if ($serviceInvoiceChanged) {

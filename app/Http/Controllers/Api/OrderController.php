@@ -549,52 +549,18 @@ class OrderController extends Controller
             $agentDiscountInput = $request->input('agent_discount') ?? ($agent->agent_discount ?? null);
             $agentDiscount = $this->resolveAgentDiscount($agent, $agentDiscountInput, $totalAmount);
 
-            // Option B: Pick Maximum / Best Single Discount between Package and Agent Discount
-            $applyPackage = false;
-            $applyAgent = false;
+            // 3-Way Best Single Discount Selection: Package vs Agent vs Coupon / Manual Discounts
+            // Rule: Whichever single discount produces the LARGEST absolute savings amount wins.
+            // Only ONE discount is applied to the order.
             $rawPkgVal = $bestPackage ? (float)$packageDiscountAmount : 0;
             $rawAgentVal = $agentDiscount ? (float)$agentDiscount['discount_value'] : 0;
 
-            if ($rawPkgVal > 0 && $rawAgentVal > 0) {
-                if ($rawAgentVal >= $rawPkgVal) {
-                    $applyAgent = true;
-                    Log::info('Option B Selection: Agent discount selected over package discount (best single discount)', [
-                        'agent_discount' => $rawAgentVal,
-                        'package_discount' => $rawPkgVal,
-                    ]);
-                } else {
-                    $applyPackage = true;
-                    Log::info('Option B Selection: Package discount selected over agent discount (best single discount)', [
-                        'package_discount' => $rawPkgVal,
-                        'agent_discount' => $rawAgentVal,
-                    ]);
-                }
-            } elseif ($rawPkgVal > 0) {
-                $applyPackage = true;
-            } elseif ($rawAgentVal > 0) {
-                $applyAgent = true;
-            }
-
-            // Add package discount first (if applicable and selected under Option B)
-            if ($applyPackage && $bestPackage) {
-                $discountDetails[] = [
-                    'model' => null,
-                    'type' => 'package',
-                    'value' => $rawPkgVal,
-                    'service_id' => null,
-                    'package' => $bestPackage,
-                ];
-                
-                Log::info('Package discount added to processing queue', [
-                    'package_discount_amount' => $rawPkgVal,
-                    'package_name' => $bestPackage->name,
-                ]);
-            }
-            
+            // Calculate potential coupon / manual discounts value on base amount
+            $rawCodeVal = 0.0;
+            $resolvedCodeDiscounts = [];
             if (isset($data['discounts'])) {
                 foreach ($data['discounts'] as $discount) {
                     $discountModel = Discount::where('uuid', $discount['discount_id'])->first();
-                    
                     $discSvcInput = $discount['service_id'] ?? null;
                     $discSvc = null;
                     if ($discSvcInput) {
@@ -603,17 +569,72 @@ class OrderController extends Controller
                             : (Str::isUuid($discSvcInput) ? Service::where('uuid', $discSvcInput)->first() : null);
                     }
 
-                    $discountDetails[] = [
+                    $baseForDisc = $discSvc ? ($serviceAmounts[$discSvc->id] ?? 0) : $totalAmount;
+                    $discVal = $this->calculateDiscountValue($baseForDisc, (float)$discount['value'], $discount['type']);
+                    $rawCodeVal += $discVal;
+
+                    $resolvedCodeDiscounts[] = [
                         'model' => $discountModel,
                         'type' => $discount['type'],
                         'value' => $discount['value'],
+                        'calculated_value' => $discVal,
                         'service_id' => $discSvc?->id,
                     ];
                 }
             }
 
-            // Add Agent Discount (if applicable and selected under Option B)
-            if ($applyAgent && $agentDiscount) {
+            $maxDiscountVal = max($rawPkgVal, $rawAgentVal, $rawCodeVal);
+            $winnerType = 'none';
+
+            if ($maxDiscountVal > 0) {
+                if ($rawAgentVal >= $maxDiscountVal) {
+                    $winnerType = 'agent';
+                } elseif ($rawPkgVal >= $maxDiscountVal) {
+                    $winnerType = 'package';
+                } else {
+                    $winnerType = 'code';
+                }
+            }
+
+            Log::info('Best Single Discount Selection (3-Way)', [
+                'winner' => $winnerType,
+                'agent_discount' => $rawAgentVal,
+                'package_discount' => $rawPkgVal,
+                'code_discount' => $rawCodeVal,
+            ]);
+
+            // Add ONLY the winning discount to processing queue
+            if ($winnerType === 'package' && $bestPackage) {
+                $discountDetails[] = [
+                    'model' => null,
+                    'type' => 'package',
+                    'value' => $rawPkgVal,
+                    'service_id' => null,
+                    'package' => $bestPackage,
+                ];
+                // Package won: remove any pre-saved agent_discount from meta so it doesn't
+                // appear on invoices (resolveAgentDiscountForInvoice reads meta['agent_discount']).
+                $currentMeta = $order->meta ?? [];
+                if (isset($currentMeta['agent_discount'])) {
+                    unset($currentMeta['agent_discount']);
+                    $order->update(['meta' => $currentMeta]);
+                }
+            } elseif ($winnerType === 'code' && !empty($resolvedCodeDiscounts)) {
+                foreach ($resolvedCodeDiscounts as $rcd) {
+                    $discountDetails[] = [
+                        'model' => $rcd['model'],
+                        'type' => $rcd['type'],
+                        'value' => $rcd['value'],
+                        'service_id' => $rcd['service_id'],
+                    ];
+                }
+                // Code won: remove any pre-saved agent_discount from meta
+                $currentMeta = $order->meta ?? [];
+                if (isset($currentMeta['agent_discount'])) {
+                    unset($currentMeta['agent_discount']);
+                    $order->update(['meta' => $currentMeta]);
+                }
+            } elseif ($winnerType === 'agent' && $agentDiscount) {
                 $discountDetails[] = [
                     'model' => null,
                     'type' => 'agent',
@@ -1316,7 +1337,21 @@ class OrderController extends Controller
                              $province = $agent->headquarter_province ?? $order->property->province ?? 'ON';
                              $taxInfo = (new \App\Http\Controllers\Api\InvoiceController)->getCanadaTaxRate($province);
 
-                             $subtotal = $difference;
+                             // Deduct coupon discount proportionally from the difference if order had a coupon
+                             $existingDiscounts = OrderTotal::where('order_id', $order->id)
+                                 ->whereNotNull('discount_id')
+                                 ->with('discount')
+                                 ->get();
+                             $orderTotalBase = (float) $order->services->sum('amount');
+                             $couponDiscount = 0.0;
+                             if ($orderTotalBase > 0 && $existingDiscounts->isNotEmpty()) {
+                                 foreach ($existingDiscounts as $ed) {
+                                     $couponDiscount += abs((float)$ed->amount) * ($difference / $orderTotalBase);
+                                 }
+                                 $couponDiscount = round($couponDiscount, 2);
+                             }
+
+                             $subtotal = max(0, round($difference - $couponDiscount, 2));
                              $taxAmount = round($subtotal * ($taxInfo['rate'] / 100), 2);
 
                              $newInvoice = Invoice::create([
@@ -1336,10 +1371,10 @@ class OrderController extends Controller
 
                              $newInvoice->items()->create([
                                  'order_service_id' => $orderService->id,
-                                 'description' => "Upgrade: " . $modified['service_name'] . " (from $" . $oldAmount . " to $" . $newAmount . ")",
+                                 'description' => "Upgrade: " . $modified['service_name'] . " (from $" . $oldAmount . " to $" . $newAmount . ")" . ($couponDiscount > 0 ? " [Discount applied: -$" . number_format($couponDiscount, 2) . "]" : ""),
                                  'quantity' => 1,
-                                 'unit_price' => $difference,
-                                 'amount' => $difference
+                                 'unit_price' => $subtotal,
+                                 'amount' => $subtotal
                              ]);
                         }
                     }
@@ -2376,29 +2411,52 @@ private function recalculateTotals($order, array $discounts, array $serviceAmoun
     $applyPackage = false;
     $applyAgent = false;
 
-    if ($rawPkgVal > 0 && $rawAgentVal > 0) {
-        if ($rawAgentVal >= $rawPkgVal) {
-            $applyAgent = true;
-            Log::info("Option B Selection (RECALCULATE): Agent discount selected over package discount", [
-                'order_uuid' => $order->uuid,
-                'agent_discount' => $rawAgentVal,
-                'package_discount' => $rawPkgVal,
-            ]);
-        } else {
-            $applyPackage = true;
-            Log::info("Option B Selection (RECALCULATE): Package discount selected over agent discount", [
-                'order_uuid' => $order->uuid,
-                'package_discount' => $rawPkgVal,
-                'agent_discount' => $rawAgentVal,
-            ]);
-        }
-    } elseif ($rawPkgVal > 0) {
-        $applyPackage = true;
-    } elseif ($rawAgentVal > 0) {
-        $applyAgent = true;
+    // 3-Way Best Single Discount Selection (RECALCULATE): Package vs Agent vs Coupon / Manual Discounts
+    $rawPkgVal = (float)$packageDiscountAmount;
+    $rawAgentVal = $agentDiscount ? (float)$agentDiscount['discount_value'] : 0;
+
+    $rawCodeVal = 0.0;
+    $resolvedCodeDiscounts = [];
+    foreach ($discounts as $discount) {
+        $discountModel = Discount::where('uuid', $discount['discount_id'])->first();
+        if (!$discountModel) continue;
+
+        $val = $this->calculateDiscountValue(
+            $totalAmount,
+            $discount['value'],
+            $discount['type']
+        );
+        $rawCodeVal += $val;
+        $resolvedCodeDiscounts[] = [
+            'model' => $discountModel,
+            'type' => $discount['type'],
+            'value' => $discount['value'],
+            'calculated_value' => $val,
+        ];
     }
 
-    if ($applyPackage && $rawPkgVal > 0) {
+    $maxDiscountVal = max($rawPkgVal, $rawAgentVal, $rawCodeVal);
+    $winnerType = 'none';
+
+    if ($maxDiscountVal > 0) {
+        if ($rawAgentVal >= $maxDiscountVal) {
+            $winnerType = 'agent';
+        } elseif ($rawPkgVal >= $maxDiscountVal) {
+            $winnerType = 'package';
+        } else {
+            $winnerType = 'code';
+        }
+    }
+
+    Log::info('Best Single Discount Selection (RECALCULATE 3-Way)', [
+        'order_uuid' => $order->uuid,
+        'winner' => $winnerType,
+        'agent_discount' => $rawAgentVal,
+        'package_discount' => $rawPkgVal,
+        'code_discount' => $rawCodeVal,
+    ]);
+
+    if ($winnerType === 'package' && $rawPkgVal > 0) {
         $orderTotals[] = [
             'uuid' => (string) Str::uuid(),
             'order_id' => $order->id,
@@ -2411,33 +2469,40 @@ private function recalculateTotals($order, array $discounts, array $serviceAmoun
         ];
         
         $discountAmount += $rawPkgVal;
-    }
 
-    foreach ($discounts as $discount) {
-        $discountModel = Discount::where('uuid', $discount['discount_id'])->firstOrFail();
+        // Package won: ensure agent_discount is NOT in meta (so invoices don't show it)
+        $currentMeta = $order->meta ?? [];
+        if (isset($currentMeta['agent_discount'])) {
+            unset($currentMeta['agent_discount']);
+            $order->meta = $currentMeta;
+            $order->save();
+        }
+    } elseif ($winnerType === 'code' && !empty($resolvedCodeDiscounts)) {
+        foreach ($resolvedCodeDiscounts as $rcd) {
+            $val = $rcd['calculated_value'];
+            $discountAmount += $val;
 
-        $val = $this->calculateDiscountValue(
-            $totalAmount,
-            $discount['value'],
-            $discount['type']
-        );
+            $orderTotals[] = [
+                'uuid' => (string) Str::uuid(),
+                'order_id' => $order->id,
+                'discount_id' => $rcd['model']->id,
+                'amount' => -$val,
+                'discount_type' => $rcd['type'],
+                'discount_value' => $rcd['value'],
+                'sort_order' => 1,
+                'order_service_id' => null,
+            ];
+        }
 
-        $discountAmount += $val;
-
-        $orderTotals[] = [
-            'uuid' => (string) Str::uuid(),
-            'order_id' => $order->id,
-            'discount_id' => $discountModel->id,
-            'amount' => -$val,
-            'discount_type' => $discount['type'],
-            'discount_value' => $discount['value'],
-            'sort_order' => 1,
-            'order_service_id' => null,
-        ];
-    }
-
-    if ($applyAgent && $agentDiscount) {
-        $agentVal = min($agentDiscount['discount_value'], max(0, $totalAmount - $discountAmount));
+        // Code won: ensure agent_discount is NOT in meta
+        $currentMeta = $order->meta ?? [];
+        if (isset($currentMeta['agent_discount'])) {
+            unset($currentMeta['agent_discount']);
+            $order->meta = $currentMeta;
+            $order->save();
+        }
+    } elseif ($winnerType === 'agent' && $agentDiscount) {
+        $agentVal = min($agentDiscount['discount_value'], $totalAmount);
         if ($agentVal > 0) {
             $discountAmount += $agentVal;
             $orderTotals[] = [
