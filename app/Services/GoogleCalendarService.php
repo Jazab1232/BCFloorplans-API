@@ -425,7 +425,7 @@ class GoogleCalendarService
                 ? $eventData['end']
                 : Carbon::createFromFormat('Y-m-d H:i:s', Carbon::parse($eventData['end'])->format('Y-m-d H:i:s'), $tz);
 
-            $event = new \Google\Service\Calendar\Event([
+            $eventPayload = [
                 'summary' => $eventData['summary'] ?? 'Booking',
                 'description' => $eventData['description'] ?? '',
                 'start' => [
@@ -444,7 +444,13 @@ class GoogleCalendarService
                         ['method' => 'popup', 'minutes' => 30],
                     ],
                 ],
-            ]);
+            ];
+
+            if (!empty($eventData['location'])) {
+                $eventPayload['location'] = $eventData['location'];
+            }
+
+            $event = new \Google\Service\Calendar\Event($eventPayload);
 
             $calendarId = $model->google_calendar_id ?? 'primary';
             $createdEvent = $calendarService->events->insert($calendarId, $event);
@@ -495,6 +501,9 @@ class GoogleCalendarService
             }
             if (isset($eventData['description'])) {
                 $event->setDescription($eventData['description']);
+            }
+            if (array_key_exists('location', $eventData)) {
+                $event->setLocation($eventData['location'] ?? '');
             }
             if (isset($eventData['start'])) {
                 $start = new \Google\Service\Calendar\EventDateTime();

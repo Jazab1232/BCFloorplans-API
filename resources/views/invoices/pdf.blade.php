@@ -5,7 +5,7 @@
     <title>Invoice #{{ $invoice->invoice_number ?: $invoice->id }}</title>
     <style>
         @page {
-            margin: 36px 36px 36px 36px;
+            margin: 32px 36px 32px 36px;
             size: a4 portrait;
         }
 
@@ -19,7 +19,7 @@
             background-color: #FFFFFF;
         }
 
-        /* Helpers */
+        /* Utilities */
         .w-100 { width: 100%; }
         .text-right { text-align: right; }
         .text-left { text-align: left; }
@@ -29,80 +29,104 @@
         .text-muted { color: #6B7280; }
         .text-dark { color: #111827; }
 
-        /* Header */
+        /* Top Header */
         .header-table {
             width: 100%;
             border-collapse: collapse;
-            margin-bottom: 24px;
+            margin-bottom: 0px;
         }
 
         .header-table td {
             vertical-align: top;
+            padding: 0;
         }
 
         .logo-img {
-            max-height: 52px;
-            max-width: 180px;
+            max-height: 48px;
+            max-width: 160px;
             object-fit: contain;
             vertical-align: middle;
         }
 
         .company-name {
-            font-size: 20px;
-            font-weight: 700;
+            font-size: 22px;
+            font-weight: 800;
             color: #111827;
+            letter-spacing: -0.5px;
+            vertical-align: middle;
             margin-left: 8px;
             display: inline-block;
-            vertical-align: middle;
         }
 
-        .decorative-tab {
-            text-align: right;
-            padding-right: 0;
+        .meta-list {
+            margin-top: 10px;
         }
 
-        .tab-box {
-            display: inline-block;
-            background-color: {{ $branding['tab_color'] ?? '#111827' }};
-            color: #FFFFFF;
-            padding: 12px 24px;
-            border-radius: 4px;
-            text-align: center;
-        }
-
-        .tab-box .tab-title {
-            font-size: 18px;
-            font-weight: 800;
-            letter-spacing: 2px;
-            margin: 0;
-            line-height: 1;
-        }
-
-        .invoice-meta {
-            margin-top: 12px;
-        }
-
-        .invoice-meta p {
-            margin: 2px 0;
-            font-size: 11px;
+        .meta-list p {
+            margin: 3px 0;
+            font-size: 12px;
             color: #4B5563;
         }
 
-        .invoice-meta p span {
+        .meta-list p span {
             color: #111827;
-            font-weight: 600;
+            font-weight: 700;
         }
 
-        /* Status Pill */
+        /* BCF Signature 3-Tier Tab: Thin Bar (4px), Gap (6px), Medium Bar (12px), Gap (6px), Main Box */
+        .tab-table {
+            border-collapse: separate;
+            border-spacing: 5px 0;
+            float: right;
+            margin-top: 2px;
+        }
+
+        .tab-table td {
+            padding: 0;
+            vertical-align: top;
+        }
+
+        .tab-stripe-1 {
+            width: 4px;
+            height: 52px;
+            background-color: {{ $branding['tab_color'] ?? '#6BAE41' }};
+        }
+
+        .tab-stripe-2 {
+            width: 12px;
+            height: 52px;
+            background-color: {{ $branding['tab_color'] ?? '#6BAE41' }};
+        }
+
+        .tab-stripe-main {
+            height: 52px;
+            background-color: {{ $branding['tab_color'] ?? '#6BAE41' }};
+            padding: 0 32px !important;
+            text-align: center;
+            vertical-align: middle !important;
+        }
+
+        .tab-stripe-main span {
+            color: #FFFFFF;
+            font-size: 26px;
+            font-weight: 800;
+            letter-spacing: 2.5px;
+            text-transform: uppercase;
+            line-height: 52px;
+            display: inline-block;
+        }
+
+        /* Status Badge Pill matching frontend */
         .status-pill {
             display: inline-block;
             padding: 3px 10px;
-            font-size: 10px;
-            font-weight: 700;
+            font-size: 9px;
+            font-weight: 800;
             border-radius: 9999px;
-            letter-spacing: 0.5px;
+            letter-spacing: 0.6px;
             text-transform: uppercase;
             margin-top: 6px;
+            line-height: 1.2;
         }
 
         @php
@@ -111,17 +135,20 @@
                 $statusBg = '#DCFCE7';
                 $statusColor = '#15803D';
             } elseif ($st === 'partially_paid' || $st === 'partial') {
-                $statusBg = '#FEF3C7';
-                $statusColor = '#B45309';
+                $statusBg = '#FEF9C3';
+                $statusColor = '#A16207';
             } elseif ($st === 'draft') {
                 $statusBg = '#FFEDD5';
-                $statusColor = '#C2410C';
+                $statusColor = '#EA580C';
             } elseif ($st === 'refunded') {
                 $statusBg = '#FEE2E2';
-                $statusColor = '#B91C1C';
+                $statusColor = '#DC2626';
+            } elseif ($st === 'partially_refunded' || $st === 'partial_refunded') {
+                $statusBg = '#FFFBEB';
+                $statusColor = '#B45309';
             } elseif ($st === 'void') {
                 $statusBg = '#F3F4F6';
-                $statusColor = '#4B5563';
+                $statusColor = '#9CA3AF';
             } else {
                 $statusBg = '#DBEAFE';
                 $statusColor = '#1D4ED8';
@@ -133,109 +160,205 @@
             color: {{ $statusColor }};
         }
 
-        /* Info Section (Billed To / From) */
-        .info-table {
+        /* Full Width Divider */
+        .accent-divider {
+            height: 1px;
+            background-color: {{ $branding['tab_color'] ?? '#6BAE41' }};
+            opacity: 0.25;
+            margin-top: 18px;
+            margin-bottom: 22px;
+        }
+
+        /* Dual Cards: Bill From & Bill To */
+        .cards-table {
             width: 100%;
-            border-collapse: collapse;
+            border-collapse: separate;
+            border-spacing: 16px 0;
+            margin-left: -16px;
+            margin-right: -16px;
             margin-bottom: 24px;
-            background-color: #F9FAFB;
-            border-radius: 6px;
-            border: 1px solid #E5E7EB;
         }
 
-        .info-table td {
-            padding: 14px 16px;
-            vertical-align: top;
+        .cards-table td {
             width: 50%;
+            vertical-align: top;
+            padding: 0;
         }
 
-        .info-title {
-            font-size: 10px;
-            font-weight: 700;
-            color: #6B7280;
+        .info-card {
+            background-color: #FAFAFA;
+            border: 1px solid #F3F4F6;
+            border-radius: 8px;
+            padding: 12px 16px;
+        }
+
+        .card-header {
+            font-size: 11px;
+            font-weight: 800;
             text-transform: uppercase;
-            letter-spacing: 0.8px;
+            letter-spacing: 1.2px;
+            color: {{ $branding['tab_color'] ?? '#6BAE41' }};
             margin-bottom: 6px;
         }
 
-        .info-content {
-            font-size: 12px;
-            line-height: 1.5;
-            color: #1F2937;
-        }
-
-        .info-content strong {
-            color: #111827;
+        .card-title {
             font-size: 13px;
+            font-weight: 700;
+            color: #111827;
+            margin-bottom: 3px;
         }
 
-        /* Items Table */
+        .card-row {
+            font-size: 12px;
+            color: #4B5563;
+            line-height: 1.6;
+        }
+
+        /* Line Items Table (Matches Frontend 3-Column View Mode: Item Description, Quantity, Amount) */
         .items-table {
             width: 100%;
             border-collapse: collapse;
-            margin-bottom: 20px;
+            margin-bottom: 18px;
         }
 
         .items-table th {
-            background-color: #F3F4F6;
-            color: #374151;
+            border-top: 2px solid {{ $branding['tab_color'] ?? '#6BAE41' }};
+            border-bottom: 1px solid #F3F4F6;
+            color: #6B7280;
             font-size: 10px;
-            font-weight: 700;
+            font-weight: 800;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
-            padding: 8px 12px;
-            border-bottom: 2px solid #E5E7EB;
+            letter-spacing: 0.8px;
+            padding: 10px 10px;
         }
 
         .items-table td {
-            padding: 10px 12px;
-            border-bottom: 1px solid #E5E7EB;
-            font-size: 11px;
+            padding: 12px 10px;
+            border-bottom: 1px solid #F3F4F6;
+            font-size: 12px;
             vertical-align: top;
         }
 
         .item-name {
             font-weight: 600;
             color: #111827;
+            font-size: 12px;
         }
 
         .item-desc {
-            font-size: 10px;
+            font-size: 11px;
             color: #6B7280;
             margin-top: 2px;
+            line-height: 1.4;
         }
 
-        /* Financials Section */
-        .summary-container {
-            width: 100%;
-            border-collapse: collapse;
-            margin-bottom: 24px;
+        /* Pill Badge for Options (Green tinted pill matching frontend) */
+        .badge-option {
+            display: inline-block;
+            padding: 2px 8px;
+            font-size: 9px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-radius: 9999px;
+            margin-top: 4px;
+            color: {{ $branding['tab_color'] ?? '#6BAE41' }};
+            background-color: #E8F5E9;
+            border: 1px solid #C8E6C9;
+            line-height: 1.2;
+        }
+
+        .badge-paid {
+            display: inline-block;
+            padding: 2px 7px;
+            font-size: 9px;
+            font-weight: 800;
+            text-transform: uppercase;
+            border-radius: 9999px;
+            margin-top: 4px;
+            margin-left: 4px;
+            background-color: #DCFCE7;
+            color: #15803D;
+            line-height: 1.2;
+        }
+
+        .badge-refunded {
+            display: inline-block;
+            padding: 2px 7px;
+            font-size: 9px;
+            font-weight: 800;
+            text-transform: uppercase;
+            border-radius: 9999px;
+            margin-top: 4px;
+            margin-left: 4px;
+            background-color: #FEE2E2;
+            color: #DC2626;
+            line-height: 1.2;
+        }
+
+        /* Split Allocation Box (if active) */
+        .split-box {
+            background-color: #F8F9FA;
+            border: 1px solid #E5E7EB;
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin-bottom: 18px;
             page-break-inside: avoid;
         }
 
-        .summary-container td {
-            vertical-align: top;
+        .split-box-title {
+            font-size: 10px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            color: {{ $branding['tab_color'] ?? '#6BAE41' }};
+            margin-bottom: 6px;
         }
 
-        .notes-box {
-            padding-right: 20px;
+        .split-table {
+            width: 100%;
+            border-collapse: collapse;
         }
 
-        .notes-title {
-            font-size: 11px;
-            font-weight: 700;
-            color: #374151;
-            margin-bottom: 4px;
-        }
-
-        .notes-content {
-            font-size: 11px;
-            color: #6B7280;
-            background-color: #F9FAFB;
+        .split-card-cell {
+            padding: 6px 8px;
+            background-color: #FFFFFF;
             border: 1px solid #E5E7EB;
             border-radius: 4px;
-            padding: 10px;
-            line-height: 1.4;
+        }
+
+        /* Summary & Totals */
+        .summary-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 6px;
+            margin-bottom: 16px;
+            page-break-inside: avoid;
+        }
+
+        .summary-table td {
+            vertical-align: top;
+            padding: 0;
+        }
+
+        .notes-section {
+            padding-right: 30px;
+        }
+
+        .notes-heading {
+            font-size: 11px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            color: {{ $branding['tab_color'] ?? '#6BAE41' }};
+            margin-bottom: 5px;
+        }
+
+        .notes-body {
+            font-size: 11px;
+            color: #6B7280;
+            font-style: italic;
+            line-height: 1.5;
         }
 
         .totals-table {
@@ -244,67 +367,119 @@
         }
 
         .totals-table td {
-            padding: 5px 8px;
-            font-size: 11px;
+            padding: 3px 0;
+            font-size: 12px;
         }
 
-        .totals-table .label {
-            color: #4B5563;
-            text-align: right;
-            width: 60%;
-        }
-
-        .totals-table .val {
-            color: #111827;
-            text-align: right;
+        .totals-table .t-label {
+            color: #6B7280;
             font-weight: 600;
-            width: 40%;
+            text-transform: uppercase;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+            text-align: left;
         }
 
-        .totals-table .grand-total td {
-            font-size: 13px;
-            font-weight: 700;
+        .totals-table .t-val {
             color: #111827;
-            border-top: 2px solid #E5E7EB;
-            border-bottom: 2px solid #E5E7EB;
-            padding: 8px 8px;
+            font-weight: 700;
+            text-align: right;
+            font-size: 12px;
         }
 
-        .totals-table .balance-due td {
-            font-size: 13px;
+        /* Total Banner in brand tab color matching frontend line 1072 */
+        .total-banner-row td {
+            padding: 4px 0 !important;
+        }
+
+        .total-banner {
+            background-color: {{ $branding['tab_color'] ?? '#6BAE41' }};
+            color: #FFFFFF;
+            padding: 9px 12px;
+            border-radius: 3px;
+        }
+
+        .total-banner table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .total-banner td {
+            color: #FFFFFF !important;
+            padding: 0 !important;
+        }
+
+        .total-banner .b-label {
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: 0.8px;
+            text-transform: uppercase;
+            text-align: left;
+        }
+
+        .total-banner .b-val {
+            font-size: 15px;
+            font-weight: 800;
+            text-align: right;
+        }
+
+        .paid-row td {
+            color: #15803D !important;
             font-weight: 700;
+        }
+
+        .refund-row td {
+            color: #DC2626 !important;
+            font-weight: 700;
+        }
+
+        .due-row .t-label {
+            color: #111827;
+            font-size: 12px;
+            font-weight: 800;
+            text-transform: uppercase;
+        }
+
+        .due-row .t-val {
             color: #DC2626;
-            background-color: #FEF2F2;
-            border-radius: 4px;
-            padding: 8px 8px;
+            font-size: 14px;
+            font-weight: 800;
         }
 
-        .totals-table .balance-paid td {
-            font-size: 13px;
-            font-weight: 700;
+        .due-paid-row .t-val {
             color: #15803D;
-            background-color: #F0FDF4;
-            border-radius: 4px;
-            padding: 8px 8px;
+            font-size: 13px;
+            font-weight: 800;
         }
 
-        /* Payment History */
-        .payments-box {
+        /* Payment History Table */
+        .payments-container {
             margin-top: 16px;
             page-break-inside: avoid;
+        }
+
+        .payments-header {
+            font-size: 10px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            color: #374151;
+            margin-bottom: 6px;
         }
 
         .payments-table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 10px;
+            font-size: 11px;
         }
 
         .payments-table th {
-            background-color: #F3F4F6;
-            color: #4B5563;
+            background-color: #F9FAFB;
+            color: #6B7280;
             padding: 6px 10px;
             text-align: left;
+            font-size: 10px;
+            text-transform: uppercase;
             border-bottom: 1px solid #E5E7EB;
         }
 
@@ -316,9 +491,9 @@
 
         /* Footer */
         .footer {
-            margin-top: 30px;
-            border-top: 1px solid #E5E7EB;
-            padding-top: 12px;
+            margin-top: 24px;
+            border-top: 1px solid #F3F4F6;
+            padding-top: 10px;
             text-align: center;
             font-size: 10px;
             color: #9CA3AF;
@@ -330,46 +505,114 @@
     <!-- Header Section -->
     <table class="header-table">
         <tr>
-            <td style="width: 60%;">
-                <div style="margin-bottom: 6px;">
-                    @if(!empty($branding['logo_base64']))
-                        <img src="{{ $branding['logo_base64'] }}" class="logo-img" alt="Logo">
-                    @else
-                        <span class="company-name">{{ $branding['name'] }}</span>
-                    @endif
-                </div>
+            <td style="width: 55%;">
+                <table style="border-collapse: collapse;">
+                    <tr>
+                        @if(!empty($branding['logo_base64']))
+                            <td style="padding-right: 8px; vertical-align: middle;">
+                                <img src="{{ $branding['logo_base64'] }}" class="logo-img" alt="Logo">
+                            </td>
+                        @endif
+                        <td style="vertical-align: middle;">
+                            <span class="company-name">{{ $branding['name'] }}</span>
+                        </td>
+                    </tr>
+                </table>
 
-                <div class="invoice-meta">
+                <div class="meta-list">
                     <p>Invoice Number: <span>#{{ $invoice->invoice_number ?: $invoice->id }}</span></p>
-                    <p>Issue Date: <span>{{ ($invoice->issued_at ?? $invoice->created_at) ? \Carbon\Carbon::parse($invoice->issued_at ?? $invoice->created_at)->format('F j, Y') : 'N/A' }}</span></p>
+                    <p>Date: <span>{{ ($invoice->issued_at ?? $invoice->created_at) ? \Carbon\Carbon::parse($invoice->issued_at ?? $invoice->created_at)->format('n/j/Y') : 'N/A' }}</span></p>
                     @if($invoice->due_date)
-                        <p>Due Date: <span>{{ \Carbon\Carbon::parse($invoice->due_date)->format('F j, Y') }}</span></p>
+                        <p>Due Date: <span>{{ \Carbon\Carbon::parse($invoice->due_date)->format('n/j/Y') }}</span></p>
                     @endif
                     <div>
                         <span class="status-pill status-badge">{{ str_replace('_', ' ', strtoupper($invoice->status ?? 'UNPAID')) }}</span>
                     </div>
                 </div>
             </td>
-            <td style="width: 40%;" class="decorative-tab">
-                <div class="tab-box">
-                    <h1 class="tab-title">INVOICE</h1>
-                </div>
-                <div style="margin-top: 12px; font-size: 11px; color: #4B5563; line-height: 1.4;">
-                    <div class="font-bold text-dark">{{ $branding['name'] }}</div>
-                    @if(!empty($branding['address']))
-                        <div>{{ $branding['address'] }}</div>
-                    @endif
+            <td style="width: 45%;">
+                <!-- Signature 3-Tier Tab: 4px line, 12px line, and solid INVOICE block -->
+                <table class="tab-table">
+                    <tr>
+                        <td class="tab-stripe-1">&nbsp;</td>
+                        <td class="tab-stripe-2">&nbsp;</td>
+                        <td class="tab-stripe-main">
+                            <span>INVOICE</span>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+
+    <!-- Accent Divider Bar -->
+    <div class="accent-divider"></div>
+
+    <!-- Dual Cards: Bill From & Bill To -->
+    <table class="cards-table">
+        <tr>
+            <!-- Bill From Card -->
+            <td>
+                <div class="info-card">
+                    <div class="card-header">Bill From:</div>
+                    <div class="card-title">{{ $branding['name'] }}</div>
                     @if(!empty($branding['email']))
-                        <div>{{ $branding['email'] }}</div>
+                        <div class="card-row">
+                            @if(!empty($branding['mail_icon_base64']))
+                                <img src="{{ $branding['mail_icon_base64'] }}" width="11" height="11" style="vertical-align: -1px; margin-right: 4px;">
+                            @endif
+                            {{ $branding['email'] }}
+                        </div>
                     @endif
                     @if(!empty($branding['phone']))
-                        <div>{{ $branding['phone'] }}</div>
+                        <div class="card-row">{{ $branding['phone'] }}</div>
                     @endif
-                    @if(!empty($taxNumbers))
-                        <div style="margin-top: 4px; font-size: 10px; color: #6B7280;">
-                            @foreach($taxNumbers as $tName => $tNum)
-                                <span>{{ $tName }} Reg: <strong>{{ $tNum }}</strong></span>@if(!$loop->last) &bull; @endif
-                            @endforeach
+                    @if(!empty($branding['address']))
+                        <div class="card-row text-muted" style="font-size: 11px;">{{ $branding['address'] }}</div>
+                    @endif
+                </div>
+            </td>
+
+            <!-- Bill To Card -->
+            <td>
+                <div class="info-card">
+                    <div class="card-header">
+                        Bill To:
+                        @if($client['is_vendor'])
+                            <span style="font-size: 9px; font-weight: normal; color: #9CA3AF;">(vendor)</span>
+                        @endif
+                    </div>
+                    <div class="card-title">
+                        {{ $client['name'] }}
+                    </div>
+                    @if(!empty($client['company']))
+                        <div class="card-row" style="font-weight: 500;">{{ $client['company'] }}</div>
+                    @endif
+                    @if(!empty($client['property_address']))
+                        <div class="card-row">
+                            @if(!empty($branding['pin_icon_base64']))
+                                <img src="{{ $branding['pin_icon_base64'] }}" width="11" height="11" style="vertical-align: -1px; margin-right: 4px;">
+                            @endif
+                            {{ $client['property_address'] }}
+                        </div>
+                    @endif
+                    @if(!empty($client['address']))
+                        <div class="card-row text-muted">{{ $client['address'] }}</div>
+                    @endif
+                    @if(!empty($client['email']))
+                        <div class="card-row">
+                            @if(!empty($branding['mail_icon_base64']))
+                                <img src="{{ $branding['mail_icon_base64'] }}" width="11" height="11" style="vertical-align: -1px; margin-right: 4px;">
+                            @endif
+                            {{ $client['email'] }}
+                        </div>
+                    @endif
+                    @if(!empty($client['phone']))
+                        <div class="card-row">{{ $client['phone'] }}</div>
+                    @endif
+                    @if(!empty($client['tax_number']))
+                        <div class="card-row" style="margin-top: 3px; font-size: 11px;">
+                            <strong>Tax ID:</strong> {{ $client['tax_number'] }}
                         </div>
                     @endif
                 </div>
@@ -377,80 +620,24 @@
         </tr>
     </table>
 
-    <!-- Info Section (Bill To & Order Details) -->
-    <table class="info-table">
-        <tr>
-            <td>
-                <div class="info-title">Billed To</div>
-                <div class="info-content">
-                    @php
-                        $agent = $invoice->agent;
-                        $agentName = $agent ? trim(($agent->first_name ?? '') . ' ' . ($agent->last_name ?? '')) : 'Valued Customer';
-                    @endphp
-                    <strong>{{ $agentName }}</strong><br>
-                    @if($agent?->brokerage || $agent?->company_name)
-                        <div>{{ $agent->brokerage ?? $agent->company_name }}</div>
-                    @endif
-                    @if($agent?->email)
-                        <div>{{ $agent->email }}</div>
-                    @endif
-                    @if($agent?->phone || $agent?->mobile_number)
-                        <div>{{ $agent->phone ?? $agent->mobile_number }}</div>
-                    @endif
-                </div>
-            </td>
-            <td>
-                <div class="info-title">Order & Property Details</div>
-                <div class="info-content">
-                    @if($invoice->order)
-                        <div>Order Ref: <strong>#{{ $invoice->order->id }}</strong> ({{ $invoice->order->uuid }})</div>
-                    @endif
-
-                    @php
-                        $property = $invoice->order?->property;
-                        $propAddress = null;
-                        if ($property) {
-                            $propAddress = implode(', ', array_filter([
-                                $property->suite,
-                                $property->address,
-                                $property->city,
-                                $property->province,
-                                $property->postal_code,
-                                $property->country
-                            ]));
-                        } elseif (!empty($invoice->order?->property_address)) {
-                            $propAddress = $invoice->order->property_address;
-                        }
-                    @endphp
-
-                    @if($propAddress)
-                        <div style="margin-top: 4px;">Property Address:</div>
-                        <strong>{{ $propAddress }}</strong>
-                    @else
-                        <div class="text-muted">No specific property address attached</div>
-                    @endif
-                </div>
-            </td>
-        </tr>
-    </table>
-
-    <!-- Line Items Table -->
+    <!-- Line Items Table (3 Columns matching frontend view mode: Item Description, Quantity, Amount) -->
     <table class="items-table">
         <thead>
             <tr>
-                <th class="text-left" style="width: 50%;">Description / Service</th>
-                <th class="text-center" style="width: 12%;">Qty</th>
-                <th class="text-right" style="width: 18%;">Unit Price</th>
-                <th class="text-right" style="width: 20%;">Total</th>
+                <th class="text-left" style="width: 55%;">Item Description</th>
+                <th class="text-center" style="width: 15%;">Quantity</th>
+                <th class="text-right" style="width: 30%;">Amount</th>
             </tr>
         </thead>
         <tbody>
             @forelse($invoice->items as $item)
                 @php
                     $serviceTitle = $item->orderService?->service?->name ?? $item->description ?? 'Service Item';
-                    $qty = (int)($item->quantity ?? 1);
+                    $qty = (float)($item->quantity ?? 1);
                     $rate = (float)($item->unit_price ?? $item->amount ?? 0);
                     $lineTotal = (float)($item->amount ?? ($qty * $rate));
+                    $isPaidItem = !empty($item->item_status) ? $item->item_status === 'paid' : !empty($item->is_paid);
+                    $isRefundedItem = ($item->item_status ?? '') === 'refunded';
                 @endphp
                 <tr>
                     <td>
@@ -458,14 +645,25 @@
                         @if(!empty($item->description) && $item->description !== $serviceTitle)
                             <div class="item-desc">{{ $item->description }}</div>
                         @endif
+                        @if($isPaidItem)
+                            <span class="badge-paid">Paid</span>
+                        @endif
+                        @if($isRefundedItem)
+                            <span class="badge-refunded">Refunded</span>
+                        @endif
                     </td>
-                    <td class="text-center">{{ $qty }}</td>
-                    <td class="text-right">${{ number_format($rate, 2) }}</td>
-                    <td class="text-right font-bold">${{ number_format($lineTotal, 2) }}</td>
+                    <td class="text-center" style="color: #4B5563;">{{ $qty == (int)$qty ? (int)$qty : number_format($qty, 2) }}</td>
+                    <td class="text-right font-bold" style="color: #111827;">
+                        @if($lineTotal < 0)
+                            -${{ number_format(abs($lineTotal), 2) }}
+                        @else
+                            ${{ number_format($lineTotal, 2) }}
+                        @endif
+                    </td>
                 </tr>
             @empty
                 <tr>
-                    <td colspan="4" class="text-center text-muted" style="padding: 18px;">
+                    <td colspan="3" class="text-center text-muted" style="padding: 18px;">
                         No line items recorded for this invoice.
                     </td>
                 </tr>
@@ -473,61 +671,119 @@
         </tbody>
     </table>
 
-    <!-- Summary & Totals -->
-    <table class="summary-container">
+    <!-- Split Invoice Distribution (if active) -->
+    @if(!empty($splitParticipants) && count($splitParticipants) > 0)
+        <div class="split-box">
+            <div class="split-box-title">
+                {{ count($splitParticipants) === 1 ? 'Invoice Allocation' : 'Invoice Split Distribution' }}
+            </div>
+            <table class="split-table">
+                <tr>
+                    @foreach($splitParticipants as $part)
+                        <td style="width: {{ round(100 / count($splitParticipants)) }}%; padding-right: 8px;">
+                            <div class="split-card-cell">
+                                <table style="width: 100%;">
+                                    <tr>
+                                        <td style="font-weight: bold; font-size: 10px; color: #111827;">{{ $part['name'] }}</td>
+                                        <td style="text-align: right;">
+                                            <span style="background: #EFF6FF; color: #1E40AF; padding: 1px 4px; border-radius: 3px; font-size: 9px; font-weight: bold;">{{ $part['percentage'] }}%</span>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td colspan="2" style="font-size: 9px; color: #6B7280;">{{ $part['email'] }}</td>
+                                    </tr>
+                                    <tr>
+                                        <td style="font-size: 9px; color: #9CA3AF; text-transform: uppercase;">{{ $part['role'] }}</td>
+                                        <td style="text-align: right; font-weight: bold; font-size: 10px; color: #111827;">${{ number_format((float)$part['amount'], 2) }}</td>
+                                    </tr>
+                                </table>
+                            </div>
+                        </td>
+                    @endforeach
+                </tr>
+            </table>
+        </div>
+    @endif
+
+    <!-- Summary & Totals (Notes on left, Totals on right) -->
+    <table class="summary-table">
         <tr>
-            <td style="width: 50%;" class="notes-box">
-                @if(!empty($invoice->notes))
-                    <div class="notes-title">Notes / Instructions:</div>
-                    <div class="notes-content">
-                        {!! nl2br(e($invoice->notes)) !!}
-                    </div>
-                @endif
+            <!-- Notes (Left 50%) -->
+            <td style="width: 50%;" class="notes-section">
+                <div class="notes-heading">Notes:</div>
+                <div class="notes-body">
+                    {!! nl2br(e($invoice->notes ?: 'Payment is due within 30 days of issuance. Please include the invoice number with your payment. Thank you for your business!')) !!}
+                </div>
             </td>
+
+            <!-- Totals Card (Right 50%) -->
             <td style="width: 50%;">
                 <table class="totals-table">
                     <tr>
-                        <td class="label">Subtotal:</td>
-                        <td class="val">${{ number_format($financials['subtotal'], 2) }}</td>
+                        <td class="t-label">Subtotal:</td>
+                        <td class="t-val">${{ number_format($financials['subtotal'], 2) }}</td>
                     </tr>
+
+                    @if(!empty($travelAmount) && $travelAmount > 0)
+                        <tr>
+                            <td class="t-label">Travel:</td>
+                            <td class="t-val">${{ number_format($travelAmount, 2) }}</td>
+                        </tr>
+                    @endif
 
                     @if(!empty($financials['tax_breakdown']))
                         @foreach($financials['tax_breakdown'] as $taxLabel => $taxAmt)
                             <tr>
-                                <td class="label">{{ $taxLabel }}:</td>
-                                <td class="val">${{ number_format($taxAmt, 2) }}</td>
+                                <td class="t-label">{{ $taxLabel }}:</td>
+                                <td class="t-val">${{ number_format($taxAmt, 2) }}</td>
                             </tr>
                         @endforeach
                     @endif
 
-                    <tr class="grand-total">
-                        <td class="label">Total Amount:</td>
-                        <td class="val">${{ number_format($financials['total'], 2) }} {{ strtoupper($invoice->currency ?? 'CAD') }}</td>
+                    <!-- Grand Total Banner in brand tab color -->
+                    <tr class="total-banner-row">
+                        <td colspan="2">
+                            <div class="total-banner">
+                                <table>
+                                    <tr>
+                                        <td class="b-label">Total ({{ strtoupper($invoice->currency ?? 'CAD') }})</td>
+                                        <td class="b-val">${{ number_format($financials['total'], 2) }} {{ strtoupper($invoice->currency ?? 'CAD') }}</td>
+                                    </tr>
+                                </table>
+                            </div>
+                        </td>
                     </tr>
 
                     @if($financials['paid_amount'] > 0)
-                        <tr>
-                            <td class="label" style="color: #15803D;">Amount Paid:</td>
-                            <td class="val" style="color: #15803D;">-${{ number_format($financials['paid_amount'], 2) }}</td>
+                        <tr class="paid-row">
+                            <td class="t-label" style="color: #15803D !important;">Amount Paid:</td>
+                            <td class="t-val" style="color: #15803D !important;">-${{ number_format($financials['paid_amount'], 2) }}</td>
                         </tr>
                     @endif
 
                     @if($financials['refunded_amount'] > 0)
+                        <tr class="refund-row">
+                            <td class="t-label" style="color: #DC2626 !important;">Amount Refunded:</td>
+                            <td class="t-val" style="color: #DC2626 !important;">+${{ number_format($financials['refunded_amount'], 2) }}</td>
+                        </tr>
+                    @endif
+
+                    @if($financials['refunded_amount'] > 0 && $financials['paid_amount'] > 0)
                         <tr>
-                            <td class="label" style="color: #B91C1C;">Refunded Amount:</td>
-                            <td class="val" style="color: #B91C1C;">+${{ number_format($financials['refunded_amount'], 2) }}</td>
+                            <td class="t-label">Net Paid:</td>
+                            <td class="t-val">${{ number_format($financials['net_paid'], 2) }}</td>
                         </tr>
                     @endif
 
                     @if($financials['balance_due'] > 0)
-                        <tr class="balance-due">
-                            <td class="label" style="color: #DC2626;">Balance Due:</td>
-                            <td class="val">${{ number_format($financials['balance_due'], 2) }} {{ strtoupper($invoice->currency ?? 'CAD') }}</td>
+                        <tr class="due-row">
+                            <td class="t-label">Balance Due:</td>
+                            <td class="t-val">${{ number_format($financials['balance_due'], 2) }}</td>
                         </tr>
                     @else
-                        <tr class="balance-paid">
-                            <td class="label" style="color: #15803D;">Balance Due:</td>
-                            <td class="val">$0.00 (PAID)</td>
+                        <tr class="due-paid-row">
+                            <td class="t-label">Balance Due:</td>
+                            <td class="t-val">$0.00 (PAID)</td>
                         </tr>
                     @endif
                 </table>
@@ -537,26 +793,38 @@
 
     <!-- Recorded Payment History (if any) -->
     @if($invoice->payments && $invoice->payments->isNotEmpty())
-        <div class="payments-box">
-            <div style="font-size: 11px; font-weight: 700; color: #374151; margin-bottom: 6px;">Payment History</div>
+        <div class="payments-container">
+            <div class="payments-header">Transaction History</div>
             <table class="payments-table">
                 <thead>
                     <tr>
-                        <th>Date</th>
-                        <th>Method</th>
-                        <th>Status</th>
-                        <th>Reference / ID</th>
-                        <th class="text-right">Amount</th>
+                        <th style="width: 22%;">Date</th>
+                        <th style="width: 14%;">Type</th>
+                        <th style="width: 16%;">Method</th>
+                        <th style="width: 30%;">Reference / ID</th>
+                        <th class="text-right" style="width: 18%;">Amount</th>
                     </tr>
                 </thead>
                 <tbody>
                     @foreach($invoice->payments as $payment)
+                        @php
+                            $isRef = $payment->payment_type === 'refund' || (float)$payment->amount < 0;
+                            $amt = abs((float)$payment->amount);
+                        @endphp
                         <tr>
-                            <td>{{ $payment->paid_at ? \Carbon\Carbon::parse($payment->paid_at)->format('M d, Y g:i A') : \Carbon\Carbon::parse($payment->created_at)->format('M d, Y') }}</td>
+                            <td>{{ $payment->paid_at ? \Carbon\Carbon::parse($payment->paid_at)->format('n/j/Y') : \Carbon\Carbon::parse($payment->created_at)->format('n/j/Y') }}</td>
+                            <td>
+                                @if($isRef)
+                                    <span style="color: #DC2626; font-weight: 700;">Refund</span>
+                                @else
+                                    <span style="color: #15803D; font-weight: 700;">Payment</span>
+                                @endif
+                            </td>
                             <td>{{ ucfirst($payment->payment_method ?? 'Card') }}</td>
-                            <td><span style="font-weight: 600;">{{ strtoupper($payment->status ?? 'PAID') }}</span></td>
-                            <td>{{ $payment->uuid }}</td>
-                            <td class="text-right font-bold">${{ number_format((float)$payment->amount, 2) }}</td>
+                            <td style="font-family: monospace; font-size: 9px; color: #6B7280;">{{ $payment->uuid }}</td>
+                            <td class="text-right font-bold" style="color: {{ $isRef ? '#DC2626' : '#15803D' }};">
+                                {{ $isRef ? '-' : '' }}${{ number_format($amt, 2) }}
+                            </td>
                         </tr>
                     @endforeach
                 </tbody>

@@ -310,8 +310,22 @@ class InvoiceController extends Controller
     public function downloadPdf(Request $request, string $uuid, InvoicePdfService $pdfService)
     {
         try {
-            $invoice = Invoice::where('uuid', $uuid)->firstOrFail();
-            $this->authorizeInvoiceAccess($invoice);
+            $invoice = Invoice::where('uuid', $uuid)
+                ->when(is_numeric($uuid), fn($q) => $q->orWhere('id', (int)$uuid))
+                ->first();
+
+            if (!$invoice) {
+                $vendorInvoice = \App\Models\VendorInvoice::where('uuid', $uuid)
+                    ->when(is_numeric($uuid), fn($q) => $q->orWhere('id', (int)$uuid))
+                    ->first();
+                if ($vendorInvoice) {
+                    $invoice = $vendorInvoice;
+                } else {
+                    return response()->json(['success' => false, 'message' => 'Invoice not found'], 404);
+                }
+            } else {
+                $this->authorizeInvoiceAccess($invoice);
+            }
 
             $pdf = $pdfService->generate($invoice);
             $fileName = $pdfService->getFileName($invoice);
@@ -622,7 +636,9 @@ class InvoiceController extends Controller
 
         try {
             DB::beginTransaction();
-            $invoice = Invoice::where('uuid', $uuid)->firstOrFail();
+            $invoice = Invoice::where('uuid', $uuid)
+                ->when(is_numeric($uuid), fn($q) => $q->orWhere('id', (int)$uuid))
+                ->firstOrFail();
             $this->authorizeInvoiceAccess($invoice);
 
             if (in_array($invoice->status, ['paid', 'void', 'refunded']) && (float)$invoice->total > 0.0) {
@@ -818,7 +834,9 @@ class InvoiceController extends Controller
     public function void(string $uuid): JsonResponse
     {
         try {
-            $invoice = Invoice::where('uuid', $uuid)->firstOrFail();
+            $invoice = Invoice::where('uuid', $uuid)
+                ->when(is_numeric($uuid), fn($q) => $q->orWhere('id', (int)$uuid))
+                ->firstOrFail();
             if (in_array($invoice->status, ['paid', 'void', 'refunded'])) {
                 return response()->json(['success' => false, 'message' => "Cannot void a {$invoice->status} invoice."], 422);
             }
@@ -1213,6 +1231,11 @@ class InvoiceController extends Controller
                         ]);
                     }
                 }
+            }
+
+            // Sync all order invoices so their paid_amount and status reflect refunded order services
+            if ($invoice->order) {
+                Invoice::syncOrderStatus($invoice->order);
             }
 
             DB::commit();

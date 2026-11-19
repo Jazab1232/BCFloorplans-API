@@ -52,8 +52,18 @@ class QuickBooksService
         ];
 
         // Decrypt if necessary
-        $token = $this->decryptTokenSafely($accessToken, 'access token');
-        $refresh = $this->decryptTokenSafely($refreshToken, 'refresh token');
+        $token = null;
+        $refresh = null;
+        try {
+            $token = $this->decryptTokenSafely($accessToken, 'access token');
+        } catch (\Throwable $e) {
+            Log::warning('QB initializeDataService: access token decryption failed: ' . $e->getMessage());
+        }
+        try {
+            $refresh = $this->decryptTokenSafely($refreshToken, 'refresh token');
+        } catch (\Throwable $e) {
+            Log::warning('QB initializeDataService: refresh token decryption failed: ' . $e->getMessage());
+        }
 
         if ($token) {
             $config['accessTokenKey'] = $token;
@@ -367,7 +377,19 @@ class QuickBooksService
             $OAuth2LoginHelper = $this->dataService->getOAuth2LoginHelper();
             
             // Decrypt refresh token for the SDK
-            $refreshToken = $this->decryptTokenSafely($organization->qb_refresh_token, 'refresh token');
+            $refreshToken = null;
+            try {
+                $refreshToken = $this->decryptTokenSafely($organization->qb_refresh_token, 'refresh token');
+            } catch (\Exception $e) {
+                // If encrypted with old APP_KEY or corrupted, clear stale tokens so org can reconnect
+                $organization->update([
+                    'qb_access_token' => null,
+                    'qb_refresh_token' => null,
+                    'qb_access_expires_at' => null,
+                    'qb_refresh_expires_at' => null,
+                ]);
+                throw new \Exception('QuickBooks authorization has expired or is invalid. Please reconnect QuickBooks in Global Settings.');
+            }
 
             $refreshedToken = $OAuth2LoginHelper->refreshAccessTokenWithRefreshToken($refreshToken);
             
@@ -378,7 +400,7 @@ class QuickBooksService
             return $refreshedToken;
         } catch (\Exception $e) {
             Log::error('QuickBooks Token Refresh Error: ' . $e->getMessage());
-            if (str_contains($e->getMessage(), 'invalid_grant') || str_contains($e->getMessage(), 'Incorrect or invalid refresh token')) {
+            if (str_contains($e->getMessage(), 'invalid_grant') || str_contains($e->getMessage(), 'Incorrect or invalid refresh token') || str_contains($e->getMessage(), 'reconnect QuickBooks')) {
                 throw new \Exception('QuickBooks authorization has expired. Please reconnect QuickBooks in Global Settings.');
             }
             throw new \Exception('QuickBooks token refresh failed: ' . $e->getMessage());
@@ -487,10 +509,6 @@ class QuickBooksService
 
             if ($organization && $organization->qb_access_token) {
                 try {
-                    $this->initializeDataService($organization->qb_access_token);
-                    $OAuth2LoginHelper = $this->dataService->getOAuth2LoginHelper();
-                    
-                    // Decrypt for SDK
                     $token = null;
                     try {
                         $token = $this->decryptTokenSafely($organization->qb_access_token, 'access token');
@@ -498,10 +516,14 @@ class QuickBooksService
                         Log::warning('QB: Failed to decrypt access token during revoke: ' . $e->getMessage());
                     }
 
-                    $result = $OAuth2LoginHelper->revokeToken($token);
-                    
-                    if ($result) {
-                        Log::info('QuickBooks token revoked successfully');
+                    if ($token) {
+                        $this->initializeDataService($token);
+                        $OAuth2LoginHelper = $this->dataService->getOAuth2LoginHelper();
+                        $result = $OAuth2LoginHelper->revokeToken($token);
+                        
+                        if ($result) {
+                            Log::info('QuickBooks token revoked successfully');
+                        }
                     }
                 } catch (\Exception $e) {
                     Log::warning('Failed to revoke token with QuickBooks: ' . $e->getMessage());
@@ -535,7 +557,7 @@ class QuickBooksService
             $organization = $user ? ($user->organization ?? ($user->organization_id ? Organization::find($user->organization_id) : null)) : null;
         }
         
-        if (!$organization || !$organization->qb_realm_id) {
+        if (!$organization || !$organization->qb_realm_id || !$organization->qb_access_token) {
             return null;
         }
         
@@ -738,9 +760,21 @@ class QuickBooksService
                 // 1. Ensure Customer
                 $customerId = $this->getOrCreateCustomer($invoice->agent, $org);
 
-                // 2. Build Lines with Tax Support
+                // 2. Resolve Tax Code before building lines so line items can link TaxCodeRef
+                $taxCodeId = $this->resolveTaxCodeId($dataService, $invoice);
+
+                // 3. Build Lines with Tax Support and Discount handling
                 $lines = [];
                 foreach ($invoice->items as $item) {
+                    $itemAmount = (float)($item->amount ?: ($item->quantity * $item->unit_price));
+
+                    // If item is a discount or credit (negative amount), use QB DiscountLineDetail
+                    if ($itemAmount < 0 || (float)$item->unit_price < 0) {
+                        $discountDesc = $item->description ?: 'Discount';
+                        $lines[] = $this->createDiscountLine(abs($itemAmount), $discountDesc);
+                        continue;
+                    }
+
                     // Ensure the QB item exists and is valid in the currently connected QB company
                     $service = $item->orderService?->service;
                     $fallbackName = !empty($item->description) ? trim(explode("\n", $item->description)[0]) : 'Service';
@@ -749,26 +783,34 @@ class QuickBooksService
                     $lines[] = $this->createInvoiceLine(
                         $itemId,
                         $item->quantity,
-                        $item->unit_price,
-                        $item->description
+                        $itemAmount,
+                        $item->description,
+                        $taxCodeId
                     );
                 }
 
                 // Fallback 1: If invoice items are empty, populate lines from order services if available
-                if (empty($lines) && $invoice->order && $invoice->order->relationLoaded('services') ? $invoice->order->services->isNotEmpty() : ($invoice->order?->services()?->exists())) {
+                if (empty($lines) && $invoice->order && ($invoice->order->relationLoaded('services') ? $invoice->order->services->isNotEmpty() : ($invoice->order?->services()?->exists()))) {
                     $orderServices = $invoice->order->relationLoaded('services') ? $invoice->order->services : $invoice->order->services()->with('service')->get();
                     $serviceCount = max(1, $orderServices->count());
                     foreach ($orderServices as $orderService) {
+                        $amount = (float)($orderService->price ?? $orderService->amount ?? ($invoice->total ? round($invoice->total / $serviceCount, 2) : 0));
                         $service = $orderService->service;
                         $serviceName = $service?->name ?? 'Service';
+
+                        if ($amount < 0) {
+                            $lines[] = $this->createDiscountLine(abs($amount), $serviceName . ($invoice->order_id ? " (Order #{$invoice->order_id})" : ""));
+                            continue;
+                        }
+
                         $itemId = $this->getOrCreateServiceItem($dataService, $service, $serviceName);
                         $qty = 1;
-                        $amount = (float)($orderService->price ?? $orderService->amount ?? ($invoice->total ? round($invoice->total / $serviceCount, 2) : 0));
                         $lines[] = $this->createInvoiceLine(
                             $itemId,
                             $qty,
                             $amount,
-                            $serviceName . ($invoice->order_id ? " (Order #{$invoice->order_id})" : "")
+                            $serviceName . ($invoice->order_id ? " (Order #{$invoice->order_id})" : ""),
+                            $taxCodeId
                         );
                     }
                 }
@@ -786,12 +828,10 @@ class QuickBooksService
                         $fallbackItemId,
                         1,
                         $totalAmount,
-                        $fallbackDesc
+                        $fallbackDesc,
+                        $taxCodeId
                     );
                 }
-
-                // 3. Resolve Tax Code
-                $taxCodeId = $this->resolveTaxCodeId($dataService, $invoice);
 
                 // 4. Create QB Invoice
                 $invoiceObj = Invoice::create([
@@ -812,7 +852,20 @@ class QuickBooksService
                 if (!$qbInvoice || $qbInvoice instanceof \Exception) {
                     $error = $dataService->getLastError();
                     $sdkMsg = ($qbInvoice instanceof \Exception) ? $qbInvoice->getMessage() : null;
-                    throw new \Exception('QB invoice creation failed: ' . ($sdkMsg ?? $error?->getResponseBody() ?? 'Unknown'));
+                    $errorBody = $error?->getResponseBody();
+
+                    // Parse detailed message from XML / JSON responseBody if available
+                    $detailMsg = null;
+                    if ($errorBody) {
+                        if (preg_match('/<Detail>(.*?)<\/Detail>/i', $errorBody, $m)) {
+                            $detailMsg = $m[1];
+                        } elseif (preg_match('/<Message>(.*?)<\/Message>/i', $errorBody, $m)) {
+                            $detailMsg = $m[1];
+                        }
+                    }
+
+                    $resolvedError = $detailMsg ?: ($errorBody ?: ($sdkMsg ?: 'Unknown QuickBooks API error'));
+                    throw new \Exception('QB invoice creation failed: ' . $resolvedError);
                 }
 
                 // 5. If paid, create payment
@@ -869,37 +922,56 @@ class QuickBooksService
      */
     protected function resolveTaxCodeId($dataService, \App\Models\Invoice $invoice): ?string
     {
-        if (empty($invoice->tax_details)) return null;
+        if (empty($invoice->tax_details) || !is_array($invoice->tax_details)) return null;
 
-        $taxName = array_key_first($invoice->tax_details);
-        $taxRate = $invoice->tax_details[$taxName]['rate'] ?? null;
-
-        if (!$taxName) return null;
-
-        // Try to fetch from organization settings first (Mapping)
-        $orgUuid = $invoice->order->organization?->uuid ?? null;
+        $orgUuid = $invoice->order?->organization?->uuid ?? null;
         $mappings = null;
         if ($orgUuid) {
             $mappings = \App\Models\Setting::where('org_id', $orgUuid)->where('key', 'quickbooks_tax_mappings')->first();
         }
 
-        if ($mappings && isset($mappings->value[$taxName])) {
-            return $mappings->value[$taxName];
+        // Check each tax entry in invoice tax_details
+        $taxNames = array_keys($invoice->tax_details);
+        $primaryTaxName = $taxNames[0] ?? null;
+
+        // Try mapping by full combination (e.g. "GST/PST" if multiple) or primary tax name
+        $combinedName = implode('/', $taxNames);
+        if ($mappings && is_array($mappings->value)) {
+            if (isset($mappings->value[$combinedName])) {
+                return $mappings->value[$combinedName];
+            }
+            if ($primaryTaxName && isset($mappings->value[$primaryTaxName])) {
+                return $mappings->value[$primaryTaxName];
+            }
         }
 
-        // Fallback: Search QB by name
+        // Fallback: Search QB TaxCode by name
         try {
-            $escapedName = str_replace("'", "''", $taxName);
-            $taxCodes = $dataService->Query("SELECT * FROM TaxCode WHERE Name = '{$escapedName}' AND Active = true");
-            if (!empty($taxCodes)) {
-                return $taxCodes[0]->Id;
+            // First search combined name e.g. "GST/PST"
+            if (count($taxNames) > 1) {
+                $escapedCombined = str_replace("'", "''", $combinedName);
+                $taxCodes = $dataService->Query("SELECT * FROM TaxCode WHERE Name = '{$escapedCombined}' AND Active = true");
+                if (!empty($taxCodes)) {
+                    return $taxCodes[0]->Id;
+                }
             }
 
-            // Secondary fallback: search by rate in name (e.g. "13%")
-            $query = "SELECT * FROM TaxCode WHERE Name LIKE '%{$taxRate}%' AND Active = true";
-            $taxCodes = $dataService->Query($query);
-            if (!empty($taxCodes)) {
-                return $taxCodes[0]->Id;
+            // Search primary name e.g. "GST", "HST", "PST"
+            if ($primaryTaxName) {
+                $escapedName = str_replace("'", "''", $primaryTaxName);
+                $taxCodes = $dataService->Query("SELECT * FROM TaxCode WHERE Name = '{$escapedName}' AND Active = true");
+                if (!empty($taxCodes)) {
+                    return $taxCodes[0]->Id;
+                }
+
+                $taxRate = $invoice->tax_details[$primaryTaxName]['rate'] ?? null;
+                if ($taxRate) {
+                    $query = "SELECT * FROM TaxCode WHERE Name LIKE '%{$taxRate}%' AND Active = true";
+                    $taxCodes = $dataService->Query($query);
+                    if (!empty($taxCodes)) {
+                        return $taxCodes[0]->Id;
+                    }
+                }
             }
         } catch (\Exception $e) {
             Log::warning('Failed to search QB TaxCode: ' . $e->getMessage());
@@ -1444,9 +1516,9 @@ class QuickBooksService
     }
 
     /**
-     * Create invoice line item with accurate quantity and price
+     * Create invoice line item with accurate quantity, price, and tax code
      */
-    protected function createInvoiceLine($itemId, $quantity, $totalAmount, $description = '')
+    protected function createInvoiceLine($itemId, $quantity, $totalAmount, $description = '', ?string $taxCodeId = null)
     {
         $qty = max(1, (int)$quantity);
         $total = (float)$totalAmount;
@@ -1461,10 +1533,33 @@ class QuickBooksService
         $salesItemLineDetail->Qty = $qty;
         $salesItemLineDetail->UnitPrice = $unitPrice;
 
+        if ($taxCodeId) {
+            $salesItemLineDetail->TaxCodeRef = new IPPReferenceType(['value' => $taxCodeId]);
+        }
+
         $line->SalesItemLineDetail = $salesItemLineDetail;
 
         // Explicitly set Amount to match original line total
         $line->Amount = round($total, 2);
+
+        return $line;
+    }
+
+    /**
+     * Create a QuickBooks Discount line detail for discounts or negative adjustments
+     */
+    protected function createDiscountLine(float $amount, string $description = 'Discount'): IPPLine
+    {
+        $line = new IPPLine();
+        $line->DetailType = "DiscountLineDetail";
+        $line->Description = $description;
+        // DiscountLine amount must be positive in QuickBooks Online
+        $line->Amount = round(abs($amount), 2);
+
+        $discountDetail = new IPPDiscountLineDetail();
+        $discountDetail->PercentBased = false;
+
+        $line->DiscountLineDetail = $discountDetail;
 
         return $line;
     }

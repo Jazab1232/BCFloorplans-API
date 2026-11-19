@@ -39,9 +39,13 @@ class SyncOrderCalendarEvents implements ShouldQueue
             $order = Order::with([
                 'slots.vendor',
                 'slots.vendor.workHours',
+                'slots.service',
+                'services.service',
+                'services.option',
+                'services.vendor',
+                'areas',
                 'agent',
                 'property',
-                'slots.service',
             ])->find($this->orderId);
 
             if (!$order) {
@@ -155,15 +159,13 @@ class SyncOrderCalendarEvents implements ShouldQueue
                 $start = Carbon::createFromFormat('Y-m-d H:i:s', "{$slot->date} {$slot->start_time}", $tz);
                 $end = Carbon::createFromFormat('Y-m-d H:i:s', "{$slot->date} {$slot->end_time}", $tz);
 
-                $serviceName = $slot->service->name ?? 'Service';
-
                 $eventData = [
-                    'summary' => "Order #{$order->id} – {$order->property->postal_code}, {$order->property->address}, {$order->property->city} - Service: {$serviceName}",
+                    'summary' => $this->resolveVendorJobTitle($order, $slot),
                     'description' => $this->buildVendorInstructionDescriptionForSlot($order, $slot, $vendor),
                     'start' => $start,
                     'end' => $end,
                     'timezone' => $tz,
-                    'location' => $order->property->address ?? '',
+                    'location' => $this->resolveEventLocation($order),
                 ];
 
                 $existingEventId = $slot->google_event_id;
@@ -267,7 +269,7 @@ class SyncOrderCalendarEvents implements ShouldQueue
                     'start' => $start,
                     'end' => $end,
                     'timezone' => $tz,
-                    'location' => $order->property->address ?? '',
+                    'location' => $this->resolveEventLocation($order),
                 ];
 
                 $existingEventId = $slot->agent_google_event_id;
@@ -369,7 +371,71 @@ class SyncOrderCalendarEvents implements ShouldQueue
     }
 
     /**
-     * Build vendor instruction description for a single slot
+     * Resolve job title for vendor appointment (e.g. 2D Floor Plan, 35 HDR Photos, HD Video)
+     */
+    protected function resolveVendorJobTitle(Order $order, OrderSlot $slot): string
+    {
+        $matchingService = $order->services->first(function ($os) use ($slot) {
+            if ($os->service_id == $slot->service_id) {
+                if ($slot->vendor_id && $os->vendor_id) {
+                    return $os->vendor_id == $slot->vendor_id;
+                }
+                return true;
+            }
+            return false;
+        }) ?: $order->services->firstWhere('service_id', $slot->service_id);
+
+        $sName = trim($slot->service->name ?? $matchingService?->service?->name ?? 'Service');
+        $optTitle = trim($matchingService?->option?->title ?? '');
+
+        if (!$optTitle) {
+            return $sName;
+        }
+        if (!$sName) {
+            return $optTitle;
+        }
+        if (stripos($optTitle, $sName) !== false) {
+            return $optTitle;
+        }
+        if (preg_match('/photo|hdr|video|tour|drone|aerial|matterport|floor\s*plan|measure/i', $optTitle)) {
+            return $optTitle;
+        }
+
+        return "{$sName} ({$optTitle})";
+    }
+
+    /**
+     * Format full property location suitable for maps navigation in Google Calendar
+     */
+    protected function resolveEventLocation(Order $order): string
+    {
+        $prop = $order->property;
+        $addressParts = [];
+
+        $street = $prop->address ?? $order->property_address ?? '';
+        if (!empty($street)) {
+            $addressParts[] = trim($street);
+        }
+        if (!empty($prop->city)) {
+            $addressParts[] = trim($prop->city);
+        }
+
+        $provPostal = array_filter([
+            $prop->province ?? $prop->state ?? $order->province ?? '',
+            $prop->postal_code ?? ''
+        ]);
+        if (!empty($provPostal)) {
+            $addressParts[] = implode(' ', $provPostal);
+        }
+
+        $country = !empty($prop->country) ? trim($prop->country) : 'Canada';
+        $addressParts[] = $country;
+
+        return implode(', ', array_filter($addressParts));
+    }
+
+    /**
+     * Build vendor instruction description for a single slot matching the mobile appointment view
      */
     protected function buildVendorInstructionDescriptionForSlot(
         Order $order,
@@ -378,34 +444,152 @@ class SyncOrderCalendarEvents implements ShouldQueue
     ): string {
         $lines = [];
 
-        $lines[] = "📋 ORDER DETAILS";
-        $lines[] = "Order ID: #{$order->id}";
-        $lines[] = "";
-        $lines[] = "👤 AGENT";
-        $lines[] = "Name: {$order->agent->first_name} {$order->agent->last_name}";
-        $lines[] = "Email: {$order->agent->email}";
-        $lines[] = "";
-        $lines[] = "🏠 PROPERTY";
-        $lines[] = "Address: {$order->property->address}, {$order->property->city}, {$order->property->province}, {$order->property->country}";
-        $lines[] = "";
-        $lines[] = "⏰ SCHEDULED SERVICE";
-        $lines[] = sprintf(
-            "• %s | %s - %s | %s",
-            Carbon::parse($slot->date)->format('M d, Y'),
-            Carbon::parse($slot->start_time)->format('g:i A'),
-            Carbon::parse($slot->end_time)->format('g:i A'),
-            $slot->service->name ?? 'Service'
-        );
+        // 1. Agent Details (Name and Contact Phone - Email omitted for vendor)
+        $agentName = $order->agent
+            ? trim("{$order->agent->first_name} {$order->agent->last_name}")
+            : '';
+        $agentPhone = $order->agent->primary_phone ?? $order->agent->secondary_phone ?? '';
 
-        $lines[] = "";
-        $lines[] = "📍 Property Location: {$order->property->address}, {$order->property->city}";
-        
-        if ($slot->distance) {
-            $lines[] = "📏 Distance: {$slot->distance} km";
+        if (!empty($agentName)) {
+            $lines[] = "Agent Name: {$agentName}";
+        }
+        if (!empty($agentPhone)) {
+            $lines[] = "Phone: {$agentPhone}";
         }
 
-        $lines[] = "";
-        $lines[] = "🔗 View Order: " . config('app.frontend_url') . "/orders/" . $order->uuid;
+        // 2. Additional Details (Job & Appointment Notes)
+        $prop = $order->property;
+        $orderMeta = is_array($order->meta) ? $order->meta : (json_decode($order->meta ?? '', true) ?: []);
+        $additionalLines = [];
+
+        // Suite Number (if any)
+        $suite = trim((string)($prop->suite ?? $order->suite ?? $orderMeta['suite'] ?? ''));
+        if (!empty($suite)) {
+            $cleanSuite = preg_replace('/^(suite|unit|#)\s*/i', '', $suite);
+            $additionalLines[] = "Suite Number: {$cleanSuite}";
+        }
+
+        // Square Footage
+        $measuredSqFt = $order->areas ? $order->areas->sum('footage') : 0;
+        $propSqFt = (int)($prop->square_footage ?? 0);
+        $totalSqFt = $measuredSqFt > 0 ? $measuredSqFt : $propSqFt;
+        if ($totalSqFt > 0) {
+            $additionalLines[] = "Square Footage: {$totalSqFt} sqft";
+        }
+
+        // Matching Service & Photos
+        $matchingService = $order->services->first(function ($os) use ($slot) {
+            if ($os->service_id == $slot->service_id) {
+                if ($slot->vendor_id && $os->vendor_id) {
+                    return $os->vendor_id == $slot->vendor_id;
+                }
+                return true;
+            }
+            return false;
+        }) ?: $order->services->firstWhere('service_id', $slot->service_id);
+
+        $sName = $slot->service->name ?? $matchingService?->service?->name ?? '';
+        $optTitle = $matchingService?->option?->title ?? '';
+
+        if (preg_match('/photo|hdr|aerial|drone/i', $sName) || preg_match('/photo|hdr|aerial|drone/i', $optTitle)) {
+            if (preg_match('/(\d+)\s*(?:HDR\s*)?Photos?/i', $optTitle, $m)) {
+                $additionalLines[] = "Photos: {$m[1]} Photos";
+            } elseif (!empty($matchingService?->option?->quantity) && (int)$matchingService->option->quantity > 0) {
+                $additionalLines[] = "Photos: {$matchingService->option->quantity} Photos";
+            }
+        }
+
+        // Floor Plan Details (Other areas to measure & special notes)
+        $fpAreas = $orderMeta['floorplan_areas'] ?? [];
+        $fpNotes = $orderMeta['floorplan_notes'] ?? '';
+        $isFloorPlan = preg_match('/floor\s*plan|measure/i', $sName) || preg_match('/floor\s*plan|measure/i', $optTitle);
+        if ($isFloorPlan || !empty($fpAreas) || !empty($fpNotes)) {
+            if (!empty($fpAreas)) {
+                $areasStr = is_array($fpAreas) ? implode(', ', $fpAreas) : (string)$fpAreas;
+                $additionalLines[] = "Other Areas to Measure: {$areasStr}";
+            }
+            if (!empty($fpNotes)) {
+                $additionalLines[] = "Floor Plan Notes: {$fpNotes}";
+            }
+        }
+
+        // Service custom notes
+        if (!empty($matchingService?->custom)) {
+            $additionalLines[] = "Service Note: {$matchingService->custom}";
+        }
+
+        // Agent Note (notes about the agent)
+        $agentNotes = trim((string)($order->agent->notes ?? ''));
+        if (!empty($agentNotes)) {
+            $additionalLines[] = "Agent Note: {$agentNotes}";
+        }
+
+        // Site Contact (from meta, co-agents, or default to agent)
+        $siteContactName = $orderMeta['site_contact_name'] ?? $orderMeta['site_contact'] ?? null;
+        $siteContactPhone = $orderMeta['site_contact_phone'] ?? null;
+        if (!$siteContactName && !empty($prop->co_agents) && is_array($prop->co_agents) && count($prop->co_agents) > 0) {
+            $co = $prop->co_agents[0];
+            $siteContactName = $co['name'] ?? trim(($co['first_name'] ?? '') . ' ' . ($co['last_name'] ?? ''));
+            $siteContactPhone = $co['phone'] ?? $co['primary_phone'] ?? null;
+        }
+        if (!$siteContactName && !empty($agentName)) {
+            $siteContactName = $agentName;
+            $siteContactPhone = $agentPhone;
+        }
+        if (!empty($siteContactName)) {
+            $additionalLines[] = "Site Contact: {$siteContactName}";
+            if (!empty($siteContactPhone)) {
+                $additionalLines[] = "Phone: {$siteContactPhone}";
+            }
+        }
+
+        // Appointment Notes (Notes about the appointment)
+        if (!empty($order->notes)) {
+            $rawNotes = is_array($order->notes) ? $order->notes : (json_decode($order->notes, true) ?: []);
+            foreach ($rawNotes as $n) {
+                if (is_array($n) && !empty($n['note'])) {
+                    $additionalLines[] = "Appointment Note: " . trim($n['note']);
+                } elseif (is_string($n) && !empty(trim($n))) {
+                    $additionalLines[] = "Appointment Note: " . trim($n);
+                }
+            }
+        }
+
+        // Property Access / Instructions
+        $access = trim((string)($prop->media_creator_access ?? ''));
+        $instructions = trim((string)($prop->instructions ?? ''));
+        if (!empty($access)) {
+            $additionalLines[] = "Property Access: {$access}";
+        }
+        if (!empty($instructions) && $instructions !== $access) {
+            $additionalLines[] = "Instructions: {$instructions}";
+        }
+
+        if (!empty($additionalLines)) {
+            $lines[] = "Additional Details:";
+            foreach ($additionalLines as $detail) {
+                $lines[] = $detail;
+            }
+        }
+
+        // 3. Other Services on this order
+        $otherSlots = $order->slots->filter(function ($s) use ($slot) {
+            return $s->id != $slot->id && ($s->status ?? 'booked') !== 'cancelled';
+        });
+
+        if ($otherSlots->isNotEmpty()) {
+            $lines[] = "";
+            $lines[] = "Other Services:";
+            foreach ($otherSlots as $os) {
+                $osServiceName = $os->service->name ?? 'Service';
+                $osVendorName = $os->vendor
+                    ? trim("{$os->vendor->first_name} {$os->vendor->last_name}")
+                    : 'Unassigned';
+                $osTime = Carbon::parse($os->start_time)->format('g:i A');
+                $osDate = Carbon::parse($os->date)->format('m/d/Y');
+                $lines[] = "Service: {$osServiceName}, Who: {$osVendorName}, Time: {$osTime}, Date: {$osDate}";
+            }
+        }
 
         return implode("\n", $lines);
     }

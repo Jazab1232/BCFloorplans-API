@@ -34,13 +34,17 @@ class PropertyController extends Controller
                     $query->select('id', 'uuid', 'first_name', 'last_name', 'company_name', 'email', 'status', 'primary_phone');
                 },
                 'orders' => function($query) {
-                    $query->select('id', 'uuid', 'property_id', 'agent_id', 'amount', 'payment_status', 'order_status', 'created_at', 'co_agents', 'release_media_before_payment');
+                    $query->select('id', 'uuid', 'property_id', 'agent_id', 'amount', 'paid_amount', 'payment_status', 'order_status', 'created_at', 'co_agents', 'release_media_before_payment');
+                },
+                'orders.invoices' => function($query) {
+                    $query->select('id', 'order_id', 'status', 'total', 'paid_amount', 'refunded_amount');
                 },
                 'orders.tours' => function($query) {
                     $query->select('id', 'uuid', 'order_id', 'is_publish');
                 },
                 'orders.tours.files' => function($query) {
-                    $query->select('id', 'uuid', 'tour_id', 'file_path', 'is_featured', 'type', 'variants', 'is_processing', 'service_id', 'created_at');
+                    $query->select('id', 'uuid', 'tour_id', 'file_path', 'is_featured', 'type', 'variants', 'is_processing', 'service_id', 'created_at', 'is_admin_approved')
+                          ->with('service:id,uuid');
                 },
                 'organization' => function($query) {
                     $query->select('id', 'uuid', 'name', 'slug', 'domain', 'is_whitelabel');
@@ -89,6 +93,78 @@ class PropertyController extends Controller
             }
 
             $properties = $properties->get();
+
+            $properties->each(function ($property) {
+                if (!$property->orders) {
+                    return;
+                }
+
+                foreach ($property->orders as $order) {
+                    // 1. Calculate media approval status
+                    $unapprovedCount = 0;
+                    $firstServiceUuid = null;
+
+                    if ($order->tours) {
+                        foreach ($order->tours as $tour) {
+                            if ($tour->files) {
+                                foreach ($tour->files as $file) {
+                                    if ($file->is_admin_approved === false || $file->is_admin_approved === 0 || $file->is_admin_approved === '0') {
+                                        $unapprovedCount++;
+                                        if (!$firstServiceUuid && $file->service && !empty($file->service->uuid)) {
+                                            $firstServiceUuid = (string) $file->service->uuid;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    $order->has_pending_approval = $unapprovedCount > 0;
+                    $order->media_approval_required = $unapprovedCount > 0;
+                    $order->has_unapproved_media = $unapprovedCount > 0;
+                    $order->unapproved_files_count = $unapprovedCount;
+                    $order->pending_approval_service_uuid = $firstServiceUuid;
+
+                    // 2. Calculate accurate payment status (PAID, PARTIALLY_PAID, REFUNDED, UNPAID)
+                    $invoices = $order->invoices ? $order->invoices->whereNotIn('status', ['void']) : collect();
+
+                    if ($invoices->isNotEmpty()) {
+                        $totalInvoice = (float) $invoices->sum('total');
+                        $totalPaid = (float) $invoices->sum('paid_amount');
+                        $allRefunded = $invoices->every(fn($i) => $i->status === 'refunded');
+                        $allPaid = $invoices->every(fn($i) => $i->status === 'paid');
+                        $hasPaid = $invoices->contains('status', 'paid');
+                        $hasPartial = $invoices->contains('status', 'partially_paid');
+                        $hasRefunded = $invoices->contains('status', 'refunded') || $invoices->contains('status', 'partially_refunded');
+
+                        if ($allRefunded) {
+                            $order->payment_status = 'REFUNDED';
+                        } elseif ($allPaid || ($totalInvoice > 0 && $totalPaid >= $totalInvoice)) {
+                            $order->payment_status = 'PAID';
+                        } elseif ($hasPaid || $hasPartial || ($totalPaid > 0 && $totalPaid < $totalInvoice)) {
+                            $order->payment_status = 'PARTIALLY_PAID';
+                        } elseif ($hasRefunded) {
+                            $order->payment_status = 'REFUNDED';
+                        } else {
+                            $order->payment_status = 'UNPAID';
+                        }
+                    } else {
+                        $paid = (float) ($order->paid_amount ?? 0);
+                        $total = (float) ($order->amount ?? 0);
+                        $rawStatus = strtoupper(trim((string) $order->payment_status));
+
+                        if ($rawStatus === 'REFUNDED') {
+                            $order->payment_status = 'REFUNDED';
+                        } elseif ($rawStatus === 'PAID' || ($total > 0 && $paid >= $total)) {
+                            $order->payment_status = 'PAID';
+                        } elseif ($paid > 0 || in_array($rawStatus, ['PARTIAL', 'PARTIALLY_PAID'])) {
+                            $order->payment_status = 'PARTIALLY_PAID';
+                        } else {
+                            $order->payment_status = 'UNPAID';
+                        }
+                    }
+                }
+            });
 
             return response()->json([
                 'status' => true,

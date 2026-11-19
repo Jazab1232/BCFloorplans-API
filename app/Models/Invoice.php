@@ -912,22 +912,28 @@ class Invoice extends Model
  
              if (!$hasItems) continue;
 
-             // If this invoice has global discount items (like Agent Discount or Coupon Discount),
-             // proportionally allocate the discount and its tax reduction to the paid services.
-             $allocatedDiscount = 0;
-             if ($totalPositiveServiceSubtotal > 0 && $totalGlobalDiscount < 0 && $paidServiceSubtotal > 0) {
-                 $discountRatio = $paidServiceSubtotal / $totalPositiveServiceSubtotal;
-                 $allocatedDiscount = $totalGlobalDiscount * $discountRatio; // negative
-                 
-                 // Also scale tax proportionally to the discounted base
-                 if ($paidServiceSubtotal > 0) {
-                     $taxScale = ($paidServiceSubtotal + $allocatedDiscount) / $paidServiceSubtotal;
-                     $paidTax = round($paidTax * $taxScale, 2);
+             // If all services in this invoice are paid (or all positive items are paid),
+             // the calculated paid amount should exactly match the invoice's total (minus any refund).
+             if ($allPaid || ($totalPositiveServiceSubtotal > 0 && $paidServiceSubtotal >= $totalPositiveServiceSubtotal)) {
+                 $calculatedPaidAmount = (float) $invoice->total;
+             } else {
+                 // If this invoice has global discount items (like Agent Discount or Coupon Discount),
+                 // proportionally allocate the discount and its tax reduction to the paid services.
+                 $allocatedDiscount = 0;
+                 if ($totalPositiveServiceSubtotal > 0 && $totalGlobalDiscount < 0 && $paidServiceSubtotal > 0) {
+                     $discountRatio = $paidServiceSubtotal / $totalPositiveServiceSubtotal;
+                     $allocatedDiscount = $totalGlobalDiscount * $discountRatio; // negative
+                     
+                     // Also scale tax proportionally to the discounted base
+                     if ($paidServiceSubtotal > 0) {
+                         $taxScale = ($paidServiceSubtotal + $allocatedDiscount) / $paidServiceSubtotal;
+                         $paidTax = round($paidTax * $taxScale, 2);
+                     }
                  }
-             }
 
-             $paidSubtotal = round($paidServiceSubtotal + $allocatedDiscount, 2);
-             $calculatedPaidAmount = round($paidSubtotal + $paidTax, 2);
+                 $paidSubtotal = round($paidServiceSubtotal + $allocatedDiscount, 2);
+                 $calculatedPaidAmount = round($paidSubtotal + $paidTax, 2);
+             }
              
              // Direct payments recorded specifically on this invoice (e.g. Stripe checkout or manual payment)
              $directNetPaid = (float) $invoice->payments()
@@ -962,11 +968,11 @@ class Invoice extends Model
                      ? round((float)$invoice->total + (float)$invoice->refunded_amount, 2) 
                      : $invoice->total; // Ensure it's exactly total (plus refunded_amount if applicable)
              } elseif (!$isFullyPaid && $newNetPaid > 0) {
-                 if ((float)$invoice->refunded_amount > 0 || $wasGrossPaid) {
-                     $updateData['status'] = 'partially_refunded';
-                 } else {
-                     $updateData['status'] = 'partially_paid';
-                 }
+                if ((float)$invoice->refunded_amount > 0) {
+                    $updateData['status'] = 'partially_refunded';
+                } else {
+                    $updateData['status'] = 'partially_paid';
+                }
              } elseif ($newNetPaid <= 0) {
                  if ((float)$invoice->refunded_amount > 0) {
                      $updateData['status'] = 'refunded';
