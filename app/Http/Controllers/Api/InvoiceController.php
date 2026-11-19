@@ -1228,6 +1228,7 @@ class InvoiceController extends Controller
                     if (!$otherUnrefundedInvoices) {
                         $invoice->order->update([
                             'lock_materials' => $revokeMediaAccess ? true : false,
+                            'payment_status' => 'REFUNDED',
                         ]);
                     }
                 }
