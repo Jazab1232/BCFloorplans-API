@@ -716,6 +716,8 @@ class Invoice extends Model
                 'tax_amount' => $itemTax,
                 'gst_amount' => $calcItem['gst_amount'] ?? ($calcItem['tax_breakdown']['GST'] ?? 0.0),
                 'pst_amount' => $calcItem['pst_amount'] ?? ($calcItem['tax_breakdown']['PST'] ?? 0.0),
+                'gst_enabled' => $calcItem['gst_enabled'] ?? true,
+                'pst_enabled' => $calcItem['pst_enabled'] ?? false,
                 'is_extra' => $isPkgDisc || $isAgentDisc || $isCodeDisc,
                 'meta' => $meta,
             ];
@@ -805,6 +807,8 @@ class Invoice extends Model
                 'tax_amount' => $calcItem['tax_amount'] ?? 0.0,
                 'gst_amount' => $calcItem['gst_amount'] ?? ($calcItem['tax_breakdown']['GST'] ?? 0.0),
                 'pst_amount' => $calcItem['pst_amount'] ?? ($calcItem['tax_breakdown']['PST'] ?? 0.0),
+                'gst_enabled' => $calcItem['gst_enabled'] ?? true,
+                'pst_enabled' => $calcItem['pst_enabled'] ?? false,
             ]);
         }
 

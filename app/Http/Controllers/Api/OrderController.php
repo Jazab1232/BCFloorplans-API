@@ -852,11 +852,13 @@ class OrderController extends Controller
                 // 1. Dispatch order created event (sent to admin, agent, co-agent)
                 app(\App\Services\EmailDispatchService::class)->dispatch('order_created', $order);
 
-                // 2. Dispatch slot booked event for each slot assigned to a vendor
+                // 2. Dispatch slot booked event for each slot assigned to a vendor (vendor only)
                 if ($order->slots && $order->slots->isNotEmpty()) {
                     foreach ($order->slots as $slot) {
                         if ($slot->vendor_id) {
-                            app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot);
+                            app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $slot, [
+                                'allowed_roles' => ['vendor'],
+                            ]);
                         }
                     }
                 }
@@ -2286,7 +2288,9 @@ private function processSlots($order, array $incomingSlots): array
             if (!empty($payload['vendor_id']) && !request()->boolean('suppress_email') && !request()->boolean('skip_email')) {
                 try {
                     $newSlot->load(['service', 'order.property', 'vendor']);
-                    app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $newSlot);
+                    app(\App\Services\EmailDispatchService::class)->dispatch('slot_booked', $newSlot, [
+                        'allowed_roles' => ['vendor'],
+                    ]);
                 } catch (\Throwable $e) {
                     Log::warning("Failed to dispatch slot_booked email for new slot: " . $e->getMessage());
                 }

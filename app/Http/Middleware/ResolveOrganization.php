@@ -58,11 +58,13 @@ class ResolveOrganization
             if ($user instanceof \App\Models\User) {
                 // TODO: Hardcoded email check for initial Super Admin. 
                 // In the future, this can be expanded for more admins or removed once role-based access is fully stable across environments.
-                $isSuperAdmin = (trim(strtolower($user->email)) === 'todd@tojuco.com') || $user->roles()->where(function($q) {
-                    $q->where('name', 'Super Admin')
-                      ->orWhere('name', 'super admin')
-                      ->orWhere('name', 'super-admin');
-                })->exists();
+                $isSuperAdmin = (trim(strtolower($user->email)) === 'todd@tojuco.com') ||
+                    ($user->organization_id === null) ||
+                    $user->roles()->where(function($q) {
+                        $q->where('name', 'Super Admin')
+                          ->orWhere('name', 'super admin')
+                          ->orWhere('name', 'super-admin');
+                    })->exists();
             }
 
             // 2. Resolve Context

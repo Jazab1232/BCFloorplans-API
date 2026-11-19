@@ -282,6 +282,7 @@ class TaxCalculationService
         $calculatedItems = [];
         $totalTaxAmount = 0.0;
 
+        $orgHasPst = false;
         foreach ($applicableTaxes as $tax) {
             $name = $tax['name'];
             $rate = (float)($tax['rate'] ?? 0.0);
@@ -294,23 +295,104 @@ class TaxCalculationService
             if ($regNo !== '') {
                 $taxNumbers[$name] = "{$name}: {$regNo}";
             }
+
+            $taxUpper = strtoupper(trim($name));
+            if (str_contains($taxUpper, 'PST') || str_contains($taxUpper, 'QST') || str_contains($taxUpper, 'RST')) {
+                $orgHasPst = true;
+            }
+        }
+
+        $positiveSubtotal = 0.0;
+        $pstEligibleSubtotal = 0.0;
+        foreach ($items as $item) {
+            $amt = (float)($item['amount'] ?? $item->amount ?? 0);
+            if ($amt > 0) {
+                $positiveSubtotal += $amt;
+                [, $pstFlag] = self::resolveItemTaxFlags($item, $orgId);
+                if ($pstFlag) {
+                    $pstEligibleSubtotal += $amt;
+                }
+            }
         }
 
         foreach ($items as $idx => $item) {
             $amount = (float)($item['amount'] ?? $item->amount ?? 0);
             $isTaxable = self::isItemTaxable($item, $orgId);
 
+            [$itemGstEnabled, $itemPstEnabled] = self::resolveItemTaxFlags($item, $orgId);
+
+            $isDiscount = !empty($item['is_package_discount']) 
+                || !empty($item['is_agent_discount']) 
+                || !empty($item['is_code_discount'])
+                || (isset($item['description']) && (
+                    str_starts_with($item['description'], 'Package Discount') || 
+                    str_starts_with($item['description'], 'Agent Discount') ||
+                    str_starts_with($item['description'], 'Coupon Discount') ||
+                    str_starts_with($item['description'], 'Discount:')
+                ));
+
             $itemTaxTotal = 0.0;
             $itemTaxBreakdown = [];
+            $itemGstAmount = 0.0;
+            $itemPstAmount = 0.0;
 
             if ($isTaxable) {
+                // 1. Calculate taxes configured by Organization
                 foreach ($applicableTaxes as $tax) {
                     $name = $tax['name'];
                     $rate = (float)($tax['rate'] ?? 0.0);
+                    $taxUpper = strtoupper(trim($name));
+                    $isGstType = str_contains($taxUpper, 'GST') || str_contains($taxUpper, 'HST');
+                    $isPstType = str_contains($taxUpper, 'PST') || str_contains($taxUpper, 'QST') || str_contains($taxUpper, 'RST');
+
+                    // If GST is disabled on this specific item, skip GST
+                    if ($isGstType && !$itemGstEnabled && !$isDiscount) {
+                        continue;
+                    }
+
+                    // Under Choice A: If Org configured PST ($orgHasPst is true), PST applies to all taxable items
                     $itemTax = round($amount * ($rate / 100), 2);
                     $taxTally[$name]['amount'] += $itemTax;
                     $itemTaxTotal += $itemTax;
-                    $itemTaxBreakdown[$name] = $itemTax;
+                    $itemTaxBreakdown[$name] = ($itemTaxBreakdown[$name] ?? 0.0) + $itemTax;
+
+                    if ($isGstType) {
+                        $itemGstAmount += $itemTax;
+                    } elseif ($isPstType) {
+                        $itemPstAmount += $itemTax;
+                    }
+                }
+
+                // 2. Choice A rule: If Org did NOT set PST ($orgHasPst is false), but this item has PST enabled
+                if (!$orgHasPst && $itemPstEnabled && !$isDiscount) {
+                    $pstRate = self::getProvincialPstRate($normProvince);
+                    $pstName = self::getProvincialPstName($normProvince);
+
+                    if (!isset($taxTally[$pstName])) {
+                        $taxTally[$pstName] = [
+                            'rate' => $pstRate,
+                            'amount' => 0.0,
+                            'registration_number' => '',
+                        ];
+                    }
+
+                    $itemPstTax = round($amount * ($pstRate / 100), 2);
+                    $taxTally[$pstName]['amount'] += $itemPstTax;
+                    $itemTaxTotal += $itemPstTax;
+                    $itemTaxBreakdown[$pstName] = ($itemTaxBreakdown[$pstName] ?? 0.0) + $itemPstTax;
+                    $itemPstAmount += $itemPstTax;
+                }
+
+                // If this is a discount line and fallback PST exists in taxTally, reduce fallback PST proportionally
+                if (!$orgHasPst && $isDiscount && isset($taxTally['PST']) && $positiveSubtotal > 0 && $pstEligibleSubtotal > 0) {
+                    $pstRate = self::getProvincialPstRate($normProvince);
+                    $pstName = self::getProvincialPstName($normProvince);
+                    $pstRatio = $pstEligibleSubtotal / $positiveSubtotal;
+                    $discountPst = round(($amount * $pstRatio) * ($pstRate / 100), 2);
+                    $taxTally[$pstName]['amount'] += $discountPst;
+                    $itemTaxTotal += $discountPst;
+                    $itemTaxBreakdown[$pstName] = ($itemTaxBreakdown[$pstName] ?? 0.0) + $discountPst;
+                    $itemPstAmount += $discountPst;
                 }
             }
 
@@ -320,7 +402,11 @@ class TaxCalculationService
                 'index' => $idx,
                 'amount' => $amount,
                 'is_taxable' => $isTaxable,
+                'gst_enabled' => $itemGstEnabled,
+                'pst_enabled' => ($orgHasPst || $itemPstEnabled),
                 'tax_amount' => round($itemTaxTotal, 2),
+                'gst_amount' => round($itemGstAmount, 2),
+                'pst_amount' => round($itemPstAmount, 2),
                 'tax_breakdown' => $itemTaxBreakdown,
             ];
         }
@@ -352,6 +438,79 @@ class TaxCalculationService
     }
 
     /**
+     * Resolve effective statutory provincial PST/QST/RST rate.
+     */
+    public static function getProvincialPstRate(?string $province): float
+    {
+        $prov = self::normalizeProvince($province);
+        return match ($prov) {
+            'BC' => 7.0,
+            'SK' => 6.0,
+            'MB' => 7.0,
+            'QC' => 9.975,
+            default => 7.0,
+        };
+    }
+
+    /**
+     * Resolve effective statutory provincial PST tax name.
+     */
+    public static function getProvincialPstName(?string $province): string
+    {
+        $prov = self::normalizeProvince($province);
+        return match ($prov) {
+            'QC' => 'QST',
+            'MB' => 'RST',
+            default => 'PST',
+        };
+    }
+
+    /**
+     * Resolve effective GST and PST flags for an individual item.
+     */
+    public static function resolveItemTaxFlags($item, ?int $orgId = null): array
+    {
+        $gstEnabled = null;
+        $pstEnabled = null;
+
+        if (is_array($item)) {
+            if (isset($item['gst_enabled'])) $gstEnabled = (bool)$item['gst_enabled'];
+            if (isset($item['pst_enabled'])) $pstEnabled = (bool)$item['pst_enabled'];
+        } elseif (is_object($item)) {
+            if (isset($item->gst_enabled)) $gstEnabled = (bool)$item->gst_enabled;
+            if (isset($item->pst_enabled)) $pstEnabled = (bool)$item->pst_enabled;
+        }
+
+        $service = null;
+        if (is_array($item)) {
+            $service = $item['service'] ?? null;
+            if (!$service && !empty($item['service_id'])) {
+                $service = is_numeric($item['service_id'])
+                    ? \App\Models\Service::find($item['service_id'])
+                    : \App\Models\Service::where('uuid', $item['service_id'])->first();
+            }
+        } elseif (is_object($item)) {
+            $service = $item->service ?? null;
+            if (!$service && !empty($item->service_id)) {
+                $service = is_numeric($item->service_id)
+                    ? \App\Models\Service::find($item->service_id)
+                    : \App\Models\Service::where('uuid', $item->service_id)->first();
+            }
+        }
+
+        if ($service) {
+            [$resolvedGst, $resolvedPst] = InvoiceController::resolveServiceTaxFlags($service, $orgId);
+            $gstEnabled = $resolvedGst;
+            $pstEnabled = $resolvedPst;
+        }
+
+        return [
+            $gstEnabled ?? true,
+            $pstEnabled ?? false,
+        ];
+    }
+
+    /**
      * Determine if a given line item is taxable.
      */
     protected static function isItemTaxable($item, ?int $orgId = null): bool
@@ -364,21 +523,8 @@ class TaxCalculationService
             return (bool)$item->is_taxable;
         }
 
-        // 2. Check service model if present
-        $service = null;
-        if (isset($item['service'])) {
-            $service = $item['service'];
-        } elseif (is_object($item) && isset($item->service)) {
-            $service = $item->service;
-        }
-
-        if ($service) {
-            [$gst, $pst] = InvoiceController::resolveServiceTaxFlags($service, $orgId);
-            return $gst || $pst;
-        }
-
-        // Default to taxable
-        return true;
+        [$gst, $pst] = self::resolveItemTaxFlags($item, $orgId);
+        return $gst || $pst;
     }
 
     /**
@@ -394,10 +540,7 @@ class TaxCalculationService
 
         foreach ($items as $idx => $item) {
             $amount = (float)($item['amount'] ?? $item->amount ?? 0);
-            if (isset($item['gst_enabled']) || isset($item['pst_enabled'])) {
-                $gstEnabled = (bool)($item['gst_enabled'] ?? true);
-                $pstEnabled = (bool)($item['pst_enabled'] ?? false);
-            } elseif (!empty($item['is_package_discount']) 
+            if (!empty($item['is_package_discount']) 
                 || !empty($item['is_agent_discount']) 
                 || !empty($item['is_code_discount'])
                 || (isset($item['description']) && (
@@ -409,7 +552,7 @@ class TaxCalculationService
                 $gstEnabled = true;
                 $pstEnabled = true;
             } else {
-                [$gstEnabled, $pstEnabled] = InvoiceController::resolveServiceTaxFlags($service, $orgId);
+                [$gstEnabled, $pstEnabled] = self::resolveItemTaxFlags($item, $orgId);
             }
 
             $taxCalc = InvoiceController::calculateLineItemTax($province, $amount, $gstEnabled, $pstEnabled);

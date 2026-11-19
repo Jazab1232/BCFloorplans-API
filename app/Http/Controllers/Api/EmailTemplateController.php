@@ -23,7 +23,7 @@ class EmailTemplateController extends Controller
      */
     public function index(Request $request)
     {
-        $query = EmailTemplate::query();
+        $query = EmailTemplate::with('organization:id,uuid,name');
 
         if ($request->filled('event_type')) {
             $eventType = $request->query('event_type');
@@ -51,6 +51,20 @@ class EmailTemplateController extends Controller
             $query->where('is_active', filter_var($request->query('is_active'), FILTER_VALIDATE_BOOLEAN));
         }
 
+        if ($request->filled('organization_id') && $request->query('organization_id') !== 'all') {
+            $orgParam = $request->query('organization_id');
+            if (is_numeric($orgParam)) {
+                $query->where('organization_id', (int) $orgParam);
+            } else {
+                $org = Organization::where('uuid', $orgParam)->first();
+                if ($org) {
+                    $query->where('organization_id', $org->id);
+                } else {
+                    $query->whereRaw('1 = 0');
+                }
+            }
+        }
+
         $templates = $query->orderBy('sort_order')->orderBy('title')->get();
         return response()->json([
             'success' => true,
@@ -72,6 +86,7 @@ class EmailTemplateController extends Controller
             'tags' => 'nullable|array',
             'sort_order' => 'nullable|integer',
             'is_active' => 'nullable|boolean',
+            'organization_id' => 'nullable',
         ]);
 
         if ($validator->fails()) {
@@ -97,12 +112,23 @@ class EmailTemplateController extends Controller
             }
         }
 
+        // Normalize organization_id
+        if (array_key_exists('organization_id', $data)) {
+            if (!empty($data['organization_id']) && !is_numeric($data['organization_id'])) {
+                $org = Organization::where('uuid', $data['organization_id'])->first();
+                $data['organization_id'] = $org ? $org->id : null;
+            } elseif (empty($data['organization_id'])) {
+                $data['organization_id'] = null;
+            }
+        }
+
         // Sanitize content: auto-extract Base64 images to S3 & strip Tailwind CSS bloat
         if (isset($data['content']) && is_string($data['content'])) {
             $data['content'] = app(\App\Services\EmailTemplateSanitizerService::class)->sanitize($data['content']);
         }
 
         $template = EmailTemplate::create($data);
+        $template->load('organization:id,uuid,name');
 
         return response()->json([
             'success' => true,
@@ -116,7 +142,7 @@ class EmailTemplateController extends Controller
      */
     public function show($uuid)
     {
-        $template = EmailTemplate::where('uuid', $uuid)->firstOrFail();
+        $template = EmailTemplate::with('organization:id,uuid,name')->where('uuid', $uuid)->firstOrFail();
         return response()->json([
             'success' => true,
             'data' => $template
@@ -139,6 +165,7 @@ class EmailTemplateController extends Controller
             'tags' => 'nullable|array',
             'sort_order' => 'nullable|integer',
             'is_active' => 'nullable|boolean',
+            'organization_id' => 'nullable',
         ]);
 
         if ($validator->fails()) {
@@ -164,12 +191,23 @@ class EmailTemplateController extends Controller
             }
         }
 
+        // Normalize organization_id
+        if (array_key_exists('organization_id', $data)) {
+            if (!empty($data['organization_id']) && !is_numeric($data['organization_id'])) {
+                $org = Organization::where('uuid', $data['organization_id'])->first();
+                $data['organization_id'] = $org ? $org->id : null;
+            } elseif (empty($data['organization_id'])) {
+                $data['organization_id'] = null;
+            }
+        }
+
         // Sanitize content: auto-extract Base64 images to S3 & strip Tailwind CSS bloat
         if (array_key_exists('content', $data) && is_string($data['content'])) {
             $data['content'] = app(\App\Services\EmailTemplateSanitizerService::class)->sanitize($data['content']);
         }
 
         $template->update($data);
+        $template->load('organization:id,uuid,name');
 
         return response()->json([
             'success' => true,

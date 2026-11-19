@@ -39,10 +39,8 @@ return [
     'slot_booked' => [
         'label' => 'Slot Booked / Appointment Scheduled',
         'description' => 'Sent when a service appointment is scheduled/booked',
-        'recipients' => ['admin', 'agent', 'vendor'],
+        'recipients' => ['vendor'], // Appointment schedule is exclusively for vendor per service booked
         'defaults' => [
-            'admin' => true,
-            'agent' => false,
             'vendor' => true,
         ],
         'variables' => ['order_id', 'property_address', 'service_name', 'schedule_date', 'schedule_time', 'vendor_name', 'vendor_number', 'company_name', 'company_email', 'company_phone'],

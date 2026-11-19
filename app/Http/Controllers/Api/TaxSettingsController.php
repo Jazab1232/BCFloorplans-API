@@ -158,6 +158,8 @@ class TaxSettingsController extends Controller
                 'items.*.amount' => 'required|numeric',
                 'items.*.is_taxable' => 'nullable|boolean',
                 'items.*.service_id' => 'nullable',
+                'items.*.gst_enabled' => 'nullable|boolean',
+                'items.*.pst_enabled' => 'nullable|boolean',
                 'property_province' => 'nullable|string|max:100',
                 'property_country' => 'nullable|string|max:10',
                 'org_uuid' => 'nullable|string',

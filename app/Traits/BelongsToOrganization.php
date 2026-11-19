@@ -24,6 +24,7 @@ trait BelongsToOrganization
             // Super Admin Bypass
             $isSuperAdmin = ($user instanceof \App\Models\User) && (
                 trim(strtolower($user->email)) === 'todd@tojuco.com' ||
+                $user->organization_id === null ||
                 $user->roles()->where(function($q) {
                     $q->where('name', 'Super Admin')
                       ->orWhere('name', 'super admin')
