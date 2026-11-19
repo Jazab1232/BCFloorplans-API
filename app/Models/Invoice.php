@@ -862,7 +862,6 @@ class Invoice extends Model
              ->get();
          
          foreach ($invoices as $invoice) {
-             $paidSubtotal = 0;
              $allPaid = true;
              $hasItems = false;
              $paidServiceIdsForAgent = collect();
@@ -877,6 +876,21 @@ class Invoice extends Model
                      })
                      ->pluck('order_service_id');
              }
+
+             $paidServiceSubtotal = 0;
+             $paidTax = 0;
+             $totalPositiveServiceSubtotal = 0;
+             $totalGlobalDiscount = 0;
+
+             // Pre-calculate positive service total and global discount total (discount items without order_service_id)
+             foreach ($invoice->items as $item) {
+                 $amt = (float)$item->amount;
+                 if ($amt > 0 && $item->order_service_id) {
+                     $totalPositiveServiceSubtotal += $amt;
+                 } elseif ($amt < 0 && !$item->order_service_id) {
+                     $totalGlobalDiscount += $amt; // Negative number
+                 }
+             }
  
              foreach ($invoice->items as $item) {
                  $hasItems = true;
@@ -885,20 +899,44 @@ class Invoice extends Model
                      : ($item->orderService && $item->orderService->payment_status === 'PAID');
 
                  if ($servicePaidForInvoiceOwner) {
-                     $paidSubtotal += (float)$item->amount;
+                     $paidServiceSubtotal += (float)$item->amount;
+                     $itemTax = (float)$item->tax_amount;
+                     if ($itemTax == 0 && (float)$item->amount != 0) {
+                         $itemTax = round((float)$item->amount * ($invoice->tax_rate / 100), 2);
+                     }
+                     $paidTax += $itemTax;
                  } else {
                      $allPaid = false;
                  }
              }
  
              if (!$hasItems) continue;
- 
-             // Calculate paid total including tax
-             $calculatedPaidAmount = round($paidSubtotal * (1 + ($invoice->tax_rate / 100)), 2);
+
+             // If this invoice has global discount items (like Agent Discount or Coupon Discount),
+             // proportionally allocate the discount and its tax reduction to the paid services.
+             $allocatedDiscount = 0;
+             if ($totalPositiveServiceSubtotal > 0 && $totalGlobalDiscount < 0 && $paidServiceSubtotal > 0) {
+                 $discountRatio = $paidServiceSubtotal / $totalPositiveServiceSubtotal;
+                 $allocatedDiscount = $totalGlobalDiscount * $discountRatio; // negative
+                 
+                 // Also scale tax proportionally to the discounted base
+                 if ($paidServiceSubtotal > 0) {
+                     $taxScale = ($paidServiceSubtotal + $allocatedDiscount) / $paidServiceSubtotal;
+                     $paidTax = round($paidTax * $taxScale, 2);
+                 }
+             }
+
+             $paidSubtotal = round($paidServiceSubtotal + $allocatedDiscount, 2);
+             $calculatedPaidAmount = round($paidSubtotal + $paidTax, 2);
              
-             // We take the MAX of calculated net paid amount and existing net paid amount
-             $existingNetPaid = round((float)$invoice->paid_amount - (float)$invoice->refunded_amount, 2);
-             $newNetPaid = max($existingNetPaid, $calculatedPaidAmount);
+             // Direct payments recorded specifically on this invoice (e.g. Stripe checkout or manual payment)
+             $directNetPaid = (float) $invoice->payments()
+                 ->where('status', 'succeeded')
+                 ->where('payment_type', '!=', 'refund')
+                 ->sum('amount');
+
+             // Take the higher of direct payments received on this invoice vs the calculated share of paid services
+             $newNetPaid = max($directNetPaid, $calculatedPaidAmount);
              
              // Add back the refunded amount to get the gross paid amount to store
              $newPaidAmount = round($newNetPaid + (float)$invoice->refunded_amount, 2);

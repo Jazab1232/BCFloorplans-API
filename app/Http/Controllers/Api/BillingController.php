@@ -181,7 +181,7 @@ class BillingController extends Controller
             }
 
             // Service-level data
-            $services = $order->services->map(function ($service) use ($order, $payments, $orderStatus, $coAgentMultiplier, $orderInvoices) {
+            $services = $order->services->map(function ($service) use ($order, $payments, $orderStatus, $coAgentMultiplier, $orderInvoices, $taxRate) {
                 // Check if any payment covered this service
                 $relatedPayments = $payments->filter(function ($p) use ($service) {
                     return $p->order_service_id == $service->id;
@@ -238,6 +238,13 @@ class BillingController extends Controller
                     'original_amount' => $serviceBaseAmount,
                     'amount' => $serviceDiscountedAmount,
                     'discounted_amount' => $serviceDiscountedAmount,
+                    'tax_amount' => $serviceInvoice && (float)$serviceInvoice->tax_amount > 0 ? (float)$serviceInvoice->tax_amount : round($serviceDiscountedAmount * ($taxRate / 100), 2),
+                    'tax_rate' => $serviceInvoice && (float)$serviceInvoice->tax_rate > 0 ? (float)$serviceInvoice->tax_rate : $taxRate,
+                    'tax_details' => $serviceInvoice ? $serviceInvoice->tax_details : null,
+                    'total_amount' => $serviceInvoice && (float)$serviceInvoice->total > 0 ? (float)$serviceInvoice->total : round($serviceDiscountedAmount + ($serviceDiscountedAmount * ($taxRate / 100)), 2),
+                    'paid_amount' => $serviceInvoice ? (float)$serviceInvoice->paid_amount : null,
+                    'refunded_amount' => $serviceInvoice ? (float)$serviceInvoice->refunded_amount : null,
+                    'invoice_status' => $serviceInvoice ? $serviceInvoice->status : null,
                     'status' => $status,
                     'media_access' => $service->media_access,
                     'related_invoices' => $relatedPayments->map(fn($p) => [
@@ -270,6 +277,7 @@ class BillingController extends Controller
                 'grand_total' => $grandTotal,
                 'tax_amount' => $taxAmount,
                 'tax_rate' => $taxRate,
+                'tax_details' => $primaryInvoice ? $primaryInvoice->tax_details : null,
                 'total_paid' => $totalPaid,
                 'total_refunded' => $totalRefunded,
                 'remaining_amount' => $remainingAmount,

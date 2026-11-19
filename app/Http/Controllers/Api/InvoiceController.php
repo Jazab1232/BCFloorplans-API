@@ -1078,8 +1078,25 @@ class InvoiceController extends Controller
 
             DB::beginTransaction();
 
-            // Try to find a Stripe payment to refund against
-            $stripePayment = $invoice->payments->whereNotNull('stripe_payment_intent_id')->where('status', 'succeeded')->first();
+            // Try to find a Stripe payment to refund against.
+            // First check this invoice's own payment records; if not found, search
+            // across all succeeded payments on this order (the original charge may have
+            // been recorded against a service/child invoice instead of the main invoice).
+            $stripePayment = $invoice->payments
+                ->whereNotNull('stripe_payment_intent_id')
+                ->where('status', 'succeeded')
+                ->where('payment_type', '!=', 'refund')
+                ->first();
+
+            if (!$stripePayment && $invoice->order_id) {
+                $stripePayment = AgentPayment::where('order_id', $invoice->order_id)
+                    ->whereNotNull('stripe_payment_intent_id')
+                    ->where('status', 'succeeded')
+                    ->where('payment_type', '!=', 'refund')
+                    ->orderByDesc('paid_at')
+                    ->first();
+            }
+
             $refundMethod = 'manual';
             $stripeRefundId = null;
 
@@ -1093,6 +1110,15 @@ class InvoiceController extends Controller
                     ]);
                     $refundMethod = 'stripe';
                     $stripeRefundId = $refund->id;
+                } catch (\Stripe\Exception\InvalidRequestException $e) {
+                    // PI not found on this Stripe account (e.g. env mismatch, test vs live).
+                    // Fall back to a manual refund so the accounting record is still created.
+                    Log::warning('Stripe Refund skipped — PI not found on this account, falling back to manual: ' . $e->getMessage(), [
+                        'invoice_uuid' => $invoice->uuid,
+                        'stripe_pi'    => $stripePayment->stripe_payment_intent_id,
+                    ]);
+                    $refundMethod = 'manual';
+                    $stripeRefundId = null;
                 } catch (\Exception $e) {
                     DB::rollBack();
                     Log::error('Stripe Refund error: ' . $e->getMessage());
