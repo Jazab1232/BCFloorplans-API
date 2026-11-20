@@ -587,6 +587,27 @@ class Invoice extends Model
     }
 
     /**
+     * Determine the winning discount type for the entire order under Option B rules.
+     * Option B is an order-level decision: whichever single discount produces the greatest
+     * absolute savings across all order services governs every invoice of that order.
+     */
+    public static function getOrderWinningDiscountType(Order $order): string
+    {
+        $meta = $order->meta ?? [];
+        if (!empty($meta['winning_discount'])) {
+            return $meta['winning_discount'];
+        }
+
+        $order->loadMissing('services');
+        $allServices = $order->services;
+        $pkg   = static::resolvePackageDiscountForServices($order, $allServices, 1.0);
+        $agent = static::resolveAgentDiscountForInvoice($order, $allServices, 1.0);
+        $code  = static::resolveCodeDiscountsForInvoice($order, $allServices, 1.0);
+
+        return static::pickWinningDiscount($pkg, $agent, $code);
+    }
+
+    /**
      * Given resolved package discount, agent discount, and code/coupon discount (any may be null),
      * return which discount should appear on the invoice: 'package', 'agent', 'code', or 'none'.
      *
@@ -642,10 +663,10 @@ class Invoice extends Model
             ];
         }
 
-        $pkgDiscount = static::resolvePackageDiscountForServices($order, $services, $multiplier);
-        $agentDisc   = static::resolveAgentDiscountForInvoice($order, $services, $multiplier);
-        $codeDisc    = static::resolveCodeDiscountsForInvoice($order, $services, $multiplier);
-        $winner      = static::pickWinningDiscount($pkgDiscount, $agentDisc, $codeDisc);
+        $winner      = static::getOrderWinningDiscountType($order);
+        $pkgDiscount = ($winner === 'package') ? static::resolvePackageDiscountForServices($order, $services, $multiplier) : null;
+        $agentDisc   = ($winner === 'agent')   ? static::resolveAgentDiscountForInvoice($order, $services, $multiplier) : null;
+        $codeDisc    = ($winner === 'code')    ? static::resolveCodeDiscountsForInvoice($order, $services, $multiplier) : null;
 
         if ($winner === 'package' && $pkgDiscount) {
             $preparedItems[] = [
@@ -857,12 +878,49 @@ class Invoice extends Model
      {
          $invoices = static::where('order_id', $order->id)
              ->where('status', '!=', 'void')
-             ->where('status', '!=', 'refunded')
              ->with(['items.orderService'])
              ->get();
+
+         // Check if the order itself or any main/consolidated invoice is refunded
+         $isOrderRefunded = ($order->payment_status === 'REFUNDED') || $invoices->contains(function($inv) {
+             if ($inv->status !== 'refunded') return false;
+             $notes = strtolower($inv->notes ?? '');
+             if (str_contains($notes, 'consolidated') || str_contains($notes, 'main invoice') || str_contains($notes, 'order invoice') || str_contains($notes, 'add-on service invoice')) {
+                 return true;
+             }
+             if (str_contains($notes, 'service invoice:') || str_contains($notes, 'service invoice')) {
+                 return false;
+             }
+             $distinctServices = $inv->items->where('is_extra', false)->pluck('order_service_id')->filter()->unique();
+             return $distinctServices->count() > 1;
+         });
+
+         if ($isOrderRefunded) {
+             foreach ($invoices as $invoice) {
+                 if ($invoice->status === 'void') continue;
+                 $refAmt = (float)$invoice->refunded_amount > 0 
+                     ? (float)$invoice->refunded_amount 
+                     : ((float)$invoice->paid_amount > 0 ? (float)$invoice->paid_amount : (float)$invoice->total);
+                 $invoice->update([
+                     'status' => 'refunded',
+                     'refunded_amount' => $refAmt,
+                     'paid_amount' => $refAmt,
+                 ]);
+             }
+             if ($order->payment_status !== 'REFUNDED') {
+                 $order->update(['payment_status' => 'REFUNDED']);
+             }
+             return;
+         }
          
          foreach ($invoices as $invoice) {
+             if ($invoice->status === 'refunded') {
+                 continue;
+             }
+
              $allPaid = true;
+             $allRefunded = true;
+             $hasRefunded = false;
              $hasItems = false;
              $paidServiceIdsForAgent = collect();
 
@@ -891,12 +949,26 @@ class Invoice extends Model
                      $totalGlobalDiscount += $amt; // Negative number
                  }
              }
- 
+  
              foreach ($invoice->items as $item) {
+                 if ((float)$item->amount <= 0) {
+                     continue; // Skip discount / zero / negative items for service status checks
+                 }
                  $hasItems = true;
+
+                 $isItemRefunded = ($item->orderService && $item->orderService->payment_status === 'REFUNDED')
+                     || (float)$item->refunded_amount > 0
+                     || ($invoice->status === 'refunded')
+                     || ($order->payment_status === 'REFUNDED');
                  $servicePaidForInvoiceOwner = !empty($invoice->split_details['splits'])
                      ? ($item->order_service_id && $paidServiceIdsForAgent->contains($item->order_service_id))
                      : ($item->orderService && $item->orderService->payment_status === 'PAID');
+
+                 if ($isItemRefunded) {
+                     $hasRefunded = true;
+                 } else {
+                     $allRefunded = false;
+                 }
 
                  if ($servicePaidForInvoiceOwner) {
                      $paidServiceSubtotal += (float)$item->amount;
@@ -909,30 +981,96 @@ class Invoice extends Model
                      $allPaid = false;
                  }
              }
- 
+  
              if (!$hasItems) continue;
+
+             // If all services on this invoice are refunded, mark invoice refunded
+             if ($allRefunded) {
+                 $refAmt = (float)$invoice->refunded_amount > 0 
+                     ? (float)$invoice->refunded_amount 
+                     : ((float)$invoice->paid_amount > 0 ? (float)$invoice->paid_amount : (float)$invoice->total);
+                 $invoice->update([
+                     'status' => 'refunded',
+                     'refunded_amount' => $refAmt,
+                     'paid_amount' => $refAmt,
+                 ]);
+                 continue;
+             }
 
              // If all services in this invoice are paid (or all positive items are paid),
              // the calculated paid amount should exactly match the invoice's total (minus any refund).
              if ($allPaid || ($totalPositiveServiceSubtotal > 0 && $paidServiceSubtotal >= $totalPositiveServiceSubtotal)) {
                  $calculatedPaidAmount = (float) $invoice->total;
              } else {
-                 // If this invoice has global discount items (like Agent Discount or Coupon Discount),
-                 // proportionally allocate the discount and its tax reduction to the paid services.
-                 $allocatedDiscount = 0;
-                 if ($totalPositiveServiceSubtotal > 0 && $totalGlobalDiscount < 0 && $paidServiceSubtotal > 0) {
-                     $discountRatio = $paidServiceSubtotal / $totalPositiveServiceSubtotal;
-                     $allocatedDiscount = $totalGlobalDiscount * $discountRatio; // negative
-                     
-                     // Also scale tax proportionally to the discounted base
-                     if ($paidServiceSubtotal > 0) {
-                         $taxScale = ($paidServiceSubtotal + $allocatedDiscount) / $paidServiceSubtotal;
-                         $paidTax = round($paidTax * $taxScale, 2);
+                 // Check if there are actual payments on sibling service invoices for the paid services
+                 $paidOrderServiceIds = $invoice->items
+                     ->filter(function($item) use ($invoice, $paidServiceIdsForAgent) {
+                         if (!$item->order_service_id) return false;
+                         return !empty($invoice->split_details['splits'])
+                             ? $paidServiceIdsForAgent->contains($item->order_service_id)
+                             : ($item->orderService && $item->orderService->payment_status === 'PAID');
+                     })
+                     ->pluck('order_service_id')
+                     ->filter()
+                     ->toArray();
+
+                 $actualServicePayments = 0;
+                 if (!empty($paidOrderServiceIds)) {
+                     // 1. Direct payments explicitly assigned to these order services
+                     $servicePayments = AgentPayment::where('order_id', $invoice->order_id)
+                         ->whereIn('order_service_id', $paidOrderServiceIds)
+                         ->where('status', 'succeeded')
+                         ->where('payment_type', '!=', 'refund')
+                         ->get()
+                         ->unique(fn($p) => $p->stripe_session_id ?: ($p->stripe_payment_intent_id ?: $p->id));
+
+                     $coveredServiceIds = $servicePayments->pluck('order_service_id')->filter()->unique()->toArray();
+                     $actualServicePayments += (float) $servicePayments->sum('amount');
+
+                     // 2. For paid services not covered by direct order_service_id payments, sum from sibling service invoices
+                     $uncoveredServiceIds = array_diff($paidOrderServiceIds, $coveredServiceIds);
+                     if (!empty($uncoveredServiceIds)) {
+                         $siblingInvoices = static::where('order_id', $invoice->order_id)
+                             ->where('id', '!=', $invoice->id)
+                             ->whereIn('status', ['paid', 'partially_paid'])
+                             ->whereHas('items', function($q) use ($uncoveredServiceIds) {
+                                 $q->whereIn('order_service_id', $uncoveredServiceIds);
+                             })
+                             ->with('payments')
+                             ->get();
+
+                         foreach ($siblingInvoices as $sibInv) {
+                             $sibDirectPaid = (float) $sibInv->payments
+                                 ->where('status', 'succeeded')
+                                 ->where('payment_type', '!=', 'refund')
+                                 ->unique(fn($p) => $p->stripe_session_id ?: ($p->stripe_payment_intent_id ?: $p->id))
+                                 ->sum('amount');
+
+                             $actualServicePayments += ($sibDirectPaid > 0 ? $sibDirectPaid : (float) $sibInv->paid_amount);
+                         }
                      }
                  }
 
-                 $paidSubtotal = round($paidServiceSubtotal + $allocatedDiscount, 2);
-                 $calculatedPaidAmount = round($paidSubtotal + $paidTax, 2);
+                 if ($actualServicePayments > 0) {
+                     $calculatedPaidAmount = round($actualServicePayments, 2);
+                 } else {
+                     // If this invoice has global discount items (like Agent Discount or Coupon Discount),
+                     // proportionally allocate the discount and its tax reduction to the paid services.
+                     $allocatedDiscount = 0;
+                     if ($totalPositiveServiceSubtotal > 0 && $totalGlobalDiscount < 0 && $paidServiceSubtotal > 0) {
+                         $discountRatio = $paidServiceSubtotal / $totalPositiveServiceSubtotal;
+                         $allocatedDiscount = $totalGlobalDiscount * $discountRatio; // negative
+                         
+                         // Also scale tax proportionally to the discounted base
+                         if ($paidServiceSubtotal > 0) {
+                             $taxScale = ($paidServiceSubtotal + $allocatedDiscount) / $paidServiceSubtotal;
+                             $paidTax = round($paidTax * $taxScale, 2);
+                         }
+                     }
+
+                     $paidSubtotal = round($paidServiceSubtotal + $allocatedDiscount, 2);
+                     $calculatedPaidAmount = round($paidSubtotal + $paidTax, 2);
+                 }
              }
              
              // Direct payments recorded specifically on this invoice (e.g. Stripe checkout or manual payment)
@@ -944,6 +1082,12 @@ class Invoice extends Model
              // Take the higher of direct payments received on this invoice vs the calculated share of paid services
              $newNetPaid = max($directNetPaid, $calculatedPaidAmount);
              
+             // Check if remaining net balance is 2 cents or less when all services are covered (absorbs rounding differences)
+             $remainingNet = round((float)$invoice->total - $newNetPaid, 2);
+             if ($remainingNet <= 0.02 && $newNetPaid > 0 && ($allPaid || ($totalPositiveServiceSubtotal > 0 && $paidServiceSubtotal >= $totalPositiveServiceSubtotal))) {
+                 $newNetPaid = (float)$invoice->total;
+             }
+
              // Add back the refunded amount to get the gross paid amount to store
              $newPaidAmount = round($newNetPaid + (float)$invoice->refunded_amount, 2);
              
@@ -955,27 +1099,28 @@ class Invoice extends Model
              }
  
              $isFullyPaid = ($newNetPaid >= (float)$invoice->total) || $allPaid;
-             $wasGrossPaid = (float)$invoice->paid_amount >= (float)$invoice->total || $invoice->status === 'paid' || $invoice->status === 'partially_refunded';
 
              $updateData = [
                  'paid_amount' => $newPaidAmount,
              ];
 
              if ($isFullyPaid && !in_array($invoice->status, ['paid', 'partially_refunded'])) {
-                 $updateData['status'] = (float)$invoice->refunded_amount > 0 ? 'partially_refunded' : 'paid';
+                 $updateData['status'] = ($hasRefunded || (float)$invoice->refunded_amount > 0) ? 'partially_refunded' : 'paid';
                  $updateData['paid_at'] = $invoice->paid_at ?? now();
                  $updateData['paid_amount'] = (float)$invoice->refunded_amount > 0 
                      ? round((float)$invoice->total + (float)$invoice->refunded_amount, 2) 
                      : $invoice->total; // Ensure it's exactly total (plus refunded_amount if applicable)
              } elseif (!$isFullyPaid && $newNetPaid > 0) {
-                if ((float)$invoice->refunded_amount > 0) {
+                if ($hasRefunded || (float)$invoice->refunded_amount > 0) {
                     $updateData['status'] = 'partially_refunded';
                 } else {
                     $updateData['status'] = 'partially_paid';
                 }
              } elseif ($newNetPaid <= 0) {
-                 if ((float)$invoice->refunded_amount > 0) {
+                 if ($allRefunded || (float)$invoice->refunded_amount >= (float)$invoice->total) {
                      $updateData['status'] = 'refunded';
+                 } elseif ($hasRefunded || (float)$invoice->refunded_amount > 0) {
+                     $updateData['status'] = 'partially_refunded';
                  } else {
                      $updateData['status'] = 'issued';
                  }
@@ -1151,11 +1296,11 @@ class Invoice extends Model
                 }
 
                 // 4. Sync package/agent/code discount item on consolidated invoice — only the SINGLE WINNING discount shows.
-                // Rule: whichever gives the largest absolute saving wins (agent >= package >= code on tie).
-                $pkgDiscount   = static::resolvePackageDiscountForServices($order, $allOrderServices, $multiplier);
-                $agentDiscount = static::resolveAgentDiscountForInvoice($order, $allOrderServices, $multiplier);
-                $codeDiscount  = static::resolveCodeDiscountsForInvoice($order, $allOrderServices, $multiplier);
-                $winner        = static::pickWinningDiscount($pkgDiscount, $agentDiscount, $codeDiscount);
+                // Rule: whichever gives the largest absolute saving wins across the whole order (Option B).
+                $winner        = static::getOrderWinningDiscountType($order);
+                $pkgDiscount   = ($winner === 'package') ? static::resolvePackageDiscountForServices($order, $allOrderServices, $multiplier) : null;
+                $agentDiscount = ($winner === 'agent')   ? static::resolveAgentDiscountForInvoice($order, $allOrderServices, $multiplier) : null;
+                $codeDiscount  = ($winner === 'code')    ? static::resolveCodeDiscountsForInvoice($order, $allOrderServices, $multiplier) : null;
 
                 $existingPackageItem = $invoice->items
                     ->filter(function($i) {
@@ -1356,10 +1501,11 @@ class Invoice extends Model
                 }
 
                 // Sync package/agent/code discount item on service-specific invoice — only the SINGLE WINNING discount shows.
-                $pkgDiscount   = static::resolvePackageDiscountForServices($order, collect([$os]), $multiplier);
-                $agentDiscount = static::resolveAgentDiscountForInvoice($order, collect([$os]), $multiplier);
-                $codeDiscount  = static::resolveCodeDiscountsForInvoice($order, collect([$os]), $multiplier);
-                $winner        = static::pickWinningDiscount($pkgDiscount, $agentDiscount, $codeDiscount);
+                // Governed by the order-level Option B winner so all invoices remain consistent.
+                $winner        = static::getOrderWinningDiscountType($order);
+                $pkgDiscount   = ($winner === 'package') ? static::resolvePackageDiscountForServices($order, collect([$os]), $multiplier) : null;
+                $agentDiscount = ($winner === 'agent')   ? static::resolveAgentDiscountForInvoice($order, collect([$os]), $multiplier) : null;
+                $codeDiscount  = ($winner === 'code')    ? static::resolveCodeDiscountsForInvoice($order, collect([$os]), $multiplier) : null;
 
                 $existingPackageItem = $invoice->items
                     ->filter(function($i) {

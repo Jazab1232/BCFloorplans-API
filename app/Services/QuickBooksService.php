@@ -22,6 +22,7 @@ use QuickBooksOnline\API\Data\IPPReferenceType;
 use QuickBooksOnline\API\Data\IPPPayment;
 use QuickBooksOnline\API\Data\IPPLinkedTxn;
 use QuickBooksOnline\API\Data\IPPSalesItemLineDetail;
+use QuickBooksOnline\API\Data\IPPDiscountLineDetail;
 use QuickBooksOnline\API\Core\OAuth\OAuth2\OAuth2AccessToken;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;

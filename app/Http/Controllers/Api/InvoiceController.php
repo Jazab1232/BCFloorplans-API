@@ -263,6 +263,7 @@ class InvoiceController extends Controller
                         'data'    => [],
                     ]);
                 }
+                Invoice::syncOrderStatus($order);
                 $query->where('order_id', $order->id);
             }
 
@@ -293,6 +294,11 @@ class InvoiceController extends Controller
             ])->where('uuid', $uuid)->firstOrFail();
 
             $this->authorizeInvoiceAccess($invoice);
+
+            if ($invoice->order) {
+                Invoice::syncOrderStatus($invoice->order);
+                $invoice->refresh();
+            }
 
             return response()->json([
                 'success' => true,
@@ -960,6 +966,10 @@ class InvoiceController extends Controller
             DB::beginTransaction();
 
             $amount = (float) $request->amount;
+            $remainingBalance = max(0, round((float) $invoice->total - (float) $invoice->paid_amount, 2));
+            if ($amount > $remainingBalance && $remainingBalance > 0) {
+                $amount = $remainingBalance;
+            }
             $paymentMode = $request->payment_mode;
             $payerAgentId = $request->payer_uuid
                 ? Agent::where('uuid', $request->payer_uuid)->value('id')
@@ -1219,17 +1229,44 @@ class InvoiceController extends Controller
                     }
                 }
 
-                if ($invoice->order) {
-                    $otherUnrefundedInvoices = Invoice::where('order_id', $invoice->order_id)
-                        ->where('id', '!=', $invoice->id)
-                        ->whereNotIn('status', ['refunded', 'void'])
-                        ->exists();
+                $notes = strtolower($invoice->notes ?? '');
+                $distinctServices = $invoice->items->where('is_extra', false)->pluck('order_service_id')->filter()->unique();
+                $isMain = str_contains($notes, 'consolidated') || str_contains($notes, 'main invoice') || str_contains($notes, 'order invoice') || str_contains($notes, 'add-on service invoice') || ($distinctServices->count() > 1 && !str_contains($notes, 'service invoice'));
 
-                    if (!$otherUnrefundedInvoices) {
+                if ($isMain) {
+                    $siblingInvoices = Invoice::where('order_id', $invoice->order_id)
+                        ->where('id', '!=', $invoice->id)
+                        ->where('status', '!=', 'void')
+                        ->get();
+
+                    foreach ($siblingInvoices as $sib) {
+                        $sibRefAmt = (float)$sib->paid_amount > 0 ? (float)$sib->paid_amount : (float)$sib->total;
+                        $sib->update([
+                            'status' => 'refunded',
+                            'refunded_amount' => $sibRefAmt,
+                            'paid_amount' => $sibRefAmt,
+                        ]);
+                    }
+
+                    if ($invoice->order) {
                         $invoice->order->update([
                             'lock_materials' => $revokeMediaAccess ? true : false,
                             'payment_status' => 'REFUNDED',
                         ]);
+                    }
+                } else {
+                    if ($invoice->order) {
+                        $otherUnrefundedInvoices = Invoice::where('order_id', $invoice->order_id)
+                            ->where('id', '!=', $invoice->id)
+                            ->whereNotIn('status', ['refunded', 'void'])
+                            ->exists();
+
+                        if (!$otherUnrefundedInvoices) {
+                            $invoice->order->update([
+                                'lock_materials' => $revokeMediaAccess ? true : false,
+                                'payment_status' => 'REFUNDED',
+                            ]);
+                        }
                     }
                 }
             }

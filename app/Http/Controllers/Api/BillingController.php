@@ -109,8 +109,9 @@ class BillingController extends Controller
                 }
             }
 
-            // In-memory payment resolution
-            $rawPayments = $allPayments->get($order->id, collect());
+            // In-memory payment resolution with deduplication by stripe_session_id/intent
+            $rawPayments = $allPayments->get($order->id, collect())
+                ->unique(fn($p) => $p->stripe_session_id ?: ($p->stripe_payment_intent_id ?: $p->id));
             $payments = $isCoAgentOnOrder
                 ? $rawPayments->filter(fn($p) => $p->agent_id == $user->id)
                 : $rawPayments;
@@ -164,20 +165,34 @@ class BillingController extends Controller
             
             // Gross refunds
             $totalRefunded = abs((float)$payments->filter(fn($p) => $p->status === 'refunded' || (float)$p->amount < 0)->sum('amount'));
+            // Gross succeeded payments (before refunds)
+            $grossPaid = (float)$payments->filter(fn($p) => $p->status === 'succeeded' && (float)$p->amount > 0)->sum('amount');
             // Net Paid (succeeded payments minus refunds)
-            $totalPaid = (float)$payments->sum('amount');
+            $netPaid = max(0.0, round($grossPaid - $totalRefunded, 2));
 
-            $effectiveGrandTotal = max(0.0, $grandTotal - $totalRefunded);
-            $remainingAmount = max(0.0, $effectiveGrandTotal - $totalPaid);
+            $isOrderRefunded = ($order->payment_status === 'REFUNDED') 
+                || ($totalRefunded >= $grandTotal && $grandTotal > 0)
+                || ($orderInvoices->isNotEmpty() && $orderInvoices->every(fn($inv) => $inv->status === 'refunded'));
 
-            if ($totalRefunded >= $grandTotal || ($orderInvoices->isNotEmpty() && $orderInvoices->every(fn($inv) => $inv->status === 'refunded'))) {
+            if ($isOrderRefunded) {
                 $orderStatus = 'refunded';
-            } elseif ($totalPaid >= $effectiveGrandTotal) {
-                $orderStatus = 'paid';
-            } elseif ($totalPaid > 0) {
-                $orderStatus = 'partial';
+                $totalPaid = 0.0;
+                $remainingAmount = 0.0;
             } else {
-                $orderStatus = 'unpaid';
+                $effectiveGrandTotal = max(0.0, $grandTotal - $totalRefunded);
+                $remainingAmount = max(0.0, round($effectiveGrandTotal - $netPaid, 2));
+                if ($remainingAmount <= 0.02) {
+                    $remainingAmount = 0.0;
+                }
+
+                if ($netPaid >= $effectiveGrandTotal || $remainingAmount == 0) {
+                    $orderStatus = 'paid';
+                } elseif ($netPaid > 0) {
+                    $orderStatus = 'partial';
+                } else {
+                    $orderStatus = 'unpaid';
+                }
+                $totalPaid = $netPaid;
             }
 
             // Service-level data

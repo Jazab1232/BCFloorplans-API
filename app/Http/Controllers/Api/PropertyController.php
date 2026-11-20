@@ -125,26 +125,54 @@ class PropertyController extends Controller
                     $order->unapproved_files_count = $unapprovedCount;
                     $order->pending_approval_service_uuid = $firstServiceUuid;
 
-                    // 2. Calculate accurate payment status (PAID, PARTIALLY_PAID, REFUNDED, UNPAID)
+                    // 2. Calculate accurate payment status (PAID, PARTIALLY_PAID, REFUNDED, CANCELLED, UNPAID)
+                    $isCancelled = strtoupper(trim((string)$order->order_status)) === 'CANCELLED';
+                    if ($isCancelled) {
+                        $order->payment_status = 'CANCELLED';
+                        continue;
+                    }
+
                     $invoices = $order->invoices ? $order->invoices->whereNotIn('status', ['void']) : collect();
 
                     if ($invoices->isNotEmpty()) {
-                        $totalInvoice = (float) $invoices->sum('total');
-                        $totalPaid = (float) $invoices->sum('paid_amount');
-                        $allRefunded = $invoices->every(fn($i) => $i->status === 'refunded');
-                        $allPaid = $invoices->every(fn($i) => $i->status === 'paid');
-                        $hasPaid = $invoices->contains('status', 'paid');
-                        $hasPartial = $invoices->contains('status', 'partially_paid');
-                        $hasRefunded = $invoices->contains('status', 'refunded') || $invoices->contains('status', 'partially_refunded');
+                        $refundedInvoices = collect();
+                        $paidInvoices = collect();
+                        $partialInvoices = collect();
+                        $unpaidInvoices = collect();
 
-                        if ($allRefunded) {
+                        foreach ($invoices as $inv) {
+                            $invTotal = (float) ($inv->total ?? 0);
+                            $invPaid = (float) ($inv->paid_amount ?? 0);
+                            $invRefunded = (float) ($inv->refunded_amount ?? 0);
+                            $netPaid = max(0.0, $invPaid - $invRefunded);
+                            $invStatus = strtolower(trim((string)$inv->status));
+
+                            if ($invStatus === 'refunded' || ($invRefunded > 0 && $netPaid <= 0)) {
+                                $refundedInvoices->push($inv);
+                            } elseif ($invStatus === 'partially_refunded' || $invStatus === 'partially_paid' || ($netPaid > 0 && $netPaid < $invTotal)) {
+                                $partialInvoices->push($inv);
+                            } elseif ($invStatus === 'paid' || ($invTotal > 0 && $netPaid >= $invTotal)) {
+                                $paidInvoices->push($inv);
+                            } else {
+                                $unpaidInvoices->push($inv);
+                            }
+                        }
+
+                        if ($refundedInvoices->count() === $invoices->count()) {
+                            // All invoices are refunded -> Full Refunded
                             $order->payment_status = 'REFUNDED';
-                        } elseif ($allPaid || ($totalInvoice > 0 && $totalPaid >= $totalInvoice)) {
-                            $order->payment_status = 'PAID';
-                        } elseif ($hasPaid || $hasPartial || ($totalPaid > 0 && $totalPaid < $totalInvoice)) {
+                        } elseif ($partialInvoices->isNotEmpty()) {
+                            // Any invoice is partially paid/partially refunded -> Partially Paid
                             $order->payment_status = 'PARTIALLY_PAID';
-                        } elseif ($hasRefunded) {
-                            $order->payment_status = 'REFUNDED';
+                        } elseif ($paidInvoices->isNotEmpty() && $unpaidInvoices->isNotEmpty()) {
+                            // Some are paid and some are unpaid (with or without refunded invoices) -> Partially Paid
+                            $order->payment_status = 'PARTIALLY_PAID';
+                        } elseif ($paidInvoices->isNotEmpty() && $unpaidInvoices->isEmpty()) {
+                            // Non-refunded invoices are all paid (e.g. 1 refunded, others paid) -> Paid
+                            $order->payment_status = 'PAID';
+                        } elseif ($unpaidInvoices->isNotEmpty() && $paidInvoices->isEmpty()) {
+                            // Non-refunded invoices are all unpaid -> Unpaid
+                            $order->payment_status = 'UNPAID';
                         } else {
                             $order->payment_status = 'UNPAID';
                         }

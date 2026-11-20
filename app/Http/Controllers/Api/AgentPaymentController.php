@@ -45,6 +45,30 @@ class AgentPaymentController extends Controller
         $payerUuid = $request->payer_uuid; // Who is actually paying
         $url = $request->url;
 
+        // If an invoice is associated, ensure we never charge more than the remaining unpaid balance
+        if ($invoiceUuid) {
+            $invoiceRecord = \App\Models\Invoice::withoutGlobalScopes()->where('uuid', $invoiceUuid)->first();
+            if ($invoiceRecord) {
+                $invTotal = (float)$invoiceRecord->total;
+                $invPaid = (float)$invoiceRecord->paid_amount;
+                $invRefunded = (float)($invoiceRecord->refunded_amount ?? 0);
+                $netPaid = max(0, $invPaid - $invRefunded);
+                $remainingBalance = max(0, round($invTotal - $netPaid, 2));
+
+                if (in_array(strtolower($invoiceRecord->status), ['paid', 'refunded', 'partially_refunded', 'partial_refunded']) || ($invTotal > 0 && $remainingBalance <= 0)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'This invoice cannot be paid.',
+                    ], 400);
+                }
+
+                // If paying the full invoice or if requested amount exceeds remaining balance, cap to remaining balance
+                if ($paymentType === 'full' || (float)$amount > $remainingBalance) {
+                    $amount = number_format($remainingBalance, 2, '.', '');
+                }
+            }
+        }
+
         // BYO Stripe: resolve the organization from the order so we use the correct Stripe account
         $order = Order::find($request->order_id);
         $organization = $order ? Organization::find($order->organization_id) : null;
@@ -101,7 +125,7 @@ class AgentPaymentController extends Controller
                         'product_data' => [
                             'name' => $request->description ?? 'Agent Payment',
                         ],
-                        'unit_amount' => intval($amount * 100),
+                        'unit_amount' => intval(round((float)$amount * 100)),
                     ],
                     'quantity' => 1,
                 ]],
@@ -316,6 +340,16 @@ class AgentPaymentController extends Controller
         // Resolve invoice ID from UUID
         $invoiceId = $invoiceUuid ? \App\Models\Invoice::withoutGlobalScopes()->where('uuid', $invoiceUuid)->value('id') : null;
 
+        if (!$orderServiceId && $invoiceId) {
+            $invRecord = \App\Models\Invoice::withoutGlobalScopes()->with('items')->find($invoiceId);
+            if ($invRecord) {
+                $osIds = $invRecord->items->pluck('order_service_id')->filter()->unique();
+                if ($osIds->count() === 1) {
+                    $orderServiceId = $osIds->first();
+                }
+            }
+        }
+
         // Determine the effective agent_id for the payment record based on payment_mode
         // 'self' = payer takes ownership of the expense (agent's money)
         // 'on_behalf' = paying for the co-agent (co-agent's money)
@@ -324,12 +358,16 @@ class AgentPaymentController extends Controller
             $effectiveAgentId = $payerAgentId;
         }
 
-        // Check if this session already processed
+        // Check if this session already processed (idempotency check)
         $existingPayment = AgentPayment::where('stripe_session_id', $session->id)
-            ->whereNotNull('paid_at')
+            ->orWhere(function($q) use ($session) {
+                if (!empty($session->payment_intent)) {
+                    $q->where('stripe_payment_intent_id', $session->payment_intent);
+                }
+            })
             ->first();
 
-        if ($existingPayment) {
+        if ($existingPayment && $existingPayment->status === 'succeeded' && $existingPayment->paid_at !== null) {
             Log::info('Payment already processed for session: ' . $session->id);
 
             // Even if payment was already recorded, ensure renewal and invoice sync are executed
@@ -355,37 +393,85 @@ class AgentPaymentController extends Controller
             ]);
         }
 
-        // Start transaction for ALL database operations
+        // Acquire concurrency lock on session to prevent simultaneous duplicate requests from double-processing
+        $lockKey = "stripe_session_lock_{$session->id}";
+        $lock = \Illuminate\Support\Facades\Cache::lock($lockKey, 30);
+        try {
+            $lock->block(5);
+        } catch (\Illuminate\Contracts\Cache\LockTimeoutException $e) {
+            $existingPayment = AgentPayment::where('stripe_session_id', $session->id)->first();
+            if ($existingPayment) {
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Payment already processed.',
+                    'data' => [
+                        'payment_id' => $existingPayment->id,
+                        'status' => $existingPayment->status,
+                        'amount' => $existingPayment->amount,
+                        'currency' => $existingPayment->currency,
+                        'payment_mode' => $existingPayment->payment_mode,
+                    ],
+                ]);
+            }
+        }
+
+        // Start transaction for database operations
         DB::beginTransaction();
 
         try {
-            // Create or update payment record
-            $payment = AgentPayment::updateOrCreate(
-                ['stripe_session_id' => $session->id],
-                [
-                    'uuid' => (string) Str::uuid(),
-                    'agent_id' => $effectiveAgentId,
-                    'paid_by_agent_id' => $payerAgentId,
-                    'order_service_id' => $orderServiceId,
-                    'order_id' => $resolvedOrderId,
-                    'invoice_id' => $invoiceId,
-                    'amount' => $amount,
-                    'currency' => $currency,
-                    'session_created_at' => $session->created
-                        ? date('Y-m-d H:i:s', $session->created)
-                        : now(),
-                    'status' => $session->payment_status === 'paid' ? 'succeeded' : 'processing',
-                    'payment_method' => $session->payment_method_types[0] ?? 'card',
-                    'payment_type' => ($metadata['payment_type'] ?? 'full') === 'service' ? 'partial' : 'full',
-                    'payment_mode' => $paymentMode,
-                    'stripe_payment_intent_id' => $session->payment_intent,
-                    'stripe_customer_id' => $session->customer,
-                    'meta' => [
-                        'metadata' => $metadata,
-                        'source' => 'checkout_session',
+            // Re-check inside lock / transaction
+            $payment = AgentPayment::where('stripe_session_id', $session->id)
+                ->orWhere(function($q) use ($session) {
+                    if (!empty($session->payment_intent)) {
+                        $q->where('stripe_payment_intent_id', $session->payment_intent);
+                    }
+                })
+                ->first();
+
+            $alreadyPaidBefore = $payment && $payment->status === 'succeeded' && $payment->paid_at !== null;
+            if ($alreadyPaidBefore) {
+                DB::rollBack();
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Payment already processed.',
+                    'data' => [
+                        'payment_id' => $payment->id,
+                        'status' => $payment->status,
+                        'amount' => $payment->amount,
+                        'currency' => $payment->currency,
+                        'payment_mode' => $payment->payment_mode,
                     ],
-                ]
-            );
+                ]);
+            }
+
+            if (!$payment) {
+                $payment = new AgentPayment();
+                $payment->uuid = (string) Str::uuid();
+                $payment->stripe_session_id = $session->id;
+            }
+
+            $payment->fill([
+                'agent_id' => $effectiveAgentId,
+                'paid_by_agent_id' => $payerAgentId,
+                'order_service_id' => $orderServiceId,
+                'order_id' => $resolvedOrderId,
+                'invoice_id' => $invoiceId,
+                'amount' => $amount,
+                'currency' => $currency,
+                'session_created_at' => $session->created
+                    ? date('Y-m-d H:i:s', $session->created)
+                    : now(),
+                'status' => $session->payment_status === 'paid' ? 'succeeded' : 'processing',
+                'payment_method' => $session->payment_method_types[0] ?? 'card',
+                'payment_type' => ($metadata['payment_type'] ?? 'full') === 'service' ? 'partial' : 'full',
+                'payment_mode' => $paymentMode,
+                'stripe_payment_intent_id' => $session->payment_intent,
+                'stripe_customer_id' => $session->customer,
+                'meta' => [
+                    'metadata' => $metadata,
+                    'source' => 'checkout_session',
+                ],
+            ]);
 
             // Handle paid status
             if ($session->payment_status === 'paid') {
@@ -485,6 +571,10 @@ class AgentPaymentController extends Controller
             'message' => 'Unable to process Stripe session.',
             'error' => $e->getMessage(),
         ], 500);
+    } finally {
+        if (isset($lock)) {
+            try { $lock->release(); } catch (\Throwable $e) {}
+        }
     }
 }
 

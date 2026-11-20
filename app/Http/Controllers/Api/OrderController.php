@@ -615,10 +615,11 @@ class OrderController extends Controller
                 // Package won: remove any pre-saved agent_discount from meta so it doesn't
                 // appear on invoices (resolveAgentDiscountForInvoice reads meta['agent_discount']).
                 $currentMeta = $order->meta ?? [];
+                $currentMeta['winning_discount'] = 'package';
                 if (isset($currentMeta['agent_discount'])) {
                     unset($currentMeta['agent_discount']);
-                    $order->update(['meta' => $currentMeta]);
                 }
+                $order->update(['meta' => $currentMeta]);
             } elseif ($winnerType === 'code' && !empty($resolvedCodeDiscounts)) {
                 foreach ($resolvedCodeDiscounts as $rcd) {
                     $discountDetails[] = [
@@ -628,12 +629,18 @@ class OrderController extends Controller
                         'service_id' => $rcd['service_id'],
                     ];
                 }
-                // Code won: remove any pre-saved agent_discount from meta
+                // Code won: remove any pre-saved agent_discount and applied_package from meta
                 $currentMeta = $order->meta ?? [];
+                $currentMeta['winning_discount'] = 'code';
                 if (isset($currentMeta['agent_discount'])) {
                     unset($currentMeta['agent_discount']);
-                    $order->update(['meta' => $currentMeta]);
                 }
+                if (isset($currentMeta['applied_package'])) {
+                    unset($currentMeta['applied_package']);
+                }
+                $order->package_id = null;
+                $order->meta = $currentMeta;
+                $order->save();
             } elseif ($winnerType === 'agent' && $agentDiscount) {
                 $discountDetails[] = [
                     'model' => null,
@@ -646,10 +653,16 @@ class OrderController extends Controller
                 ];
 
                 $currentMeta = $order->meta ?? [];
+                $currentMeta['winning_discount'] = 'agent';
+                if (isset($currentMeta['applied_package'])) {
+                    unset($currentMeta['applied_package']);
+                }
                 $currentMeta['agent_discount'] = array_merge($agentDiscount['data'], [
                     'calculated_discount_amount' => $agentDiscount['discount_value']
                 ]);
-                $order->update(['meta' => $currentMeta]);
+                $order->package_id = null;
+                $order->meta = $currentMeta;
+                $order->save();
 
                 Log::info('✅ AGENT DISCOUNT APPLIED (STORE)', [
                     'agent_id' => $agent->id,
@@ -2476,11 +2489,12 @@ private function recalculateTotals($order, array $discounts, array $serviceAmoun
 
         // Package won: ensure agent_discount is NOT in meta (so invoices don't show it)
         $currentMeta = $order->meta ?? [];
+        $currentMeta['winning_discount'] = 'package';
         if (isset($currentMeta['agent_discount'])) {
             unset($currentMeta['agent_discount']);
-            $order->meta = $currentMeta;
-            $order->save();
         }
+        $order->meta = $currentMeta;
+        $order->save();
     } elseif ($winnerType === 'code' && !empty($resolvedCodeDiscounts)) {
         foreach ($resolvedCodeDiscounts as $rcd) {
             $val = $rcd['calculated_value'];
@@ -2498,13 +2512,18 @@ private function recalculateTotals($order, array $discounts, array $serviceAmoun
             ];
         }
 
-        // Code won: ensure agent_discount is NOT in meta
+        // Code won: ensure agent_discount and applied_package are NOT in meta
         $currentMeta = $order->meta ?? [];
+        $currentMeta['winning_discount'] = 'code';
         if (isset($currentMeta['agent_discount'])) {
             unset($currentMeta['agent_discount']);
-            $order->meta = $currentMeta;
-            $order->save();
         }
+        if (isset($currentMeta['applied_package'])) {
+            unset($currentMeta['applied_package']);
+        }
+        $order->package_id = null;
+        $order->meta = $currentMeta;
+        $order->save();
     } elseif ($winnerType === 'agent' && $agentDiscount) {
         $agentVal = min($agentDiscount['discount_value'], $totalAmount);
         if ($agentVal > 0) {
@@ -2521,9 +2540,14 @@ private function recalculateTotals($order, array $discounts, array $serviceAmoun
             ];
 
             $currentMeta = $order->meta ?? [];
+            $currentMeta['winning_discount'] = 'agent';
+            if (isset($currentMeta['applied_package'])) {
+                unset($currentMeta['applied_package']);
+            }
             $currentMeta['agent_discount'] = array_merge($agentDiscount['data'], [
                 'calculated_discount_amount' => $agentVal
             ]);
+            $order->package_id = null;
             $order->meta = $currentMeta;
             $order->save();
 
@@ -2533,6 +2557,14 @@ private function recalculateTotals($order, array $discounts, array $serviceAmoun
                 'discount_amount' => $agentVal,
             ]);
         }
+    } else {
+        $currentMeta = $order->meta ?? [];
+        $currentMeta['winning_discount'] = 'none';
+        unset($currentMeta['agent_discount']);
+        unset($currentMeta['applied_package']);
+        $order->package_id = null;
+        $order->meta = $currentMeta;
+        $order->save();
     }
 
     $finalAmount = $totalAmount - $discountAmount;
