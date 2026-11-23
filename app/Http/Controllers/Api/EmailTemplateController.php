@@ -329,6 +329,10 @@ class EmailTemplateController extends Controller
                 ?? \App\Models\Organization::withoutGlobalScopes()->first();
         }
 
+        if ($org && !$org->relationLoaded('domains')) {
+            $org->load('domains');
+        }
+
         $loadDefault = $request->boolean('load_default')
             || $request->query('load_default') === '1'
             || $request->query('load_default') === 'true'
@@ -521,6 +525,13 @@ class EmailTemplateController extends Controller
             }
         }
 
+        if (!$org && $order) {
+            $org = app(EmailDispatchService::class)->resolveOrganization($order);
+        }
+        if ($org && !$org->relationLoaded('domains')) {
+            $org->load('domains');
+        }
+
         // Target recipient details
         $recipientName = 'Valued Customer';
         $agentName = $order?->agent ? trim(($order->agent->first_name ?? '') . ' ' . ($order->agent->last_name ?? '')) : 'Agent';
@@ -620,7 +631,17 @@ class EmailTemplateController extends Controller
         $serviceUrl = $request->query('service_url') ?? ($extraData['service_url'] ?? '');
         if (empty($serviceUrl) && $order) {
             $agentDomain = app(EmailDispatchService::class)->resolvePortalBaseUrl('agent', $org);
-            $serviceUrl = $agentDomain . '/dashboard/file-manager/' . $order->uuid;
+            $query = [];
+            if ($orderService?->service?->uuid) {
+                $query['serviceId'] = $orderService->service->uuid;
+            } elseif ($orderService?->uuid) {
+                $query['serviceId'] = $orderService->uuid;
+            }
+            if ($order->property?->uuid) {
+                $query['listingId'] = $order->property->uuid;
+            }
+            $queryString = !empty($query) ? '?' . http_build_query($query) : '';
+            $serviceUrl = $agentDomain . '/dashboard/file-manager/' . $order->uuid . $queryString;
         }
 
         $oldDate = (!empty($request->query('old_date'))) ? $request->query('old_date') : (!empty($extraData['old_date']) ? $extraData['old_date'] : $slotDate);
@@ -833,6 +854,13 @@ class EmailTemplateController extends Controller
 
         if ($order) {
             $dispatchOptions['order'] = $order;
+            $previewOrg = $dispatchService->resolveOrganization($order);
+            if ($previewOrg) {
+                if (!$previewOrg->relationLoaded('domains')) {
+                    $previewOrg->load('domains');
+                }
+                $dispatchOptions['organization'] = $previewOrg;
+            }
         }
 
         if ($request->filled('vendor_uuid')) {

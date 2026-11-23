@@ -99,25 +99,44 @@ class SettingsService
             'allow_client_upload' => true,
             'require_payment_before_download' => false,
             'always_enable_sorting' => false,
+            'floorplan_names' => [
+                'Dimensions PDF',
+                'Branded Floor Plan',
+                'UnBranded Floor Plan',
+                'Branded Image',
+                'Unbranded Image',
+                'Additional Files',
+            ],
         ];
 
         // 2. Global platform tour_settings
+        $globalFloorplanNames = $effective['floorplan_names'];
         try {
             $globalSetting = Setting::whereNull('org_id')->where('key', 'tour_settings')->first();
             if ($globalSetting && is_array($globalSetting->value)) {
+                if (isset($globalSetting->value['floorplan_names']) && is_array($globalSetting->value['floorplan_names'])) {
+                    $globalFloorplanNames = $globalSetting->value['floorplan_names'];
+                }
                 $effective = array_merge($effective, array_filter($globalSetting->value, fn($v) => !is_null($v)));
             }
         } catch (\Throwable $e) {}
 
+        $isCustomFloorplans = false;
         // 3. Organization tour_settings
         if ($orgUuid) {
             try {
                 $orgSetting = Setting::where('org_id', $orgUuid)->where('key', 'tour_settings')->first();
                 if ($orgSetting && is_array($orgSetting->value)) {
+                    if (isset($orgSetting->value['floorplan_names']) && is_array($orgSetting->value['floorplan_names'])) {
+                        $isCustomFloorplans = true;
+                    }
                     $effective = array_merge($effective, array_filter($orgSetting->value, fn($v) => !is_null($v)));
                 }
             } catch (\Throwable $e) {}
         }
+
+        $effective['is_custom_floorplans'] = $isCustomFloorplans;
+        $effective['global_floorplan_names'] = $globalFloorplanNames;
 
         // 4. Agent personal overrides
         if ($agentUuid) {

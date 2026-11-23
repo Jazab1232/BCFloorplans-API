@@ -2521,19 +2521,7 @@ class TourController extends Controller
                     $organization = $orgId ? Organization::find($orgId) : null;
                     $stripe = StripeResolverService::clientForOrganization($organization);
 
-                    $agentDomain = env('NEXT_PUBLIC_DEFAULT_AGENT_DOMAIN', env('FRONTEND_URL', config('app.frontend_url', 'https://teams.tojuco.com')));
-                    if ($organization && $organization->is_whitelabel) {
-                        $domainRecord = $organization->domains()->where('portal_type', 'agent')->first();
-                        if ($domainRecord && !empty($domainRecord->domain)) {
-                            $agentDomain = $domainRecord->domain;
-                        } elseif (!empty($organization->domain)) {
-                            $agentDomain = $organization->domain;
-                        }
-                    }
-                    if (!str_starts_with($agentDomain, 'http://') && !str_starts_with($agentDomain, 'https://')) {
-                        $agentDomain = 'https://' . $agentDomain;
-                    }
-                    $agentDomain = rtrim($agentDomain, '/');
+                    $agentDomain = app(\App\Services\EmailDispatchService::class)->resolvePortalBaseUrl('agent', $organization);
 
                     $returnUrl = $request->input('return_url');
                     if (!empty($returnUrl)) {

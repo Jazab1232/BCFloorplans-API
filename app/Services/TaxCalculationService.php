@@ -351,7 +351,13 @@ class TaxCalculationService
                     }
 
                     // Under Choice A: If Org configured PST ($orgHasPst is true), PST applies to all taxable items
-                    $itemTax = round($amount * ($rate / 100), 2);
+                    $taxBase = $amount;
+                    if ($isPstType && $isDiscount && isset($item['pst_applicable_amount'])) {
+                        $taxBase = (float)$item['pst_applicable_amount'];
+                    } elseif ($isGstType && $isDiscount && isset($item['gst_applicable_amount'])) {
+                        $taxBase = (float)$item['gst_applicable_amount'];
+                    }
+                    $itemTax = round($taxBase * ($rate / 100), 2);
                     $taxTally[$name]['amount'] += $itemTax;
                     $itemTaxTotal += $itemTax;
                     $itemTaxBreakdown[$name] = ($itemTaxBreakdown[$name] ?? 0.0) + $itemTax;
@@ -383,12 +389,23 @@ class TaxCalculationService
                     $itemPstAmount += $itemPstTax;
                 }
 
-                // If this is a discount line and fallback PST exists in taxTally, reduce fallback PST proportionally
-                if (!$orgHasPst && $isDiscount && isset($taxTally['PST']) && $positiveSubtotal > 0 && $pstEligibleSubtotal > 0) {
+                // If this is a discount line and fallback PST exists in taxTally, reduce fallback PST
+                if (!$orgHasPst && $isDiscount && isset($taxTally['PST'])) {
                     $pstRate = self::getProvincialPstRate($normProvince);
                     $pstName = self::getProvincialPstName($normProvince);
-                    $pstRatio = $pstEligibleSubtotal / $positiveSubtotal;
-                    $discountPst = round(($amount * $pstRatio) * ($pstRate / 100), 2);
+
+                    if (isset($item['pst_applicable_amount'])) {
+                        $pstBase = (float)$item['pst_applicable_amount'];
+                        $discountPst = round($pstBase * ($pstRate / 100), 2);
+                    } elseif (isset($item['pst_enabled']) && !$item['pst_enabled']) {
+                        $discountPst = 0.0;
+                    } elseif ($positiveSubtotal > 0 && $pstEligibleSubtotal > 0) {
+                        $pstRatio = $pstEligibleSubtotal / $positiveSubtotal;
+                        $discountPst = round(($amount * $pstRatio) * ($pstRate / 100), 2);
+                    } else {
+                        $discountPst = 0.0;
+                    }
+
                     $taxTally[$pstName]['amount'] += $discountPst;
                     $itemTaxTotal += $discountPst;
                     $itemTaxBreakdown[$pstName] = ($itemTaxBreakdown[$pstName] ?? 0.0) + $discountPst;

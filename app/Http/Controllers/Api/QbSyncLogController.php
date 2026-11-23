@@ -226,19 +226,37 @@ class QbSyncLogController extends Controller
                 }
 
                 if ($log->action === 'pay_bill') {
-                    if (!$vInvoice->quickbooks_bill_id) {
-                        // Sync the bill first before paying
-                        $qbService->syncVendorInvoiceToQB($vInvoice);
-                        $vInvoice->refresh();
+                    if ($vInvoice->quickbooks_bill_payment_id) {
+                        $log->update([
+                            'status'        => 'success',
+                            'qb_entity_id'  => $vInvoice->quickbooks_bill_payment_id,
+                            'error_message' => null,
+                            'attempts'      => $log->attempts + 1,
+                        ]);
+                    } else {
+                        if (!$vInvoice->quickbooks_bill_id) {
+                            // Sync the bill first before paying
+                            $qbService->syncVendorInvoiceToQB($vInvoice);
+                            $vInvoice->refresh();
+                        }
+                        $result = $vInvoice->quickbooks_bill_id
+                            ? $qbService->syncVendorPayoutToQB($vInvoice)
+                            : null;
+                        $finalizeLog($result);
                     }
-                    $result = $vInvoice->quickbooks_bill_id
-                        ? $qbService->syncVendorPayoutToQB($vInvoice)
-                        : null;
                 } else {
-                    $result = $qbService->syncVendorInvoiceToQB($vInvoice);
+                    if ($vInvoice->quickbooks_bill_id) {
+                        $log->update([
+                            'status'        => 'success',
+                            'qb_entity_id'  => $vInvoice->quickbooks_bill_id,
+                            'error_message' => null,
+                            'attempts'      => $log->attempts + 1,
+                        ]);
+                    } else {
+                        $result = $qbService->syncVendorInvoiceToQB($vInvoice);
+                        $finalizeLog($result);
+                    }
                 }
-
-                $finalizeLog($result);
 
             } else {
                 $log->update([

@@ -352,6 +352,12 @@ class Invoice extends Model
         }
 
         $matchedServiceIds = $packageInfo['matched_service_ids'] ?? [];
+        if (empty($matchedServiceIds) && $packageId) {
+            $package = $order->package ?? \App\Models\Package::find($packageId);
+            if ($package) {
+                $matchedServiceIds = $package->services->pluck('id')->toArray();
+            }
+        }
         if (empty($matchedServiceIds)) {
             return null;
         }
@@ -413,16 +419,16 @@ class Invoice extends Model
 
     /**
      * Resolve agent discount for the given services being invoiced on an order.
-     *
-     * IMPORTANT: Only reads agent_discount from order->meta (snapshotted at order time).
-     * Does NOT fall back to the live agent profile to prevent the agent discount from
-     * appearing on invoices when a package discount was selected as the winner instead.
-     * The snapshot in order->meta['agent_discount'] is only written when agent discount
-     * was actually applied (i.e., it won over any package discount).
      */
     public static function resolveAgentDiscountForInvoice(Order $order, $services, float $multiplier = 1.0): ?array
     {
         $discountData = $order->meta['agent_discount'] ?? null;
+        if (empty($discountData) && $order->agent) {
+            $agent = $order->agent;
+            if (!empty($agent->agent_discount)) {
+                $discountData = $agent->agent_discount;
+            }
+        }
 
         if (empty($discountData)) {
             return null;
@@ -431,6 +437,35 @@ class Invoice extends Model
         $isActive = filter_var($discountData['is_active'] ?? true, FILTER_VALIDATE_BOOLEAN);
         if (!$isActive) {
             return null;
+        }
+
+        // Check expiry date
+        if (!empty($discountData['expiry_date'])) {
+            $expiry = \Carbon\Carbon::parse($discountData['expiry_date'])->endOfDay();
+            if ($expiry->isPast()) {
+                return null;
+            }
+        }
+
+        // Check minimum orders if specified
+        if (!empty($discountData['minimum_orders']) && (int)$discountData['minimum_orders'] > 0) {
+            $agent = $order->agent ?? \App\Models\Agent::find($order->agent_id);
+            $orderCount = $agent ? $agent->orders()->count() : 0;
+            if ($orderCount < (int)$discountData['minimum_orders']) {
+                return null;
+            }
+        }
+
+        // Check minimum spend against entire order total if specified
+        if (!empty($discountData['minimum_spend']) && (float)$discountData['minimum_spend'] > 0) {
+            $order->loadMissing('services');
+            $orderBaseTotal = (float) $order->services->sum(fn($os) => (float)$os->amount);
+            if ($orderBaseTotal <= 0 && isset($order->amount)) {
+                $orderBaseTotal = (float)$order->amount;
+            }
+            if ($orderBaseTotal < (float)$discountData['minimum_spend']) {
+                return null;
+            }
         }
 
         $amount = (float)($discountData['amount'] ?? 0);
@@ -479,6 +514,7 @@ class Invoice extends Model
             'amount' => -abs($discountAmount),
             'description' => $desc,
             'is_percentage' => $isPercentage,
+            'rate' => $amount,
         ];
     }
 
@@ -526,44 +562,58 @@ class Invoice extends Model
         $discountNames = [];
 
         foreach ($discountsData as $disc) {
-            $discountId = $disc['discount_id'] ?? null;
-            if (!$discountId) continue;
+            $discountId = $disc['discount_id'] ?? $disc['id'] ?? $disc['uuid'] ?? $disc['code'] ?? null;
+            if (!$discountId && empty($disc['value'])) continue;
 
-            $discModel = is_numeric($discountId)
-                ? \App\Models\Discount::find((int)$discountId)
-                : \App\Models\Discount::where('uuid', $discountId)->first();
+            $discModel = null;
+            if ($discountId) {
+                if (is_numeric($discountId)) {
+                    $discModel = \App\Models\Discount::find((int)$discountId);
+                } elseif (\Illuminate\Support\Str::isUuid((string)$discountId)) {
+                    $discModel = \App\Models\Discount::where('uuid', $discountId)->first();
+                } else {
+                    $discModel = \App\Models\Discount::where('code_key', $discountId)->first();
+                }
+            }
 
-            $val = (float)($disc['value'] ?? $discModel?->percentage ?? $discModel?->quantity ?? 0);
-            $type = $disc['type'] ?? $discModel?->type ?? 'manual';
+            // Determine percentage rate vs fixed dollar discount
+            $pctRate = null;
+            if (!empty($discModel?->percentage) && (float)$discModel->percentage > 0) {
+                $pctRate = (float)$discModel->percentage;
+            } elseif (!empty($disc['percentage']) && (float)$disc['percentage'] > 0) {
+                $pctRate = (float)$disc['percentage'];
+            } elseif (!empty($disc['is_percentage']) && filter_var($disc['is_percentage'], FILTER_VALIDATE_BOOLEAN)) {
+                $pctRate = (float)($disc['value'] ?? 0);
+            }
+
+            $isPercentage = ($pctRate !== null && $pctRate > 0);
+            $fixedVal = (float)($disc['value'] ?? $discModel?->amount ?? $discModel?->quantity ?? 0);
+            if (!$isPercentage && $fixedVal <= 0) continue;
 
             // Service-scoped discount: check if this service matches
             $serviceId = $disc['service_id'] ?? null;
             if ($serviceId) {
                 $matchingService = $servicesCollection->first(function ($os) use ($serviceId) {
-                    return $os->id == $serviceId || $os->service_id == $serviceId || ($os->service?->uuid === $serviceId);
+                    return $os->id == $serviceId || $os->service_id == $serviceId || (($os->service?->uuid ?? null) === $serviceId);
                 });
                 if (!$matchingService) {
                     continue;
                 }
                 // Use os->amount (the calculated total) — option->amount is just the per-unit rate
                 $svcAmount = (float)$matchingService->amount;
-                $discAmt = match ($type) {
-                    'quantity', 'code' => min($svcAmount, $val),
-                    'manual' => round($svcAmount * ($val / 100), 2),
-                    default => 0,
-                };
+                $discAmt = $isPercentage
+                    ? round($svcAmount * ($pctRate / 100), 2)
+                    : min($svcAmount, $fixedVal);
                 $totalDiscountAmount += round($discAmt * $multiplier, 2);
             } else {
                 // Order-wide discount: distribute proportionally
-                $fullDiscAmt = match ($type) {
-                    'quantity', 'code' => min($totalOrderAmount, $val),
-                    'manual' => round($totalOrderAmount * ($val / 100), 2),
-                    default => 0,
-                };
+                $fullDiscAmt = $isPercentage
+                    ? round($totalOrderAmount * ($pctRate / 100), 2)
+                    : min($totalOrderAmount, $fixedVal);
                 $totalDiscountAmount += round($fullDiscAmt * $ratio * $multiplier, 2);
             }
 
-            $name = $discModel?->name ?? $discModel?->code_key ?? 'Coupon';
+            $name = $discModel?->name ?? $discModel?->code_key ?? $disc['code'] ?? $disc['name'] ?? 'Coupon';
             if (!in_array($name, $discountNames)) {
                 $discountNames[] = $name;
             }
@@ -605,6 +655,56 @@ class Invoice extends Model
         $code  = static::resolveCodeDiscountsForInvoice($order, $allServices, 1.0);
 
         return static::pickWinningDiscount($pkg, $agent, $code);
+    }
+
+    /**
+     * Resolve the winning discount for a single service line item under the Per-Service Maximum Discount Engine.
+     * Evaluates Candidate Package, Candidate Agent, and Candidate Coupon, and returns the one giving the largest savings.
+     * Tie-breaking preference: agent >= package >= code.
+     */
+    public static function resolveServiceWinningDiscount(Order $order, $orderService, float $multiplier = 1.0): ?array
+    {
+        // Guard: check if the service item is explicitly marked non-discountable
+        $isDiscountable = true;
+        if (is_object($orderService)) {
+            if (isset($orderService->is_discountable) && !$orderService->is_discountable) {
+                $isDiscountable = false;
+            } elseif (isset($orderService->service) && is_object($orderService->service) && isset($orderService->service->is_discountable) && !$orderService->service->is_discountable) {
+                $isDiscountable = false;
+            }
+        } elseif (is_array($orderService)) {
+            if (isset($orderService['is_discountable']) && !$orderService['is_discountable']) {
+                $isDiscountable = false;
+            }
+        }
+        if (!$isDiscountable) {
+            return null;
+        }
+
+        $pkgCandidate   = static::resolvePackageDiscountForServices($order, collect([$orderService]), $multiplier);
+        $agentCandidate = static::resolveAgentDiscountForInvoice($order, collect([$orderService]), $multiplier);
+        $codeCandidate  = static::resolveCodeDiscountsForInvoice($order, collect([$orderService]), $multiplier);
+
+        $rawPkg   = $pkgCandidate   ? abs((float)($pkgCandidate['amount']   ?? 0)) : 0.0;
+        $rawAgent = $agentCandidate ? abs((float)($agentCandidate['amount'] ?? 0)) : 0.0;
+        $rawCode  = $codeCandidate  ? abs((float)($codeCandidate['amount']  ?? 0)) : 0.0;
+
+        $maxVal = max($rawPkg, $rawAgent, $rawCode);
+        if ($maxVal <= 0.001) {
+            return null;
+        }
+
+        // Tie-break priority: Agent >= Package >= Code
+        if ($rawAgent >= $maxVal) {
+            $agentCandidate['type'] = 'agent_discount';
+            return $agentCandidate;
+        }
+        if ($rawPkg >= $maxVal) {
+            $pkgCandidate['type'] = 'package_discount';
+            return $pkgCandidate;
+        }
+        $codeCandidate['type'] = 'code_discount';
+        return $codeCandidate;
     }
 
     /**
@@ -663,43 +763,134 @@ class Invoice extends Model
             ];
         }
 
-        $winner      = static::getOrderWinningDiscountType($order);
-        $pkgDiscount = ($winner === 'package') ? static::resolvePackageDiscountForServices($order, $services, $multiplier) : null;
-        $agentDisc   = ($winner === 'agent')   ? static::resolveAgentDiscountForInvoice($order, $services, $multiplier) : null;
-        $codeDisc    = ($winner === 'code')    ? static::resolveCodeDiscountsForInvoice($order, $services, $multiplier) : null;
+        $isSingleService = collect($services)->count() === 1;
 
-        if ($winner === 'package' && $pkgDiscount) {
-            $preparedItems[] = [
-                'order_service' => (collect($services)->count() === 1 ? collect($services)->first() : null),
-                'service' => null,
-                'amount' => $pkgDiscount['amount'],
-                'description' => $pkgDiscount['description'],
-                'is_taxable' => true,
-                'is_package_discount' => true,
-                'package_id' => $pkgDiscount['package_id'],
-            ];
-        }
+        if ($isSingleService) {
+            $singleService = collect($services)->first();
+            $winner = static::resolveServiceWinningDiscount($order, $singleService, $multiplier);
+            if ($winner) {
+                $type = $winner['type'] ?? '';
+                $preparedItems[] = [
+                    'order_service' => $singleService,
+                    'service' => null,
+                    'amount' => $winner['amount'],
+                    'description' => $winner['description'],
+                    'is_taxable' => true,
+                    'is_package_discount' => ($type === 'package_discount'),
+                    'is_agent_discount'   => ($type === 'agent_discount'),
+                    'is_code_discount'    => ($type === 'code_discount'),
+                    'package_id'          => $winner['package_id'] ?? null,
+                ];
+            }
+        } else {
+            // Consolidated invoice: aggregate winning discounts by category across all services
+            $totalPkgDiscount = 0.0;
+            $pkgPstDiscount = 0.0;
+            $pkgGstDiscount = 0.0;
+            $pkgName = 'Package';
+            $pkgId = $order->package_id ?? null;
 
-        if ($winner === 'agent' && $agentDisc) {
-            $preparedItems[] = [
-                'order_service' => (collect($services)->count() === 1 ? collect($services)->first() : null),
-                'service' => null,
-                'amount' => $agentDisc['amount'],
-                'description' => $agentDisc['description'],
-                'is_taxable' => true,
-                'is_agent_discount' => true,
-            ];
-        }
+            $totalAgentDiscount = 0.0;
+            $agentPstDiscount = 0.0;
+            $agentGstDiscount = 0.0;
+            $agentName = 'Agent Discount';
 
-        if ($winner === 'code' && $codeDisc) {
-            $preparedItems[] = [
-                'order_service' => (collect($services)->count() === 1 ? collect($services)->first() : null),
-                'service' => null,
-                'amount' => $codeDisc['amount'],
-                'description' => $codeDisc['description'],
-                'is_taxable' => true,
-                'is_code_discount' => true,
-            ];
+            $totalCodeDiscount = 0.0;
+            $codePstDiscount = 0.0;
+            $codeGstDiscount = 0.0;
+            $codeNames = [];
+
+            foreach ($services as $os) {
+                $winner = static::resolveServiceWinningDiscount($order, $os, $multiplier);
+                if (!$winner) continue;
+
+                $amt = abs((float)($winner['amount'] ?? 0));
+                if ($amt <= 0) continue;
+
+                [$hasGst, $hasPst] = \App\Http\Controllers\Api\InvoiceController::resolveServiceTaxFlags($os->service, $order->organization_id);
+
+                $type = $winner['type'] ?? '';
+                if ($type === 'package_discount') {
+                    $totalPkgDiscount += $amt;
+                    if ($hasPst) $pkgPstDiscount += $amt;
+                    if ($hasGst) $pkgGstDiscount += $amt;
+                    if (!empty($winner['package_name'])) $pkgName = $winner['package_name'];
+                    if (!empty($winner['package_id'])) $pkgId = $winner['package_id'];
+                } elseif ($type === 'agent_discount') {
+                    $totalAgentDiscount += $amt;
+                    if ($hasPst) $agentPstDiscount += $amt;
+                    if ($hasGst) $agentGstDiscount += $amt;
+                    if (!empty($winner['name'])) $agentName = $winner['name'];
+                } elseif ($type === 'code_discount') {
+                    $totalCodeDiscount += $amt;
+                    if ($hasPst) $codePstDiscount += $amt;
+                    if ($hasGst) $codeGstDiscount += $amt;
+                    $desc = $winner['description'] ?? 'Coupon';
+                    if (!in_array($desc, $codeNames)) $codeNames[] = $desc;
+                }
+            }
+
+            if ($totalPkgDiscount > 0) {
+                $pkgInfo = $order->meta['applied_package'] ?? null;
+                $pctText = $pkgInfo['package_discount_percentage'] ?? $pkgInfo['package_discount'] ?? null;
+                $desc = "Package Discount: {$pkgName}";
+                if ($pctText) $desc .= " ({$pctText}%)";
+                if ($multiplier < 1) $desc .= " (" . round($multiplier * 100, 1) . "%)";
+
+                $preparedItems[] = [
+                    'order_service' => null,
+                    'service' => null,
+                    'amount' => -round($totalPkgDiscount, 2),
+                    'description' => $desc,
+                    'is_taxable' => true,
+                    'is_package_discount' => true,
+                    'package_id' => $pkgId,
+                    'pst_applicable_amount' => -round($pkgPstDiscount, 2),
+                    'gst_applicable_amount' => -round($pkgGstDiscount, 2),
+                    'pst_enabled' => ($pkgPstDiscount > 0),
+                    'gst_enabled' => ($pkgGstDiscount > 0),
+                ];
+            }
+
+            if ($totalAgentDiscount > 0) {
+                $agentData = $order->meta['agent_discount'] ?? ($order->agent?->agent_discount ?? []);
+                $rate = $agentData['amount'] ?? null;
+                $isPct = filter_var($agentData['is_percentage'] ?? true, FILTER_VALIDATE_BOOLEAN);
+                $desc = "Agent Discount: {$agentName}";
+                if ($rate) $desc .= $isPct ? " ({$rate}%)" : " (\${$rate} OFF)";
+                if ($multiplier < 1) $desc .= " (" . round($multiplier * 100, 1) . "%)";
+
+                $preparedItems[] = [
+                    'order_service' => null,
+                    'service' => null,
+                    'amount' => -round($totalAgentDiscount, 2),
+                    'description' => $desc,
+                    'is_taxable' => true,
+                    'is_agent_discount' => true,
+                    'pst_applicable_amount' => -round($agentPstDiscount, 2),
+                    'gst_applicable_amount' => -round($agentGstDiscount, 2),
+                    'pst_enabled' => ($agentPstDiscount > 0),
+                    'gst_enabled' => ($agentGstDiscount > 0),
+                ];
+            }
+
+            if ($totalCodeDiscount > 0) {
+                $desc = !empty($codeNames) ? implode(', ', $codeNames) : 'Coupon Discount';
+                if ($multiplier < 1) $desc .= " (" . round($multiplier * 100, 1) . "%)";
+
+                $preparedItems[] = [
+                    'order_service' => null,
+                    'service' => null,
+                    'amount' => -round($totalCodeDiscount, 2),
+                    'description' => $desc,
+                    'is_taxable' => true,
+                    'is_code_discount' => true,
+                    'pst_applicable_amount' => -round($codePstDiscount, 2),
+                    'gst_applicable_amount' => -round($codeGstDiscount, 2),
+                    'pst_enabled' => ($codePstDiscount > 0),
+                    'gst_enabled' => ($codeGstDiscount > 0),
+                ];
+            }
         }
 
         $country = $order->property->country ?? 'CA';
@@ -721,11 +912,19 @@ class Invoice extends Model
 
             $meta = null;
             if ($isPkgDisc) {
-                $meta = ['type' => 'package_discount', 'package_id' => $prep['package_id']];
+                $meta = ['type' => 'package_discount', 'package_id' => $prep['package_id'] ?? null];
             } elseif ($isAgentDisc) {
                 $meta = ['type' => 'agent_discount'];
             } elseif ($isCodeDisc) {
                 $meta = ['type' => 'code_discount'];
+            }
+            if ($meta) {
+                if (isset($prep['pst_applicable_amount'])) {
+                    $meta['pst_applicable_amount'] = $prep['pst_applicable_amount'];
+                }
+                if (isset($prep['gst_applicable_amount'])) {
+                    $meta['gst_applicable_amount'] = $prep['gst_applicable_amount'];
+                }
             }
 
             $items[] = [
@@ -774,7 +973,7 @@ class Invoice extends Model
      */
     public function recalculateTotals()
     {
-        $this->load(['items.orderService.service', 'items.orderService.option', 'agent', 'order.property']);
+        $this->load(['items.orderService.service', 'items.orderService.option', 'agent', 'order.property', 'order.services.service']);
 
         $province = 'BC';
         if (isset($this->order->property->state) && !empty($this->order->property->state)) {
@@ -787,30 +986,96 @@ class Invoice extends Model
 
         $country = $this->order->property->country ?? 'CA';
 
+        $distinctServices = $this->items->where('is_extra', false)->pluck('order_service_id')->filter()->unique();
+        $isServiceInvoice = ($distinctServices->count() === 1 && !str_starts_with($this->notes ?? '', 'Consolidated'));
+
         $calcItemsInput = [];
-        foreach ($this->items as $item) {
+        $itemMetaUpdates = [];
+        foreach ($this->items as $idx => $item) {
             $qty = $item->quantity ?: 1;
             $price = (float)$item->unit_price;
             $amount = round($qty * $price, 2);
 
             $service = $item->orderService?->service;
-            $isPkgDisc = ($item->meta['type'] ?? null) === 'package_discount' || str_starts_with($item->description ?? '', 'Package Discount');
+            $metaType = $item->meta['type'] ?? null;
+            $desc = $item->description ?? '';
+            $isPkgDisc = $metaType === 'package_discount' || str_starts_with($desc, 'Package Discount');
+            $isAgentDisc = $metaType === 'agent_discount' || str_starts_with($desc, 'Agent Discount');
+            $isCodeDisc = $metaType === 'code_discount' || str_starts_with($desc, 'Coupon Discount') || str_starts_with($desc, 'Promo Discount');
+            $isDiscount = $isPkgDisc || $isAgentDisc || $isCodeDisc || $amount < 0;
+
             $isTaxable = null;
             if ($item->gst_enabled !== null || $item->pst_enabled !== null) {
                 $isTaxable = (bool)$item->gst_enabled || (bool)$item->pst_enabled;
-            } elseif ($isPkgDisc) {
+            } elseif ($isDiscount) {
                 $isTaxable = true;
             }
 
-            $calcItemsInput[] = [
+            $pstApplicable = isset($item->meta['pst_applicable_amount']) ? (float)$item->meta['pst_applicable_amount'] : null;
+            $gstApplicable = isset($item->meta['gst_applicable_amount']) ? (float)$item->meta['gst_applicable_amount'] : null;
+
+            // Fallback for legacy discount items that do not yet have pst_applicable_amount in meta:
+            if ($isDiscount && $pstApplicable === null && $this->order) {
+                $multiplier = (float)($this->split_details['percentage'] ?? 100) / 100;
+                if ($multiplier <= 0) $multiplier = 1.0;
+
+                if ($isServiceInvoice) {
+                    $orderSvc = $this->order->services->firstWhere('id', $distinctServices->first());
+                    if ($orderSvc && $orderSvc->service) {
+                        [$hasGst, $hasPst] = \App\Http\Controllers\Api\InvoiceController::resolveServiceTaxFlags($orderSvc->service, $this->organization_id);
+                        $pstApplicable = $hasPst ? $amount : 0.0;
+                        $gstApplicable = $hasGst ? $amount : 0.0;
+                    }
+                } else {
+                    // Consolidated invoice: aggregate from order services for this discount category
+                    $targetType = $isPkgDisc ? 'package_discount' : ($isAgentDisc ? 'agent_discount' : ($isCodeDisc ? 'code_discount' : null));
+                    if ($targetType) {
+                        $discPst = 0.0;
+                        $discGst = 0.0;
+                        foreach ($this->order->services as $os) {
+                            $winner = static::resolveServiceWinningDiscount($this->order, $os, $multiplier);
+                            if (!$winner || ($winner['type'] ?? '') !== $targetType) continue;
+                            $wAmt = abs((float)($winner['amount'] ?? 0));
+                            if ($wAmt <= 0) continue;
+                            [$hasGst, $hasPst] = \App\Http\Controllers\Api\InvoiceController::resolveServiceTaxFlags($os->service, $this->organization_id);
+                            if ($hasPst) $discPst += $wAmt;
+                            if ($hasGst) $discGst += $wAmt;
+                        }
+                        $pstApplicable = -round($discPst, 2);
+                        $gstApplicable = -round($discGst, 2);
+                    }
+                }
+            }
+
+            $input = [
                 'amount' => $amount,
                 'service' => $service,
                 'is_taxable' => $isTaxable,
                 'is_package_discount' => $isPkgDisc,
+                'is_agent_discount' => $isAgentDisc,
+                'is_code_discount' => $isCodeDisc,
                 'description' => $item->description,
-                'gst_enabled' => $item->gst_enabled,
-                'pst_enabled' => $item->pst_enabled,
+                'gst_enabled' => $item->gst_enabled ?? ($gstApplicable !== null ? ($gstApplicable < 0) : true),
+                'pst_enabled' => $item->pst_enabled ?? ($pstApplicable !== null ? ($pstApplicable < 0) : false),
             ];
+
+            if ($pstApplicable !== null) {
+                $input['pst_applicable_amount'] = $pstApplicable;
+                $input['pst_enabled'] = ($pstApplicable < 0);
+            }
+            if ($gstApplicable !== null) {
+                $input['gst_applicable_amount'] = $gstApplicable;
+                $input['gst_enabled'] = ($gstApplicable < 0);
+            }
+
+            if ($isDiscount && ($pstApplicable !== null || $gstApplicable !== null)) {
+                $meta = $item->meta ?? [];
+                if ($pstApplicable !== null) $meta['pst_applicable_amount'] = $pstApplicable;
+                if ($gstApplicable !== null) $meta['gst_applicable_amount'] = $gstApplicable;
+                $itemMetaUpdates[$idx] = $meta;
+            }
+
+            $calcItemsInput[] = $input;
         }
 
         $taxCalc = \App\Services\TaxCalculationService::calculateTaxes(
@@ -823,14 +1088,18 @@ class Invoice extends Model
         foreach ($this->items as $idx => $item) {
             $calcItem = $taxCalc['items'][$idx] ?? [];
             $amount = $calcItem['amount'] ?? round(($item->quantity ?: 1) * (float)$item->unit_price, 2);
-            $item->update([
+            $updateData = [
                 'amount' => $amount,
                 'tax_amount' => $calcItem['tax_amount'] ?? 0.0,
                 'gst_amount' => $calcItem['gst_amount'] ?? ($calcItem['tax_breakdown']['GST'] ?? 0.0),
                 'pst_amount' => $calcItem['pst_amount'] ?? ($calcItem['tax_breakdown']['PST'] ?? 0.0),
                 'gst_enabled' => $calcItem['gst_enabled'] ?? true,
                 'pst_enabled' => $calcItem['pst_enabled'] ?? false,
-            ]);
+            ];
+            if (isset($itemMetaUpdates[$idx])) {
+                $updateData['meta'] = $itemMetaUpdates[$idx];
+            }
+            $item->update($updateData);
         }
 
         $subtotal = $taxCalc['subtotal'];
@@ -1117,7 +1386,7 @@ class Invoice extends Model
                     $updateData['status'] = 'partially_paid';
                 }
              } elseif ($newNetPaid <= 0) {
-                 if ($allRefunded || (float)$invoice->refunded_amount >= (float)$invoice->total) {
+                 if ($allRefunded || ((float)$invoice->total > 0 && (float)$invoice->refunded_amount >= (float)$invoice->total)) {
                      $updateData['status'] = 'refunded';
                  } elseif ($hasRefunded || (float)$invoice->refunded_amount > 0) {
                      $updateData['status'] = 'partially_refunded';
@@ -1216,6 +1485,11 @@ class Invoice extends Model
                 continue;
             }
 
+            // Historical Data Guard: Never recompute or alter paid or refunded invoices
+            if (in_array($invoice->status, ['paid', 'refunded']) || (float)$invoice->paid_amount > 0) {
+                continue;
+            }
+
             // Determine multiplier (for split invoices)
             $multiplier = 1.0;
             if (!empty($invoice->split_details['splits'])) {
@@ -1295,12 +1569,55 @@ class Invoice extends Model
                     }
                 }
 
-                // 4. Sync package/agent/code discount item on consolidated invoice — only the SINGLE WINNING discount shows.
-                // Rule: whichever gives the largest absolute saving wins across the whole order (Option B).
-                $winner        = static::getOrderWinningDiscountType($order);
-                $pkgDiscount   = ($winner === 'package') ? static::resolvePackageDiscountForServices($order, $allOrderServices, $multiplier) : null;
-                $agentDiscount = ($winner === 'agent')   ? static::resolveAgentDiscountForInvoice($order, $allOrderServices, $multiplier) : null;
-                $codeDiscount  = ($winner === 'code')    ? static::resolveCodeDiscountsForInvoice($order, $allOrderServices, $multiplier) : null;
+                // 4. Sync package/agent/code discount items on consolidated invoice — multi-category line items under Per-Service Best Discount Engine.
+                // Evaluates each service's winning discount and aggregates by category.
+                $totalPkgDiscount = 0.0;
+                $pkgPstDiscount = 0.0;
+                $pkgGstDiscount = 0.0;
+                $pkgDiscountName = 'Package';
+                $pkgId = $order->package_id ?? null;
+
+                $totalAgentDiscount = 0.0;
+                $agentPstDiscount = 0.0;
+                $agentGstDiscount = 0.0;
+                $agentDiscountName = 'Agent Discount';
+                $agentRate = null;
+
+                $totalCodeDiscount = 0.0;
+                $codePstDiscount = 0.0;
+                $codeGstDiscount = 0.0;
+                $codeDiscountNames = [];
+
+                foreach ($allOrderServices as $os) {
+                    $winner = static::resolveServiceWinningDiscount($order, $os, $multiplier);
+                    if (!$winner) continue;
+
+                    $amt = abs((float)($winner['amount'] ?? 0));
+                    if ($amt <= 0) continue;
+
+                    [$hasGst, $hasPst] = \App\Http\Controllers\Api\InvoiceController::resolveServiceTaxFlags($os->service, $order->organization_id);
+
+                    $type = $winner['type'] ?? '';
+                    if ($type === 'package_discount') {
+                        $totalPkgDiscount += $amt;
+                        if ($hasPst) $pkgPstDiscount += $amt;
+                        if ($hasGst) $pkgGstDiscount += $amt;
+                        if (!empty($winner['package_name'])) $pkgDiscountName = $winner['package_name'];
+                        if (!empty($winner['package_id'])) $pkgId = $winner['package_id'];
+                    } elseif ($type === 'agent_discount') {
+                        $totalAgentDiscount += $amt;
+                        if ($hasPst) $agentPstDiscount += $amt;
+                        if ($hasGst) $agentGstDiscount += $amt;
+                        if (!empty($winner['name'])) $agentDiscountName = $winner['name'];
+                        if (!empty($winner['rate'])) $agentRate = $winner['rate'];
+                    } elseif ($type === 'code_discount') {
+                        $totalCodeDiscount += $amt;
+                        if ($hasPst) $codePstDiscount += $amt;
+                        if ($hasGst) $codeGstDiscount += $amt;
+                        $desc = $winner['description'] ?? 'Coupon';
+                        if (!in_array($desc, $codeDiscountNames)) $codeDiscountNames[] = $desc;
+                    }
+                }
 
                 $existingPackageItem = $invoice->items
                     ->filter(function($i) {
@@ -1320,126 +1637,193 @@ class Invoice extends Model
                     })
                     ->first();
 
-                // Apply winner and delete losers
-                if ($winner === 'package' && $pkgDiscount) {
-                    $expectedDiscountAmt  = (float)$pkgDiscount['amount'];
-                    $expectedDiscountDesc = $pkgDiscount['description'];
+                // 4.1 Sync Package Discount line
+                if ($totalPkgDiscount > 0) {
+                    $expectedPkgAmt = -round($totalPkgDiscount, 2);
+                    $expectedPkgPst = -round($pkgPstDiscount, 2);
+                    $expectedPkgGst = -round($pkgGstDiscount, 2);
+                    $expectedPkgPstEnabled = ($pkgPstDiscount > 0);
+                    $expectedPkgGstEnabled = ($pkgGstDiscount > 0);
+                    $pkgInfo = $order->meta['applied_package'] ?? null;
+                    $pctText = $pkgInfo['package_discount_percentage'] ?? $pkgInfo['package_discount'] ?? null;
+                    $expectedPkgDesc = "Package Discount: {$pkgDiscountName}";
+                    if ($pctText) {
+                        $expectedPkgDesc .= " ({$pctText}%)";
+                    }
+                    if ($multiplier < 1) {
+                        $expectedPkgDesc .= " (" . round($multiplier * 100, 1) . "%)";
+                    }
+
+                    $expectedMeta = [
+                        'type' => 'package_discount',
+                        'package_id' => $pkgId,
+                        'pst_applicable_amount' => $expectedPkgPst,
+                        'gst_applicable_amount' => $expectedPkgGst,
+                    ];
 
                     if ($existingPackageItem) {
-                        if ((float)$existingPackageItem->amount != $expectedDiscountAmt || (float)$existingPackageItem->unit_price != $expectedDiscountAmt || $existingPackageItem->description != $expectedDiscountDesc) {
+                        $currentMeta = $existingPackageItem->meta ?? [];
+                        if (
+                            (float)$existingPackageItem->amount != $expectedPkgAmt ||
+                            (float)$existingPackageItem->unit_price != $expectedPkgAmt ||
+                            $existingPackageItem->description != $expectedPkgDesc ||
+                            ($currentMeta['pst_applicable_amount'] ?? null) != $expectedPkgPst ||
+                            ($currentMeta['gst_applicable_amount'] ?? null) != $expectedPkgGst ||
+                            (bool)$existingPackageItem->pst_enabled != $expectedPkgPstEnabled ||
+                            (bool)$existingPackageItem->gst_enabled != $expectedPkgGstEnabled
+                        ) {
                             $existingPackageItem->update([
-                                'unit_price' => $expectedDiscountAmt,
-                                'amount' => $expectedDiscountAmt,
-                                'description' => $expectedDiscountDesc,
+                                'unit_price' => $expectedPkgAmt,
+                                'amount' => $expectedPkgAmt,
+                                'description' => $expectedPkgDesc,
                                 'is_extra' => true,
-                                'meta' => ['type' => 'package_discount', 'package_id' => $pkgDiscount['package_id']],
+                                'pst_enabled' => $expectedPkgPstEnabled,
+                                'gst_enabled' => $expectedPkgGstEnabled,
+                                'meta' => $expectedMeta,
                             ]);
                             $hasChanged = true;
                         }
                     } else {
                         $invoice->items()->create([
                             'order_service_id' => null,
-                            'description' => $expectedDiscountDesc,
+                            'description' => $expectedPkgDesc,
                             'quantity' => 1,
-                            'unit_price' => $expectedDiscountAmt,
-                            'amount' => $expectedDiscountAmt,
+                            'unit_price' => $expectedPkgAmt,
+                            'amount' => $expectedPkgAmt,
                             'is_extra' => true,
-                            'meta' => ['type' => 'package_discount', 'package_id' => $pkgDiscount['package_id']],
+                            'pst_enabled' => $expectedPkgPstEnabled,
+                            'gst_enabled' => $expectedPkgGstEnabled,
+                            'meta' => $expectedMeta,
                         ]);
                         $hasChanged = true;
                     }
-                    if ($existingAgentItem) {
-                        $existingAgentItem->delete();
-                        $hasChanged = true;
+                } elseif ($existingPackageItem) {
+                    $existingPackageItem->delete();
+                    $hasChanged = true;
+                }
+
+                // 4.2 Sync Agent Discount line
+                if ($totalAgentDiscount > 0) {
+                    $expectedAgentAmt = -round($totalAgentDiscount, 2);
+                    $expectedAgentPst = -round($agentPstDiscount, 2);
+                    $expectedAgentGst = -round($agentGstDiscount, 2);
+                    $expectedAgentPstEnabled = ($agentPstDiscount > 0);
+                    $expectedAgentGstEnabled = ($agentGstDiscount > 0);
+                    $agentData = $order->meta['agent_discount'] ?? ($order->agent?->agent_discount ?? []);
+                    $rateText = $agentData['amount'] ?? $agentRate;
+                    $isPct = filter_var($agentData['is_percentage'] ?? true, FILTER_VALIDATE_BOOLEAN);
+                    $expectedAgentDesc = "Agent Discount: {$agentDiscountName}";
+                    if ($rateText) {
+                        $expectedAgentDesc .= $isPct ? " ({$rateText}%)" : " (\${$rateText} OFF)";
                     }
-                    if ($existingCodeItem) {
-                        $existingCodeItem->delete();
-                        $hasChanged = true;
+                    if ($multiplier < 1) {
+                        $expectedAgentDesc .= " (" . round($multiplier * 100, 1) . "%)";
                     }
-                } elseif ($winner === 'agent' && $agentDiscount) {
-                    $expectedDiscountAmt  = (float)$agentDiscount['amount'];
-                    $expectedDiscountDesc = $agentDiscount['description'];
+
+                    $expectedMeta = [
+                        'type' => 'agent_discount',
+                        'pst_applicable_amount' => $expectedAgentPst,
+                        'gst_applicable_amount' => $expectedAgentGst,
+                    ];
 
                     if ($existingAgentItem) {
-                        if ((float)$existingAgentItem->amount != $expectedDiscountAmt || (float)$existingAgentItem->unit_price != $expectedDiscountAmt || $existingAgentItem->description != $expectedDiscountDesc) {
+                        $currentMeta = $existingAgentItem->meta ?? [];
+                        if (
+                            (float)$existingAgentItem->amount != $expectedAgentAmt ||
+                            (float)$existingAgentItem->unit_price != $expectedAgentAmt ||
+                            $existingAgentItem->description != $expectedAgentDesc ||
+                            ($currentMeta['pst_applicable_amount'] ?? null) != $expectedAgentPst ||
+                            ($currentMeta['gst_applicable_amount'] ?? null) != $expectedAgentGst ||
+                            (bool)$existingAgentItem->pst_enabled != $expectedAgentPstEnabled ||
+                            (bool)$existingAgentItem->gst_enabled != $expectedAgentGstEnabled
+                        ) {
                             $existingAgentItem->update([
-                                'unit_price' => $expectedDiscountAmt,
-                                'amount' => $expectedDiscountAmt,
-                                'description' => $expectedDiscountDesc,
+                                'unit_price' => $expectedAgentAmt,
+                                'amount' => $expectedAgentAmt,
+                                'description' => $expectedAgentDesc,
                                 'is_extra' => true,
-                                'meta' => ['type' => 'agent_discount'],
+                                'pst_enabled' => $expectedAgentPstEnabled,
+                                'gst_enabled' => $expectedAgentGstEnabled,
+                                'meta' => $expectedMeta,
                             ]);
                             $hasChanged = true;
                         }
                     } else {
                         $invoice->items()->create([
                             'order_service_id' => null,
-                            'description' => $expectedDiscountDesc,
+                            'description' => $expectedAgentDesc,
                             'quantity' => 1,
-                            'unit_price' => $expectedDiscountAmt,
-                            'amount' => $expectedDiscountAmt,
+                            'unit_price' => $expectedAgentAmt,
+                            'amount' => $expectedAgentAmt,
                             'is_extra' => true,
-                            'meta' => ['type' => 'agent_discount'],
+                            'pst_enabled' => $expectedAgentPstEnabled,
+                            'gst_enabled' => $expectedAgentGstEnabled,
+                            'meta' => $expectedMeta,
                         ]);
                         $hasChanged = true;
                     }
-                    if ($existingPackageItem) {
-                        $existingPackageItem->delete();
-                        $hasChanged = true;
+                } elseif ($existingAgentItem) {
+                    $existingAgentItem->delete();
+                    $hasChanged = true;
+                }
+
+                // 4.3 Sync Coupon Discount line
+                if ($totalCodeDiscount > 0) {
+                    $expectedCodeAmt = -round($totalCodeDiscount, 2);
+                    $expectedCodePst = -round($codePstDiscount, 2);
+                    $expectedCodeGst = -round($codeGstDiscount, 2);
+                    $expectedCodePstEnabled = ($codePstDiscount > 0);
+                    $expectedCodeGstEnabled = ($codeGstDiscount > 0);
+                    $codeDesc = !empty($codeDiscountNames) ? implode(', ', $codeDiscountNames) : 'Coupon Discount';
+                    if ($multiplier < 1) {
+                        $codeDesc .= " (" . round($multiplier * 100, 1) . "%)";
                     }
-                    if ($existingCodeItem) {
-                        $existingCodeItem->delete();
-                        $hasChanged = true;
-                    }
-                } elseif ($winner === 'code' && $codeDiscount) {
-                    $expectedDiscountAmt  = (float)$codeDiscount['amount'];
-                    $expectedDiscountDesc = $codeDiscount['description'];
+
+                    $expectedMeta = [
+                        'type' => 'code_discount',
+                        'pst_applicable_amount' => $expectedCodePst,
+                        'gst_applicable_amount' => $expectedCodeGst,
+                    ];
 
                     if ($existingCodeItem) {
-                        if ((float)$existingCodeItem->amount != $expectedDiscountAmt || (float)$existingCodeItem->unit_price != $expectedDiscountAmt || $existingCodeItem->description != $expectedDiscountDesc) {
+                        $currentMeta = $existingCodeItem->meta ?? [];
+                        if (
+                            (float)$existingCodeItem->amount != $expectedCodeAmt ||
+                            (float)$existingCodeItem->unit_price != $expectedCodeAmt ||
+                            $existingCodeItem->description != $codeDesc ||
+                            ($currentMeta['pst_applicable_amount'] ?? null) != $expectedCodePst ||
+                            ($currentMeta['gst_applicable_amount'] ?? null) != $expectedCodeGst ||
+                            (bool)$existingCodeItem->pst_enabled != $expectedCodePstEnabled ||
+                            (bool)$existingCodeItem->gst_enabled != $expectedCodeGstEnabled
+                        ) {
                             $existingCodeItem->update([
-                                'unit_price' => $expectedDiscountAmt,
-                                'amount' => $expectedDiscountAmt,
-                                'description' => $expectedDiscountDesc,
+                                'unit_price' => $expectedCodeAmt,
+                                'amount' => $expectedCodeAmt,
+                                'description' => $codeDesc,
                                 'is_extra' => true,
-                                'meta' => ['type' => 'code_discount'],
+                                'pst_enabled' => $expectedCodePstEnabled,
+                                'gst_enabled' => $expectedCodeGstEnabled,
+                                'meta' => $expectedMeta,
                             ]);
                             $hasChanged = true;
                         }
                     } else {
                         $invoice->items()->create([
                             'order_service_id' => null,
-                            'description' => $expectedDiscountDesc,
+                            'description' => $codeDesc,
                             'quantity' => 1,
-                            'unit_price' => $expectedDiscountAmt,
-                            'amount' => $expectedDiscountAmt,
+                            'unit_price' => $expectedCodeAmt,
+                            'amount' => $expectedCodeAmt,
                             'is_extra' => true,
-                            'meta' => ['type' => 'code_discount'],
+                            'pst_enabled' => $expectedCodePstEnabled,
+                            'gst_enabled' => $expectedCodeGstEnabled,
+                            'meta' => $expectedMeta,
                         ]);
                         $hasChanged = true;
                     }
-                    if ($existingPackageItem) {
-                        $existingPackageItem->delete();
-                        $hasChanged = true;
-                    }
-                    if ($existingAgentItem) {
-                        $existingAgentItem->delete();
-                        $hasChanged = true;
-                    }
-                } else {
-                    // No discount applicable — remove all if present
-                    if ($existingPackageItem) {
-                        $existingPackageItem->delete();
-                        $hasChanged = true;
-                    }
-                    if ($existingAgentItem) {
-                        $existingAgentItem->delete();
-                        $hasChanged = true;
-                    }
-                    if ($existingCodeItem) {
-                        $existingCodeItem->delete();
-                        $hasChanged = true;
-                    }
+                } elseif ($existingCodeItem) {
+                    $existingCodeItem->delete();
+                    $hasChanged = true;
                 }
 
                 if ($hasChanged) {
@@ -1500,12 +1884,12 @@ class Invoice extends Model
                     }
                 }
 
-                // Sync package/agent/code discount item on service-specific invoice — only the SINGLE WINNING discount shows.
-                // Governed by the order-level Option B winner so all invoices remain consistent.
-                $winner        = static::getOrderWinningDiscountType($order);
-                $pkgDiscount   = ($winner === 'package') ? static::resolvePackageDiscountForServices($order, collect([$os]), $multiplier) : null;
-                $agentDiscount = ($winner === 'agent')   ? static::resolveAgentDiscountForInvoice($order, collect([$os]), $multiplier) : null;
-                $codeDiscount  = ($winner === 'code')    ? static::resolveCodeDiscountsForInvoice($order, collect([$os]), $multiplier) : null;
+                // Sync winning discount on service-specific invoice (exactly one winning discount per service)
+                $winner = static::resolveServiceWinningDiscount($order, $os, $multiplier);
+                $winnerType = $winner['type'] ?? 'none';
+                $pkgDiscount   = ($winnerType === 'package_discount') ? $winner : null;
+                $agentDiscount = ($winnerType === 'agent_discount')   ? $winner : null;
+                $codeDiscount  = ($winnerType === 'code_discount')    ? $winner : null;
 
                 $existingPackageItem = $invoice->items
                     ->filter(function($i) {
@@ -1525,18 +1909,39 @@ class Invoice extends Model
                     })
                     ->first();
 
-                if ($winner === 'package' && $pkgDiscount) {
+                [$osHasGst, $osHasPst] = \App\Http\Controllers\Api\InvoiceController::resolveServiceTaxFlags($os->service, $order->organization_id);
+
+                if ($pkgDiscount) {
                     $expectedDiscountAmt = (float)$pkgDiscount['amount'];
                     $expectedDiscountDesc = $pkgDiscount['description'];
+                    $discPst = $osHasPst ? $expectedDiscountAmt : 0.0;
+                    $discGst = $osHasGst ? $expectedDiscountAmt : 0.0;
+                    $meta = [
+                        'type' => 'package_discount',
+                        'package_id' => $pkgDiscount['package_id'] ?? null,
+                        'pst_applicable_amount' => $discPst,
+                        'gst_applicable_amount' => $discGst,
+                    ];
 
                     if ($existingPackageItem) {
-                        if ((float)$existingPackageItem->amount != $expectedDiscountAmt || (float)$existingPackageItem->unit_price != $expectedDiscountAmt || $existingPackageItem->description != $expectedDiscountDesc) {
+                        $currentMeta = $existingPackageItem->meta ?? [];
+                        if (
+                            (float)$existingPackageItem->amount != $expectedDiscountAmt ||
+                            (float)$existingPackageItem->unit_price != $expectedDiscountAmt ||
+                            $existingPackageItem->description != $expectedDiscountDesc ||
+                            ($currentMeta['pst_applicable_amount'] ?? null) != $discPst ||
+                            ($currentMeta['gst_applicable_amount'] ?? null) != $discGst ||
+                            (bool)$existingPackageItem->pst_enabled != $osHasPst ||
+                            (bool)$existingPackageItem->gst_enabled != $osHasGst
+                        ) {
                             $existingPackageItem->update([
                                 'unit_price' => $expectedDiscountAmt,
                                 'amount' => $expectedDiscountAmt,
                                 'description' => $expectedDiscountDesc,
                                 'is_extra' => true,
-                                'meta' => ['type' => 'package_discount', 'package_id' => $pkgDiscount['package_id']],
+                                'pst_enabled' => $osHasPst,
+                                'gst_enabled' => $osHasGst,
+                                'meta' => $meta,
                             ]);
                             $serviceInvoiceChanged = true;
                         }
@@ -1548,7 +1953,9 @@ class Invoice extends Model
                             'unit_price' => $expectedDiscountAmt,
                             'amount' => $expectedDiscountAmt,
                             'is_extra' => true,
-                            'meta' => ['type' => 'package_discount', 'package_id' => $pkgDiscount['package_id']],
+                            'pst_enabled' => $osHasPst,
+                            'gst_enabled' => $osHasGst,
+                            'meta' => $meta,
                         ]);
                         $serviceInvoiceChanged = true;
                     }
@@ -1560,18 +1967,36 @@ class Invoice extends Model
                         $existingCodeItem->delete();
                         $serviceInvoiceChanged = true;
                     }
-                } elseif ($winner === 'agent' && $agentDiscount) {
+                } elseif ($agentDiscount) {
                     $expectedDiscountAmt = (float)$agentDiscount['amount'];
                     $expectedDiscountDesc = $agentDiscount['description'];
+                    $discPst = $osHasPst ? $expectedDiscountAmt : 0.0;
+                    $discGst = $osHasGst ? $expectedDiscountAmt : 0.0;
+                    $meta = [
+                        'type' => 'agent_discount',
+                        'pst_applicable_amount' => $discPst,
+                        'gst_applicable_amount' => $discGst,
+                    ];
 
                     if ($existingAgentItem) {
-                        if ((float)$existingAgentItem->amount != $expectedDiscountAmt || (float)$existingAgentItem->unit_price != $expectedDiscountAmt || $existingAgentItem->description != $expectedDiscountDesc) {
+                        $currentMeta = $existingAgentItem->meta ?? [];
+                        if (
+                            (float)$existingAgentItem->amount != $expectedDiscountAmt ||
+                            (float)$existingAgentItem->unit_price != $expectedDiscountAmt ||
+                            $existingAgentItem->description != $expectedDiscountDesc ||
+                            ($currentMeta['pst_applicable_amount'] ?? null) != $discPst ||
+                            ($currentMeta['gst_applicable_amount'] ?? null) != $discGst ||
+                            (bool)$existingAgentItem->pst_enabled != $osHasPst ||
+                            (bool)$existingAgentItem->gst_enabled != $osHasGst
+                        ) {
                             $existingAgentItem->update([
                                 'unit_price' => $expectedDiscountAmt,
                                 'amount' => $expectedDiscountAmt,
                                 'description' => $expectedDiscountDesc,
                                 'is_extra' => true,
-                                'meta' => ['type' => 'agent_discount'],
+                                'pst_enabled' => $osHasPst,
+                                'gst_enabled' => $osHasGst,
+                                'meta' => $meta,
                             ]);
                             $serviceInvoiceChanged = true;
                         }
@@ -1583,7 +2008,9 @@ class Invoice extends Model
                             'unit_price' => $expectedDiscountAmt,
                             'amount' => $expectedDiscountAmt,
                             'is_extra' => true,
-                            'meta' => ['type' => 'agent_discount'],
+                            'pst_enabled' => $osHasPst,
+                            'gst_enabled' => $osHasGst,
+                            'meta' => $meta,
                         ]);
                         $serviceInvoiceChanged = true;
                     }
@@ -1595,18 +2022,36 @@ class Invoice extends Model
                         $existingCodeItem->delete();
                         $serviceInvoiceChanged = true;
                     }
-                } elseif ($winner === 'code' && $codeDiscount) {
+                } elseif ($codeDiscount) {
                     $expectedDiscountAmt = (float)$codeDiscount['amount'];
                     $expectedDiscountDesc = $codeDiscount['description'];
+                    $discPst = $osHasPst ? $expectedDiscountAmt : 0.0;
+                    $discGst = $osHasGst ? $expectedDiscountAmt : 0.0;
+                    $meta = [
+                        'type' => 'code_discount',
+                        'pst_applicable_amount' => $discPst,
+                        'gst_applicable_amount' => $discGst,
+                    ];
 
                     if ($existingCodeItem) {
-                        if ((float)$existingCodeItem->amount != $expectedDiscountAmt || (float)$existingCodeItem->unit_price != $expectedDiscountAmt || $existingCodeItem->description != $expectedDiscountDesc) {
+                        $currentMeta = $existingCodeItem->meta ?? [];
+                        if (
+                            (float)$existingCodeItem->amount != $expectedDiscountAmt ||
+                            (float)$existingCodeItem->unit_price != $expectedDiscountAmt ||
+                            $existingCodeItem->description != $expectedDiscountDesc ||
+                            ($currentMeta['pst_applicable_amount'] ?? null) != $discPst ||
+                            ($currentMeta['gst_applicable_amount'] ?? null) != $discGst ||
+                            (bool)$existingCodeItem->pst_enabled != $osHasPst ||
+                            (bool)$existingCodeItem->gst_enabled != $osHasGst
+                        ) {
                             $existingCodeItem->update([
                                 'unit_price' => $expectedDiscountAmt,
                                 'amount' => $expectedDiscountAmt,
                                 'description' => $expectedDiscountDesc,
                                 'is_extra' => true,
-                                'meta' => ['type' => 'code_discount'],
+                                'pst_enabled' => $osHasPst,
+                                'gst_enabled' => $osHasGst,
+                                'meta' => $meta,
                             ]);
                             $serviceInvoiceChanged = true;
                         }
@@ -1618,7 +2063,9 @@ class Invoice extends Model
                             'unit_price' => $expectedDiscountAmt,
                             'amount' => $expectedDiscountAmt,
                             'is_extra' => true,
-                            'meta' => ['type' => 'code_discount'],
+                            'pst_enabled' => $osHasPst,
+                            'gst_enabled' => $osHasGst,
+                            'meta' => $meta,
                         ]);
                         $serviceInvoiceChanged = true;
                     }

@@ -244,6 +244,8 @@ protected function tourSettings(): array
         'value.matterport_auto_invoice_days' => 'nullable|integer|min:0',
         'value.matterport_reminder_intervals' => 'nullable|array',
         'value.always_enable_sorting' => 'nullable|boolean',
+        'value.floorplan_names' => 'nullable|array',
+        'value.floorplan_names.*' => 'required|string|max:255',
     ];
 }
 

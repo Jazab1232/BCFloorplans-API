@@ -699,7 +699,8 @@ class AgentController extends Controller
             }
 
             if (!$loginUrl) {
-                $loginUrl = config('app.agent_url', 'https://bookings.tojuco.com/login-user');
+                $baseAgentUrl = app(\App\Services\EmailDispatchService::class)->resolvePortalBaseUrl('agent', $org);
+                $loginUrl = ($baseAgentUrl ?: 'https://my.tojuco.com') . '/login-user';
             }
 
             // Dispatch welcome email and admin notification safely

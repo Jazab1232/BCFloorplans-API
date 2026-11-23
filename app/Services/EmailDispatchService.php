@@ -991,46 +991,10 @@ class EmailDispatchService
                 $baseUrl = "{$originScheme}://{$originHost}{$originPort}";
             }
 
-            // 3. If not sent from a custom origin, but the organization is whitelabel in database
-            if (!$baseUrl && $org && $org->is_whitelabel) {
-                try {
-                    $domainRecord = $org->domains()->where('portal_type', $userType)->first();
-                    if ($domainRecord && !empty($domainRecord->domain)) {
-                        $baseUrl = $domainRecord->domain;
-                    } elseif (!empty($org->domain)) {
-                        $baseUrl = $org->domain;
-                    }
-                } catch (\Throwable $e) {
-                    if (!empty($org->domain)) {
-                        $baseUrl = $org->domain;
-                    }
-                }
+            // 3. Fallback to unified portal base URL resolution (whitelabel org domains or non-whitelabel .env)
+            if (!$baseUrl) {
+                $baseUrl = $this->resolvePortalBaseUrl($userType, $org, $originHost);
             }
-
-                // If not whitelabel (or no custom domain configured), resolve platform domain per role and environment
-                if (!$baseUrl) {
-                    $isDevEnv = (
-                        str_contains($originHost ?? '', 'dev.tojuco.com') ||
-                        in_array(config('app.env'), ['develop', 'dev', 'development', 'staging', 'local']) ||
-                        str_contains(config('app.admin_app', ''), 'dev.tojuco.com')
-                    );
-
-                    if ($isDevEnv) {
-                        // 3 Development domains
-                        $baseUrl = match ($userType) {
-                            'agent' => config('app.dev_agent_domain', env('DEFAULT_AGENT_DOMAIN', 'my.dev.tojuco.com')),
-                            'vendor' => config('app.dev_vendor_domain', env('DEFAULT_VENDOR_DOMAIN', 'team.dev.tojuco.com')),
-                            default => config('app.dev_admin_domain', env('DEFAULT_ADMIN_DOMAIN', 'admin.dev.tojuco.com')),
-                        };
-                    } else {
-                        // 3 Production domains
-                        $baseUrl = match ($userType) {
-                            'agent' => config('app.prod_agent_domain', env('DEFAULT_BOOKINGS_DOMAIN', 'bookings.tojuco.com')),
-                            'vendor' => config('app.prod_vendor_domain', env('DEFAULT_VENDORS_DOMAIN', 'vendors.tojuco.com')),
-                            default => config('app.prod_admin_domain', env('DEFAULT_TEAMS_DOMAIN', 'teams.tojuco.com')),
-                        };
-                    }
-                }
 
             if (!str_starts_with($baseUrl, 'http://') && !str_starts_with($baseUrl, 'https://')) {
                 $baseUrl = (str_contains($baseUrl, 'localhost') || str_contains($baseUrl, '127.0.0.1')) ? 'http://' . $baseUrl : 'https://' . $baseUrl;
@@ -1558,15 +1522,19 @@ class EmailDispatchService
     {
         $baseUrl = null;
 
-        // 1. Whitelabel Organization: match portal_type to recipient role
-        if ($org && $org->is_whitelabel) {
+        // 1. Whitelabel Organization: match portal_type to recipient role from organization data
+        if ($org && !empty($org->is_whitelabel)) {
             try {
                 $portalType = match ($role) {
                     'admin', 'user' => 'admin',
                     'vendor' => 'vendor',
                     default => 'agent',
                 };
-                $domainRecord = $org->domains()->where('portal_type', $portalType)->first();
+
+                $domainRecord = $org->relationLoaded('domains')
+                    ? $org->domains->firstWhere('portal_type', $portalType)
+                    : $org->domains()->where('portal_type', $portalType)->first();
+
                 if ($domainRecord && !empty($domainRecord->domain)) {
                     $baseUrl = $domainRecord->domain;
                 } elseif (!empty($org->domain)) {
@@ -1579,45 +1547,49 @@ class EmailDispatchService
             }
         }
 
-        // 2. Non-Whitelabel: environment-driven domain resolution
+        // 2. Non-Whitelabel: environment-driven domain resolution from .env
         if (!$baseUrl) {
+            $isDevEnv = (
+                str_contains($originHost ?? '', 'dev.tojuco.com') ||
+                in_array(config('app.env'), ['develop', 'dev', 'development', 'staging', 'local']) ||
+                str_contains(config('app.admin_app', ''), 'dev.tojuco.com')
+            );
+
             $configuredDomain = match ($role) {
-                'agent' => config('app.agent_url') ?: env('DEFAULT_AGENT_DOMAIN', env('AGENT_APP_URL')),
-                'vendor' => config('app.vendor_url') ?: env('DEFAULT_VENDOR_DOMAIN', env('VENDOR_APP_URL')),
-                default => config('app.admin_app') ?: (config('app.frontend_url') ?: env('ADMIN_APP', env('DEFAULT_ADMIN_DOMAIN', env('FRONTEND_URL')))),
+                'agent' => config('app.agent_url')
+                    ?: env('DEFAULT_AGENT_DOMAIN', env('AGENT_APP_URL', env('AGENT_URL', env('NEXT_PUBLIC_DEFAULT_AGENT_DOMAIN')))),
+                'vendor' => config('app.vendor_url')
+                    ?: env('DEFAULT_VENDOR_DOMAIN', env('VENDOR_APP_URL', env('VENDOR_URL', env('NEXT_PUBLIC_DEFAULT_VENDOR_DOMAIN')))),
+                default => config('app.admin_app')
+                    ?: (config('app.frontend_url') ?: env('ADMIN_APP', env('DEFAULT_ADMIN_DOMAIN', env('FRONTEND_URL')))),
             };
 
             if (!empty($configuredDomain)) {
                 $baseUrl = $configuredDomain;
+            } elseif ($isDevEnv) {
+                $baseUrl = match ($role) {
+                    'agent' => config('app.dev_agent_domain') ?: env('DEFAULT_AGENT_DOMAIN', 'my.dev.tojuco.com'),
+                    'vendor' => config('app.dev_vendor_domain') ?: env('DEFAULT_VENDOR_DOMAIN', 'team.dev.tojuco.com'),
+                    default => config('app.dev_admin_domain') ?: env('DEFAULT_ADMIN_DOMAIN', 'admin.dev.tojuco.com'),
+                };
             } else {
-                $isDevEnv = (
-                    str_contains($originHost ?? '', 'dev.tojuco.com') ||
-                    in_array(config('app.env'), ['develop', 'dev', 'development', 'staging', 'local']) ||
-                    str_contains(config('app.admin_app', ''), 'dev.tojuco.com')
-                );
-
-                if ($isDevEnv) {
-                    $baseUrl = match ($role) {
-                        'agent' => config('app.dev_agent_domain', 'my.dev.tojuco.com'),
-                        'vendor' => config('app.dev_vendor_domain', 'team.dev.tojuco.com'),
-                        default => config('app.dev_admin_domain', 'admin.dev.tojuco.com'),
-                    };
-                } else {
-                    $baseUrl = match ($role) {
-                        'agent' => config('app.prod_agent_domain', 'bookings.tojuco.com'),
-                        'vendor' => config('app.prod_vendor_domain', 'vendors.tojuco.com'),
-                        default => config('app.prod_admin_domain', 'teams.tojuco.com'),
-                    };
-                }
+                $baseUrl = match ($role) {
+                    'agent' => config('app.prod_agent_domain') ?: env('DEFAULT_AGENT_DOMAIN', env('DEFAULT_BOOKINGS_DOMAIN', 'my.tojuco.com')),
+                    'vendor' => config('app.prod_vendor_domain') ?: env('DEFAULT_VENDOR_DOMAIN', env('DEFAULT_VENDORS_DOMAIN', 'vendors.tojuco.com')),
+                    default => config('app.prod_admin_domain') ?: env('DEFAULT_TEAMS_DOMAIN', 'teams.tojuco.com'),
+                };
             }
         }
 
-        if (!str_starts_with($baseUrl, 'http://') && !str_starts_with($baseUrl, 'https://')) {
-            $isLocal = str_contains($baseUrl, 'localhost') || str_contains($baseUrl, '127.0.0.1');
-            $baseUrl = ($isLocal ? 'http://' : 'https://') . $baseUrl;
+        if (!empty($baseUrl)) {
+            if (!str_starts_with($baseUrl, 'http://') && !str_starts_with($baseUrl, 'https://')) {
+                $isLocal = str_contains($baseUrl, 'localhost') || str_contains($baseUrl, '127.0.0.1');
+                $baseUrl = ($isLocal ? 'http://' : 'https://') . $baseUrl;
+            }
+            $baseUrl = rtrim($baseUrl, '/');
         }
 
-        return rtrim($baseUrl, '/');
+        return $baseUrl ?: '';
     }
 
     /**

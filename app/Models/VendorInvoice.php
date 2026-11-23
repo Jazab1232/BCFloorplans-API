@@ -38,6 +38,7 @@ class VendorInvoice extends Model
         'org_details',
         'tax_details',
         'quickbooks_bill_id',
+        'quickbooks_bill_payment_id',
         'quickbooks_synced_at',
     ];
 

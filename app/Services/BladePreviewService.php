@@ -578,6 +578,11 @@ class BladePreviewService
         $orgPhone = $org?->contact_phone ?: '604-788-7783';
         $orgSlug = strtoupper($org?->slug ?: 'BCF');
 
+        $dispatchService = app(\App\Services\EmailDispatchService::class);
+        $agentPortalUrl = $dispatchService->resolvePortalBaseUrl('agent', $org);
+        $adminPortalUrl = $dispatchService->resolvePortalBaseUrl('admin', $org);
+        $vendorPortalUrl = $dispatchService->resolvePortalBaseUrl('vendor', $org);
+
         $dummyMap = [
             'order_id'            => '1001',
             'property_address'    => '123 Main Street, Vancouver, BC',
@@ -621,18 +626,18 @@ class BladePreviewService
             'days_remaining'      => '7',
             'new_expiry_date'     => date('F j, Y', strtotime('+6 months')),
             'duration_months'     => '6',
-            'renewal_url'         => 'https://bookings.tojuco.com/tours/renew/sample',
-            'service_url'         => 'https://teams.tojuco.com/dashboard/file-manager/sample',
+            'renewal_url'         => "{$agentPortalUrl}/tours/renew/sample",
+            'service_url'         => "{$agentPortalUrl}/dashboard/file-manager/sample",
             'completed_by'        => 'Alex Rivera',
             'media_count'         => '12',
             'uploaded_by'         => 'Alex Rivera',
             'custom_message'      => 'High-resolution photos and Matterport 3D scan are ready for download.',
             'changes_summary'     => 'Appointment rescheduled to Nov 5, 2026 at 2:00 PM',
-            'reset_link'          => 'https://teams.tojuco.com/reset-password?token=sample',
+            'reset_link'          => ($recipientRole === 'agent' ? $agentPortalUrl : ($recipientRole === 'vendor' ? $vendorPortalUrl : $adminPortalUrl)) . '/reset-password?token=sample',
             'copies'              => '50',
             'with_bleed'          => 'Standard (No Bleed)',
             'additional_info'     => 'Please use 100lb glossy cardstock',
-            'pdf_url'             => 'https://teams.tojuco.com/storage/feature-sheets/sample.pdf',
+            'pdf_url'             => "{$adminPortalUrl}/storage/feature-sheets/sample.pdf",
             'company_name'        => $orgName,
             'company_email'       => $orgEmail,
             'company_phone'       => $orgPhone,

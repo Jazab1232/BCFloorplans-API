@@ -786,9 +786,6 @@ class VendorBillingController extends Controller
                 'stripe_transfer_id' => $transfer->id,
             ]);
 
-            // Dispatch QuickBooks Payout Sync
-            \App\Jobs\SyncVendorPayoutToQuickBooks::dispatch($invoice->id);
-
             // Update all related order services
             OrderService::where('vendor_invoice_id', $invoice->id)
                 ->update([
@@ -797,6 +794,11 @@ class VendorBillingController extends Controller
                 ]);
 
             DB::commit();
+
+            // Dispatch QuickBooks Payout Sync after database commit
+            if (config('quickbooks.vendor_sync_enabled', true) && class_exists(\App\Jobs\SyncVendorPayoutToQuickBooks::class)) {
+                \App\Jobs\SyncVendorPayoutToQuickBooks::dispatch($invoice->id)->afterCommit();
+            }
 
             return response()->json([
                 'success' => true,
@@ -848,9 +850,6 @@ class VendorBillingController extends Controller
                 'notes' => $newNotes,
             ]);
 
-            // Dispatch QuickBooks Payout Sync
-            \App\Jobs\SyncVendorPayoutToQuickBooks::dispatch($invoice->id);
-
             // Update all related order services
             OrderService::where('vendor_invoice_id', $invoice->id)
                 ->update([
@@ -859,6 +858,11 @@ class VendorBillingController extends Controller
                 ]);
 
             DB::commit();
+
+            // Dispatch QuickBooks Payout Sync after database commit
+            if (config('quickbooks.vendor_sync_enabled', true) && class_exists(\App\Jobs\SyncVendorPayoutToQuickBooks::class)) {
+                \App\Jobs\SyncVendorPayoutToQuickBooks::dispatch($invoice->id)->afterCommit();
+            }
 
             return response()->json([
                 'success' => true,
@@ -1233,16 +1237,16 @@ class VendorBillingController extends Controller
                         'vendor_paid' => true,
                         'vendor_paid_at' => $paidAt
                     ]);
-
-                // Dispatch QuickBooks Payout Sync if job class exists
-                if (class_exists(\App\Jobs\SyncVendorPayoutToQuickBooks::class)) {
-                    \App\Jobs\SyncVendorPayoutToQuickBooks::dispatch($invoice->id);
-                }
             }
 
             $invoice->update($updateData);
 
             DB::commit();
+
+            // Dispatch QuickBooks Payout Sync after commit if invoice was marked paid
+            if ($status === 'paid' && config('quickbooks.vendor_sync_enabled', true) && class_exists(\App\Jobs\SyncVendorPayoutToQuickBooks::class)) {
+                \App\Jobs\SyncVendorPayoutToQuickBooks::dispatch($invoice->id)->afterCommit();
+            }
 
             return response()->json([
                 'success' => true,

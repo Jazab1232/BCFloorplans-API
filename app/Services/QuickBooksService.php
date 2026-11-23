@@ -572,6 +572,14 @@ class QuickBooksService
     }
 
     /**
+     * Check if an organization is connected to QuickBooks
+     */
+    public function isConnected(?Organization $organization = null): bool
+    {
+        return $this->getStoredTokens($organization) !== null;
+    }
+
+    /**
      * Validate configuration
      */
     public function validateConfig()
@@ -711,10 +719,37 @@ class QuickBooksService
     }
 
     /**
-     * ✅ NEW: Main sync entry point for an internal Invoice
+     * ✅ NEW: Main sync entry point for an internal Invoice (One Main Invoice Per Order Model)
      */
     public function syncInvoiceToQB(\App\Models\Invoice $invoice): ?array
     {
+        // 1. Resolve to Main Invoice if this is an individual service invoice
+        if ($invoice->order_id && $invoice->notes && stripos($invoice->notes, 'service invoice') !== false) {
+            $mainInvoice = \App\Models\Invoice::with(['order.property', 'items.orderService.service', 'agent', 'order.organization'])
+                ->where('order_id', $invoice->order_id)
+                ->where(function ($q) {
+                    $q->where('notes', 'ilike', '%consolidated%')
+                      ->orWhere('notes', 'ilike', '%add-on service invoice%');
+                })
+                ->first();
+
+            if (!$mainInvoice) {
+                $mainInvoice = \App\Models\Invoice::with(['order.property', 'items.orderService.service', 'agent', 'order.organization'])
+                    ->where('order_id', $invoice->order_id)
+                    ->where('agent_type', 'primary')
+                    ->where(function ($q) {
+                        $q->whereNull('notes')
+                          ->orWhere('notes', 'not ilike', '%service invoice%');
+                    })
+                    ->first();
+            }
+
+            if ($mainInvoice) {
+                Log::info("QB sync: resolving service invoice #{$invoice->id} to Order Main Invoice #{$mainInvoice->id}");
+                $invoice = $mainInvoice;
+            }
+        }
+
         // Atomic lock to prevent duplicate concurrent syncs (e.g. Stripe webhook + manual retry)
         $lockKey = "qb_sync_invoice_lock_{$invoice->id}";
         $lock = Cache::lock($lockKey, 120);
@@ -729,16 +764,24 @@ class QuickBooksService
         try {
             $invoice->refresh();
 
-            // Idempotency: skip if already synced to avoid duplicate QB invoices
+            // If Main Invoice is already created in QB, check and sync any pending unsynced payments
             if ($invoice->quickbooks_invoice_id) {
-                Log::info('QB sync skipped: invoice already synced', [
+                Log::info('QB sync: Main invoice already synced in QB, syncing any unsynced payments', [
                     'invoice_id' => $invoice->id,
                     'qb_invoice_id' => $invoice->quickbooks_invoice_id,
                     'doc_number' => $invoice->invoice_number,
                 ]);
+
+                $org = $invoice->organization 
+                    ?? $invoice->order?->organization 
+                    ?? ($invoice->organization_id ? \App\Models\Organization::find($invoice->organization_id) : null);
+                $dataService = $this->getDataService($org);
+
+                $syncedPaymentIds = $this->syncPendingPaymentsForOrder($dataService, $invoice);
+
                 return [
                     'invoice_id' => $invoice->quickbooks_invoice_id,
-                    'payment_id' => null,
+                    'payment_id' => !empty($syncedPaymentIds) ? end($syncedPaymentIds) : null,
                     'doc_number' => $invoice->invoice_number,
                 ];
             }
@@ -869,27 +912,14 @@ class QuickBooksService
                     throw new \Exception('QB invoice creation failed: ' . $resolvedError);
                 }
 
-                // 5. If paid, create payment
-                $qbPaymentId = null;
-                if ($invoice->status === 'paid' || $invoice->paid_amount > 0) {
-                    $qbPayment = $this->createPaymentForInvoice($dataService, $qbInvoice, $invoice->paid_amount);
-                    $qbPaymentId = $qbPayment?->Id;
-                }
-
                 $invoice->update([
                     'quickbooks_invoice_id' => $qbInvoice->Id,
                     'quickbooks_synced_at' => now(),
                 ]);
 
-                // Update linked AgentPayment records so getSyncQueue and payment lists reflect synced status
-                AgentPayment::where('invoice_id', $invoice->id)
-                    ->whereNull('quickbooks_invoice_id')
-                    ->update([
-                        'quickbooks_invoice_id' => $qbInvoice->Id,
-                        'quickbooks_payment_id' => $qbPaymentId,
-                        'quickbooks_txn_id'     => $qbInvoice->DocNumber,
-                        'quickbooks_synced_at'  => now(),
-                    ]);
+                // 5. Sync any successful payments for this order against the new Main Invoice
+                $syncedPaymentIds = $this->syncPendingPaymentsForOrder($dataService, $invoice, $qbInvoice);
+                $qbPaymentId = !empty($syncedPaymentIds) ? end($syncedPaymentIds) : null;
 
                 $log->update([
                     'status' => 'success',
@@ -1049,10 +1079,16 @@ class QuickBooksService
         }
     }
     /**
-     * ✅ NEW: Sync Vendor Invoice as Bill
+     * ✅ Sync Vendor Invoice as Bill
      */
     public function syncVendorInvoiceToQB(\App\Models\VendorInvoice $vInvoice): ?string
     {
+        // Idempotency guard: Return early if bill already created in QB
+        if ($vInvoice->quickbooks_bill_id) {
+            Log::info("Vendor invoice {$vInvoice->id} already synced to QB as Bill #{$vInvoice->quickbooks_bill_id}");
+            return $vInvoice->quickbooks_bill_id;
+        }
+
         $log = QbSyncLog::create([
             'organization_id' => $vInvoice->vendor?->organization_id ?? $vInvoice->organization_id,
             'entity_type' => 'vendor_invoice',
@@ -1063,55 +1099,71 @@ class QuickBooksService
         ]);
 
         try {
-            $org = $vInvoice->vendor->organization ?? null;
+            $org = $vInvoice->vendor?->organization ?? $vInvoice->organization ?? null;
             $dataService = $this->getDataService($org);
             $vendorId = $this->getOrCreateVendor($vInvoice->vendor, $org);
 
-            // Use "Subcontracted Services" account
-            $expenseAccountId = config('quickbooks.accounts.expense_id', '1'); 
+            // Dynamic expense account discovery
+            $expenseAccountId = $this->getExpenseAccountId($dataService);
 
             $lines = [];
             foreach ($vInvoice->lines as $line) {
                 $lines[] = [
-                    'Amount' => (float)$line->amount,
+                    'Description' => $line->description ?: 'Vendor service item',
+                    'Amount' => round((float)$line->amount, 2),
                     'DetailType' => 'AccountBasedExpenseLineDetail',
                     'AccountBasedExpenseLineDetail' => [
                         'AccountRef' => ['value' => $expenseAccountId],
-                        'Description' => $line->description,
-                    ]
+                    ],
                 ];
             }
 
-            // Handle Tax separately if needed, but Bills usually have it in line
+            // Handle Tax separately as an expense line if applicable
             if ((float)$vInvoice->tax_amount > 0) {
+                $taxDesc = 'Tax';
+                if (!empty($vInvoice->tax_type)) {
+                    $taxDesc .= ' (' . $vInvoice->tax_type . ')';
+                }
                 $lines[] = [
-                    'Amount' => (float)$vInvoice->tax_amount,
+                    'Description' => $taxDesc,
+                    'Amount' => round((float)$vInvoice->tax_amount, 2),
                     'DetailType' => 'AccountBasedExpenseLineDetail',
                     'AccountBasedExpenseLineDetail' => [
                         'AccountRef' => ['value' => $expenseAccountId],
-                        'Description' => 'Tax',
-                    ]
+                    ],
                 ];
             }
 
             if (empty($lines)) {
                 $lines[] = [
-                    'Amount' => (float)($vInvoice->total_amount ?: 0),
+                    'Description' => "Vendor Invoice for Cycle: " . ($vInvoice->cycle_start?->format('Y-m-d') ?? 'N/A') . " to " . ($vInvoice->cycle_end?->format('Y-m-d') ?? 'N/A'),
+                    'Amount' => round((float)($vInvoice->total_amount ?: 0), 2),
                     'DetailType' => 'AccountBasedExpenseLineDetail',
                     'AccountBasedExpenseLineDetail' => [
                         'AccountRef' => ['value' => $expenseAccountId],
-                        'Description' => "Vendor Invoice for Cycle: {$vInvoice->cycle_start} to {$vInvoice->cycle_end}",
-                    ]
+                    ],
                 ];
             }
 
-            $billObj = Bill::create([
+            $docNumber = $this->formatDocNumber($vInvoice->invoice_number);
+            $txnDate = $vInvoice->cycle_end?->format('Y-m-d') 
+                ?? $vInvoice->paid_at?->format('Y-m-d') 
+                ?? now()->format('Y-m-d');
+
+            $billData = [
                 'VendorRef' => ['value' => $vendorId],
                 'Line' => $lines,
-                'DocNumber' => $this->formatDocNumber($vInvoice->invoice_number),
-                'PrivateNote' => "Vendor Invoice for Cycle: {$vInvoice->cycle_start} to {$vInvoice->cycle_end}",
+                'DocNumber' => $docNumber,
+                'TxnDate' => $txnDate,
+                'PrivateNote' => "Vendor Invoice for Cycle: " . ($vInvoice->cycle_start?->format('Y-m-d') ?? 'N/A') . " to " . ($vInvoice->cycle_end?->format('Y-m-d') ?? 'N/A'),
+            ];
+
+            $log->update([
+                'payload' => $billData,
+                'qb_doc_number' => $docNumber,
             ]);
 
+            $billObj = Bill::create($billData);
             $qbBill = $dataService->Add($billObj);
 
             if (!$qbBill || $qbBill instanceof \Exception) {
@@ -1122,11 +1174,13 @@ class QuickBooksService
 
             $vInvoice->update([
                 'quickbooks_bill_id' => $qbBill->Id,
+                'quickbooks_synced_at' => now(),
             ]);
 
             $log->update([
                 'status' => 'success',
                 'qb_entity_id' => $qbBill->Id,
+                'qb_doc_number' => $docNumber,
                 'response' => (array)$qbBill,
             ]);
 
@@ -1144,10 +1198,16 @@ class QuickBooksService
     }
 
     /**
-     * ✅ NEW: Sync Vendor Payout as BillPayment
+     * ✅ Sync Vendor Payout as BillPayment
      */
     public function syncVendorPayoutToQB(\App\Models\VendorInvoice $vInvoice): ?string
     {
+        // Idempotency guard: Return early if BillPayment already exists in QB
+        if ($vInvoice->quickbooks_bill_payment_id) {
+            Log::info("Vendor invoice {$vInvoice->id} already synced to QB as BillPayment #{$vInvoice->quickbooks_bill_payment_id}");
+            return $vInvoice->quickbooks_bill_payment_id;
+        }
+
         $log = QbSyncLog::create([
             'organization_id' => $vInvoice->vendor?->organization_id ?? $vInvoice->organization_id,
             'entity_type' => 'vendor_invoice',
@@ -1158,33 +1218,55 @@ class QuickBooksService
         ]);
 
         try {
+            // Ensure Bill exists first
             if (!$vInvoice->quickbooks_bill_id) {
-                // Try to sync bill first
                 $billId = $this->syncVendorInvoiceToQB($vInvoice);
-                if (!$billId) throw new \Exception('Failed to sync bill before payment.');
+                if (!$billId) {
+                    throw new \Exception('Failed to sync bill before payment.');
+                }
+                $vInvoice->refresh();
             }
 
-            $org = $vInvoice->vendor->organization ?? null;
+            $org = $vInvoice->vendor?->organization ?? $vInvoice->organization ?? null;
             $dataService = $this->getDataService($org);
             $vendorId = $this->getOrCreateVendor($vInvoice->vendor, $org);
+            $bankAccountId = $this->getBankAccountId($dataService);
 
             $linkedTxn = new IPPLinkedTxn();
             $linkedTxn->TxnId = (string)$vInvoice->quickbooks_bill_id;
             $linkedTxn->TxnType = 'Bill';
 
-            $billPaymentObj = BillPayment::create([
+            $totalAmt = round((float)$vInvoice->total_amount, 2);
+            $txnDate = $vInvoice->paid_at?->format('Y-m-d') ?? now()->format('Y-m-d');
+            $docNumber = $this->formatDocNumber($vInvoice->invoice_number);
+
+            $privateNote = $vInvoice->stripe_transfer_id === 'manual'
+                ? "Manual Vendor Payout - {$vInvoice->invoice_number}"
+                : "Stripe Transfer: " . ($vInvoice->stripe_transfer_id ?? 'N/A') . " - {$vInvoice->invoice_number}";
+
+            $paymentData = [
                 'VendorRef' => ['value' => $vendorId],
-                'TotalAmt' => (float)$vInvoice->total_amount,
-                'PayType' => 'Check', // Or Bank if available
+                'TotalAmt' => $totalAmt,
+                'PayType' => 'Check',
+                'TxnDate' => $txnDate,
+                'CheckPayment' => [
+                    'BankAccountRef' => ['value' => $bankAccountId],
+                ],
                 'Line' => [
                     [
-                        'Amount' => (float)$vInvoice->total_amount,
-                        'LinkedTxn' => [$linkedTxn]
+                        'Amount' => $totalAmt,
+                        'LinkedTxn' => [$linkedTxn],
                     ]
                 ],
-                'PrivateNote' => "Stripe Payout: " . ($vInvoice->stripe_transfer_id ?? 'N/A'),
+                'PrivateNote' => $privateNote,
+            ];
+
+            $log->update([
+                'payload' => $paymentData,
+                'qb_doc_number' => $docNumber,
             ]);
 
+            $billPaymentObj = BillPayment::create($paymentData);
             $qbBillPayment = $dataService->Add($billPaymentObj);
 
             if (!$qbBillPayment || $qbBillPayment instanceof \Exception) {
@@ -1193,9 +1275,15 @@ class QuickBooksService
                 throw new \Exception('QB BillPayment failed: ' . ($sdkMsg ?? $error?->getResponseBody() ?? 'Unknown'));
             }
 
+            $vInvoice->update([
+                'quickbooks_bill_payment_id' => $qbBillPayment->Id,
+                'quickbooks_synced_at' => now(),
+            ]);
+
             $log->update([
                 'status' => 'success',
                 'qb_entity_id' => $qbBillPayment->Id,
+                'qb_doc_number' => $docNumber,
                 'response' => (array)$qbBillPayment,
             ]);
 
@@ -1213,7 +1301,7 @@ class QuickBooksService
     }
 
     /**
-     * ✅ NEW: Ensure Vendor exists in QuickBooks
+     * ✅ Ensure Vendor exists in QuickBooks
      */
     public function getOrCreateVendor(\App\Models\Vendor $vendor, Organization $organization = null): string
     {
@@ -1239,44 +1327,92 @@ class QuickBooksService
         }
 
         $dataService = $this->getDataService($organization);
-        $email = $vendor->email;
-        $displayName = $vendor->business_name ?: ($vendor->first_name . ' ' . $vendor->last_name);
+        $email = trim($vendor->email ?? '');
+        $displayName = trim($vendor->business_name ?: ($vendor->first_name . ' ' . $vendor->last_name));
+        if (empty($displayName)) {
+            $displayName = "Vendor #{$vendor->id}";
+        }
 
-        // Search by email
-        $vendors = $dataService->Query("SELECT * FROM Vendor WHERE PrimaryEmailAddr = '{$email}'");
+        // Search by email if email is provided
+        if (!empty($email)) {
+            $escapedEmail = str_replace("'", "''", $email);
+            $vendors = $dataService->Query("SELECT * FROM Vendor WHERE PrimaryEmailAddr = '{$escapedEmail}'");
+            if (!empty($vendors)) {
+                $vendor->update([
+                    'quickbooks_vendor_id' => $vendors[0]->Id,
+                    'quickbooks_synced_at' => now(),
+                ]);
+                return $vendors[0]->Id;
+            }
+        }
+
+        // Search by DisplayName
+        $escapedName = str_replace("'", "''", $displayName);
+        $vendors = $dataService->Query("SELECT * FROM Vendor WHERE DisplayName = '{$escapedName}'");
         if (!empty($vendors)) {
-            $vendor->update(['quickbooks_vendor_id' => $vendors[0]->Id]);
+            $vendor->update([
+                'quickbooks_vendor_id' => $vendors[0]->Id,
+                'quickbooks_synced_at' => now(),
+            ]);
             return $vendors[0]->Id;
         }
 
-        // Create new
-        $vendorObj = Vendor::create([
+        // Create new Vendor
+        $vendorData = [
             'DisplayName' => $displayName,
-            'PrimaryEmailAddr' => ['Address' => $email],
             'GivenName' => $vendor->first_name,
             'FamilyName' => $vendor->last_name,
             'CompanyName' => $vendor->business_name,
-        ]);
+        ];
+        if (!empty($email)) {
+            $vendorData['PrimaryEmailAddr'] = ['Address' => $email];
+        }
 
+        $vendorObj = Vendor::create($vendorData);
         $qbVendor = $dataService->Add($vendorObj);
+
         if (!$qbVendor || $qbVendor instanceof \Exception) {
             $error = $dataService->getLastError();
             $sdkMsg = ($qbVendor instanceof \Exception) ? $qbVendor->getMessage() : null;
             $errorBody = $sdkMsg ?? ($error ? $error->getResponseBody() : '');
 
-            // Check if display name exists
+            // Check if duplicate name exists error (code 6240 or message)
             if ($errorBody && (strpos($errorBody, 'Duplicate Name Exists Error') !== false || strpos($errorBody, '6240') !== false)) {
-                $escapedName = str_replace("'", "''", $displayName);
-                $vendors = $dataService->Query("SELECT * FROM Vendor WHERE DisplayName = '{$escapedName}'");
-                if (!empty($vendors)) {
-                    $vendor->update(['quickbooks_vendor_id' => $vendors[0]->Id]);
-                    return $vendors[0]->Id;
+                $existingVendors = $dataService->Query("SELECT * FROM Vendor WHERE DisplayName = '{$escapedName}'");
+                if (!empty($existingVendors)) {
+                    $vendor->update([
+                        'quickbooks_vendor_id' => $existingVendors[0]->Id,
+                        'quickbooks_synced_at' => now(),
+                    ]);
+                    return $existingVendors[0]->Id;
                 }
+
+                // If not found in Vendor, name belongs to a Customer/Employee; disambiguate
+                $disambiguatedName = "{$displayName} (Vendor #{$vendor->id})";
+                $vendorData['DisplayName'] = $disambiguatedName;
+                $vendorObj = Vendor::create($vendorData);
+                $qbVendor = $dataService->Add($vendorObj);
+
+                if ($qbVendor && !($qbVendor instanceof \Exception)) {
+                    $vendor->update([
+                        'quickbooks_vendor_id' => $qbVendor->Id,
+                        'quickbooks_synced_at' => now(),
+                    ]);
+                    return $qbVendor->Id;
+                }
+
+                $error = $dataService->getLastError();
+                $sdkMsg = ($qbVendor instanceof \Exception) ? $qbVendor->getMessage() : null;
+                $errorBody = $sdkMsg ?? ($error ? $error->getResponseBody() : '');
             }
+
             throw new \Exception('Failed to create QB Vendor: ' . ($errorBody ?: 'Unknown'));
         }
 
-        $vendor->update(['quickbooks_vendor_id' => $qbVendor->Id]);
+        $vendor->update([
+            'quickbooks_vendor_id' => $qbVendor->Id,
+            'quickbooks_synced_at' => now(),
+        ]);
         return $qbVendor->Id;
     }
 
@@ -1626,31 +1762,47 @@ class QuickBooksService
     }
 
     /**
-     * Create payment for invoice (marks as PAID)
+     * Create payment for invoice (marks as PAID or partial payment)
      */
-    protected function createPaymentForInvoice($dataService, $qbInvoice, float $amount)
+    protected function createPaymentForInvoice($dataService, $qbInvoice, float $amount, ?string $note = null)
     {
-        Log::info('Creating QB payment for invoice: ' . $qbInvoice->Id);
+        $qbInvoiceId = is_object($qbInvoice) ? $qbInvoice->Id : (string)$qbInvoice;
+        Log::info('Creating QB payment for invoice: ' . $qbInvoiceId, ['amount' => $amount]);
 
-        $customerRefValue = is_object($qbInvoice->CustomerRef)
-            ? $qbInvoice->CustomerRef->value
-            : $qbInvoice->CustomerRef;
+        $customerRefValue = null;
+        if (is_object($qbInvoice)) {
+            $customerRefValue = is_object($qbInvoice->CustomerRef)
+                ? $qbInvoice->CustomerRef->value
+                : $qbInvoice->CustomerRef;
+        }
+
+        // If customerRefValue not resolved from qbInvoice object, fetch from QB
+        if (!$customerRefValue) {
+            try {
+                $fetched = $dataService->FindById('Invoice', $qbInvoiceId);
+                if ($fetched) {
+                    $customerRefValue = is_object($fetched->CustomerRef) ? $fetched->CustomerRef->value : $fetched->CustomerRef;
+                }
+            } catch (\Exception $e) {
+                Log::warning('Failed to fetch QB Invoice for customer ref: ' . $e->getMessage());
+            }
+        }
 
         $linkedTxn = new IPPLinkedTxn();
-        $linkedTxn->TxnId = (string)$qbInvoice->Id;
+        $linkedTxn->TxnId = (string)$qbInvoiceId;
         $linkedTxn->TxnType = 'Invoice';
 
         $paymentObj = Payment::create([
             'CustomerRef' => [
                 'value' => (string)$customerRefValue,
             ],
-            'TotalAmt' => $amount,
+            'TotalAmt' => round($amount, 2),
             'TxnDate' => now()->format('Y-m-d'),
             'Line' => [[
-                'Amount' => $amount,
+                'Amount' => round($amount, 2),
                 'LinkedTxn' => [$linkedTxn],
             ]],
-            'PrivateNote' => 'Synced from BCF System',
+            'PrivateNote' => $note ?: 'Synced from BCF System',
         ]);
 
         $qbPayment = $dataService->Add($paymentObj);
@@ -1658,13 +1810,65 @@ class QuickBooksService
         if (!$qbPayment || $qbPayment instanceof \Exception) {
             $error = $dataService->getLastError();
             Log::error('QB payment creation failed', [
-                'invoice_id' => $qbInvoice->Id,
+                'invoice_id' => $qbInvoiceId,
                 'error' => ($qbPayment instanceof \Exception) ? $qbPayment->getMessage() : ($error ? $error->getResponseBody() : null),
             ]);
             return null;
         }
 
         return $qbPayment;
+    }
+
+    /**
+     * Sync any unsynced successful payments for an Order against its Main Invoice
+     */
+    public function syncPendingPaymentsForOrder($dataService, \App\Models\Invoice $mainInvoice, $qbInvoice = null): array
+    {
+        if (!$mainInvoice->order_id || !$mainInvoice->quickbooks_invoice_id) {
+            return [];
+        }
+
+        $qbInvoiceId = $mainInvoice->quickbooks_invoice_id;
+
+        // Find all successful payments for this order that have not yet been synced to QB
+        $unsyncedPayments = AgentPayment::where('order_id', $mainInvoice->order_id)
+            ->where('status', 'succeeded')
+            ->where('amount', '>', 0)
+            ->whereNull('quickbooks_payment_id')
+            ->orderBy('id', 'asc')
+            ->get();
+
+        $syncedPaymentIds = [];
+
+        foreach ($unsyncedPayments as $payment) {
+            $payAmount = (float)$payment->amount;
+            if ($payAmount <= 0) continue;
+
+            $note = "Payment #{$payment->id} for Order #{$mainInvoice->order_id}";
+            $qbPayment = $this->createPaymentForInvoice($dataService, $qbInvoice ?: $qbInvoiceId, $payAmount, $note);
+
+            if ($qbPayment && !($qbPayment instanceof \Exception) && !empty($qbPayment->Id)) {
+                $payment->update([
+                    'quickbooks_invoice_id' => $qbInvoiceId,
+                    'quickbooks_payment_id' => $qbPayment->Id,
+                    'quickbooks_txn_id'     => $mainInvoice->invoice_number,
+                    'quickbooks_synced_at'  => now(),
+                ]);
+                $syncedPaymentIds[] = $qbPayment->Id;
+                Log::info("QB Payment #{$qbPayment->Id} synced for AgentPayment #{$payment->id} against QB Invoice #{$qbInvoiceId}");
+            }
+        }
+
+        // Also update any payments already linked that missed invoice_id reference
+        AgentPayment::where('order_id', $mainInvoice->order_id)
+            ->where('status', 'succeeded')
+            ->whereNull('quickbooks_invoice_id')
+            ->update([
+                'quickbooks_invoice_id' => $qbInvoiceId,
+                'quickbooks_synced_at'  => now(),
+            ]);
+
+        return $syncedPaymentIds;
     }
 
     /**
@@ -1700,6 +1904,125 @@ class QuickBooksService
     }
 
     /**
+     * Get expense / COGS account ID from QuickBooks with intelligent discovery
+     */
+    protected function getExpenseAccountId($dataService): string
+    {
+        $orgId = $this->organization?->id ?? 'default';
+        $cacheKey = 'qb_expense_account_id_' . $orgId;
+
+        return Cache::remember($cacheKey, 3600, function () use ($dataService) {
+            try {
+                // Priority 1: Config override, verified via FindById
+                $configuredId = config('quickbooks.accounts.expense_id');
+                if ($configuredId) {
+                    try {
+                        $acc = $dataService->FindById('Account', $configuredId);
+                        if ($acc && ($acc->Active === true || $acc->Active === 'true')) {
+                            return (string) $configuredId;
+                        }
+                    } catch (\Exception $e) {
+                        Log::warning("Configured QB expense account {$configuredId} invalid: " . $e->getMessage());
+                    }
+                }
+
+                // Priority 2: Query active Cost of Goods Sold & Expense accounts
+                $accounts = $dataService->Query("SELECT * FROM Account WHERE AccountType IN ('Cost of Goods Sold', 'Expense') AND Active = true");
+
+                if (!empty($accounts) && is_array($accounts)) {
+                    $preferredNames = [
+                        'subcontracted services',
+                        'contractors',
+                        'subcontractors',
+                        'cost of labor - cos',
+                        'cost of labor',
+                        'job expenses',
+                        'contract labor',
+                        'cost of goods sold',
+                        'subcontractor expense',
+                    ];
+
+                    foreach ($preferredNames as $preferred) {
+                        foreach ($accounts as $account) {
+                            $name = strtolower(trim($account->Name ?? ''));
+                            if ($name === $preferred || str_contains($name, $preferred)) {
+                                return (string) $account->Id;
+                            }
+                        }
+                    }
+
+                    // Priority 3: First active COGS or Expense account
+                    return (string) $accounts[0]->Id;
+                }
+
+                return (string) ($configuredId ?: '1');
+            } catch (\Exception $e) {
+                Log::warning('Could not discover QB expense account: ' . $e->getMessage());
+                return (string) (config('quickbooks.accounts.expense_id', '1'));
+            }
+        });
+    }
+
+    /**
+     * Get bank account ID from QuickBooks with intelligent discovery for bill payments
+     */
+    protected function getBankAccountId($dataService): string
+    {
+        $orgId = $this->organization?->id ?? 'default';
+        $cacheKey = 'qb_bank_account_id_' . $orgId;
+
+        return Cache::remember($cacheKey, 3600, function () use ($dataService) {
+            try {
+                // Priority 1: Config override, verified via FindById
+                $configuredId = config('quickbooks.accounts.bank_id');
+                if ($configuredId) {
+                    try {
+                        $acc = $dataService->FindById('Account', $configuredId);
+                        if ($acc && ($acc->Active === true || $acc->Active === 'true')) {
+                            return (string) $configuredId;
+                        }
+                    } catch (\Exception $e) {
+                        Log::warning("Configured QB bank account {$configuredId} invalid: " . $e->getMessage());
+                    }
+                }
+
+                // Priority 2: Query active Bank accounts
+                $accounts = $dataService->Query("SELECT * FROM Account WHERE AccountType = 'Bank' AND Active = true");
+
+                if (!empty($accounts) && is_array($accounts)) {
+                    $preferredNames = [
+                        'stripe clearing',
+                        'stripe',
+                        'checking',
+                        'chequing',
+                        'operating',
+                        'operating account',
+                        'business checking',
+                        'main checking',
+                    ];
+
+                    foreach ($preferredNames as $preferred) {
+                        foreach ($accounts as $account) {
+                            $name = strtolower(trim($account->Name ?? ''));
+                            if ($name === $preferred || str_contains($name, $preferred)) {
+                                return (string) $account->Id;
+                            }
+                        }
+                    }
+
+                    // Priority 3: First active Bank account
+                    return (string) $accounts[0]->Id;
+                }
+
+                return (string) ($configuredId ?: '1');
+            } catch (\Exception $e) {
+                Log::warning('Could not discover QB bank account: ' . $e->getMessage());
+                return (string) (config('quickbooks.accounts.bank_id', '1'));
+            }
+        });
+    }
+
+    /**
      * Retry failed syncs — dispatches queued jobs to avoid HTTP timeout.
      * Finds paid invoices missing quickbooks_invoice_id and queues them for sync.
      */
@@ -1713,6 +2036,18 @@ class QuickBooksService
         $query = \App\Models\Invoice::whereNull('quickbooks_invoice_id')
             ->whereIn('status', ['paid', 'partially_paid'])
             ->where('total', '>', 0)
+            ->where(function ($q) {
+                // In One Main Invoice Per Order model, only select Main/Consolidated invoices for retry
+                $q->where('notes', 'ilike', '%consolidated%')
+                  ->orWhere('notes', 'ilike', '%add-on service invoice%')
+                  ->orWhere(function ($sub) {
+                      $sub->where('agent_type', 'primary')
+                          ->where(function ($s2) {
+                              $s2->whereNull('notes')
+                                 ->orWhere('notes', 'not ilike', '%service invoice%');
+                          });
+                  });
+            })
             ->select('id'); // Only fetch IDs — jobs load the full model themselves
 
         if ($orgId) {
@@ -1727,11 +2062,37 @@ class QuickBooksService
             \App\Jobs\SyncInvoiceToQuickBooks::dispatch($invoiceId);
         }
 
-        Log::info('QB retry: all jobs dispatched', ['total' => $invoiceIds->count()]);
+        // Also retry unsynced paid vendor invoices if vendor sync is enabled
+        $vendorInvoiceIds = collect();
+        if (config('quickbooks.vendor_sync_enabled', true)) {
+            $vQuery = \App\Models\VendorInvoice::where('status', 'paid')
+                ->where('total_amount', '>', 0)
+                ->where(function ($q) {
+                    $q->whereNull('quickbooks_bill_id')
+                      ->orWhereNull('quickbooks_bill_payment_id');
+                })
+                ->select('id');
+
+            if ($orgId) {
+                $vQuery->where('organization_id', $orgId);
+            }
+
+            $vendorInvoiceIds = $vQuery->limit(50)->pluck('id');
+            Log::info('QB retry: dispatching ' . $vendorInvoiceIds->count() . ' vendor invoice jobs to queue');
+
+            foreach ($vendorInvoiceIds as $vInvoiceId) {
+                \App\Jobs\SyncVendorPayoutToQuickBooks::dispatch($vInvoiceId);
+            }
+        }
+
+        $totalQueued = $invoiceIds->count() + $vendorInvoiceIds->count();
+        Log::info('QB retry: all jobs dispatched', ['total' => $totalQueued]);
 
         return [
-            'queued' => $invoiceIds->count(),
-            'total'  => $invoiceIds->count(),
+            'queued' => $totalQueued,
+            'invoices_queued' => $invoiceIds->count(),
+            'vendor_invoices_queued' => $vendorInvoiceIds->count(),
+            'total'  => $totalQueued,
         ];
     }
 

@@ -143,6 +143,42 @@ class GlobalSettingsApiTest extends TestCase
     }
 
     /**
+     * Test saving tour_settings with custom floorplan_names
+     */
+    public function test_super_admin_can_save_floorplan_names()
+    {
+        $payload = [
+            'value' => [
+                'music_enabled' => true,
+                'default_song' => 'tell-me-what',
+                'transition_effect' => ['kenburns'],
+                'layout_option' => 'standard',
+                'video_slideshow_enabled' => true,
+                'letterbox_correction' => true,
+                'aspect_ratio' => '16:9',
+                'autoplay_enabled' => true,
+                'allow_print_download' => true,
+                'allow_client_upload' => true,
+                'floorplan_names' => [
+                    'Main Floor',
+                    'Upper Floor',
+                    'Basement Suite',
+                ],
+            ]
+        ];
+
+        $response = $this->actingAs($this->superAdmin, 'api')
+            ->postJson('/api/settings/tour_settings', $payload);
+
+        $response->assertStatus(200)
+            ->assertJsonPath('setting.value.floorplan_names', [
+                'Main Floor',
+                'Upper Floor',
+                'Basement Suite',
+            ]);
+    }
+
+    /**
      * Test saving global portal settings via POST /global-settings
      */
     public function test_super_admin_can_save_global_portal_settings()

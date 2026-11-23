@@ -48,14 +48,43 @@ class SyncInvoiceToQuickBooks implements ShouldQueue
             return;
         }
 
-        // Only sync if payment was successful (per client feedback)
-        // or if it's explicitly triggered for a partial payment
-        if ($invoice->paid_amount <= 0 && $invoice->status !== 'paid') {
+        // ONE MAIN INVOICE PER ORDER MODEL:
+        // If this is an individual service invoice (e.g. notes = 'Service Invoice: ...'),
+        // resolve the Order's Main (Consolidated) Invoice instead of creating a duplicate QB invoice.
+        if ($invoice->order_id && $invoice->notes && stripos($invoice->notes, 'service invoice') !== false) {
+            $mainInvoice = Invoice::with(['order.property', 'items.orderService.service', 'agent', 'order.organization'])
+                ->where('order_id', $invoice->order_id)
+                ->where(function ($q) {
+                    $q->where('notes', 'ilike', '%consolidated%')
+                      ->orWhere('notes', 'ilike', '%add-on service invoice%');
+                })
+                ->first();
+
+            // Fallback: look for primary agent invoice not flagged as service invoice
+            if (!$mainInvoice) {
+                $mainInvoice = Invoice::with(['order.property', 'items.orderService.service', 'agent', 'order.organization'])
+                    ->where('order_id', $invoice->order_id)
+                    ->where('agent_type', 'primary')
+                    ->where(function ($q) {
+                        $q->whereNull('notes')
+                          ->orWhere('notes', 'not ilike', '%service invoice%');
+                    })
+                    ->first();
+            }
+
+            if ($mainInvoice) {
+                Log::info("QuickBooks Sync Job: Redirecting service invoice #{$invoice->id} to Order Main Invoice #{$mainInvoice->id}");
+                $invoice = $mainInvoice;
+            }
+        }
+
+        // Only sync if payment was successful or invoice is marked paid / partially paid
+        if ($invoice->paid_amount <= 0 && $invoice->status !== 'paid' && $invoice->status !== 'partially_paid') {
             Log::info("QuickBooks Sync Job: Skipping unpaid invoice {$invoice->id}");
             return;
         }
 
-        Log::info("QuickBooks Sync Job: Syncing invoice {$invoice->id} to QB");
+        Log::info("QuickBooks Sync Job: Syncing Main Invoice {$invoice->id} (Order #{$invoice->order_id}) to QB");
         $qbService->syncInvoiceToQB($invoice);
     }
 }

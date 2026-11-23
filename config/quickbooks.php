@@ -26,7 +26,7 @@ return [
     |--------------------------------------------------------------------------
     */
     'auto_sync_enabled' => env('QUICKBOOKS_AUTO_SYNC', true),
-    'vendor_sync_enabled' => env('QUICKBOOKS_VENDOR_SYNC', false), // Keep disabled until client confirms mapping
+    'vendor_sync_enabled' => env('QUICKBOOKS_VENDOR_SYNC', true),
     'two_way_sync_enabled' => env('QUICKBOOKS_TWO_WAY_SYNC', false), // Webhooks sync back to BCF
     'retry_failed_syncs' => env('QUICKBOOKS_RETRY_FAILED_SYNCS', true),
     'max_retry_attempts' => env('QUICKBOOKS_MAX_RETRY_ATTEMPTS', 3),
@@ -42,6 +42,7 @@ return [
     'accounts' => [
         'income_id' => env('QUICKBOOKS_INCOME_ACCOUNT_ID'),
         'expense_id' => env('QUICKBOOKS_EXPENSE_ACCOUNT_ID'),
+        'bank_id' => env('QUICKBOOKS_BANK_ACCOUNT_ID'),
         'ar_id' => env('QUICKBOOKS_AR_ACCOUNT_ID'),
         'ap_id' => env('QUICKBOOKS_AP_ACCOUNT_ID'),
     ],

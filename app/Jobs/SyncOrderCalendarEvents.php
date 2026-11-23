@@ -21,10 +21,16 @@ class SyncOrderCalendarEvents implements ShouldQueue
     public $timeout = 120;
     public $backoff = [5, 15, 30];
 
+    public int $orderId;
+    public array $deletedSlotIds;
+
     public function __construct(
-        public int $orderId,
-        public array $deletedSlotIds = []
-    ) {}
+        int|Order $orderId,
+        array $deletedSlotIds = []
+    ) {
+        $this->orderId = $orderId instanceof Order ? (int)$orderId->id : (int)$orderId;
+        $this->deletedSlotIds = $deletedSlotIds;
+    }
 
     public function handle(): void
     {
@@ -141,6 +147,14 @@ class SyncOrderCalendarEvents implements ShouldQueue
             return;
         }
 
+        if (!$vendor->sync_google_calendar) {
+            Log::info('Vendor skipped (sync_google_calendar disabled in settings)', [
+                'vendor_id' => $vendor->id,
+                'order_id' => $order->id,
+            ]);
+            return;
+        }
+
         Log::info('Syncing order slots for vendor', [
             'order_id' => $order->id,
             'vendor_id' => $vendor->id,
@@ -236,6 +250,14 @@ class SyncOrderCalendarEvents implements ShouldQueue
 
         if (!$agent->google_access_token) {
             Log::info('Agent skipped (no Google calendar token)', [
+                'agent_id' => $agent->id,
+                'order_id' => $order->id,
+            ]);
+            return;
+        }
+
+        if (!$agent->sync_google_calendar) {
+            Log::info('Agent skipped (sync_google_calendar disabled in settings)', [
                 'agent_id' => $agent->id,
                 'order_id' => $order->id,
             ]);
@@ -610,12 +632,49 @@ class SyncOrderCalendarEvents implements ShouldQueue
      */
     protected function handleDeletedSlots(GoogleCalendarService $calendarService, array $slotIds): void
     {
-        // Handle Agent event deletion if whole order is effectively deleted or affected
-        // Since we are grouping by slots, if all slots of an order are deleted, we should probably delete agent event too.
-        // But usually this job is called per order. 
-        
+        $rawSlotIds = [];
+
+        foreach ($slotIds as $item) {
+            if (is_array($item)) {
+                try {
+                    if (!empty($item['google_event_id'])) {
+                        $vendor = !empty($item['vendor'])
+                            ? ($item['vendor'] instanceof \App\Models\Vendor ? $item['vendor'] : \App\Models\Vendor::withoutGlobalScopes()->find($item['vendor']))
+                            : null;
+                        if ($vendor && $vendor->google_access_token) {
+                            $calendarService->deleteEvent($vendor, $item['google_event_id']);
+                            Log::info('Vendor calendar event deleted via pre-captured slot info', [
+                                'vendor_id' => $vendor->id,
+                                'event_id' => $item['google_event_id'],
+                            ]);
+                        }
+                    }
+                    if (!empty($item['agent_google_event_id'])) {
+                        $agent = !empty($item['agent'])
+                            ? ($item['agent'] instanceof \App\Models\Agent ? $item['agent'] : \App\Models\Agent::withoutGlobalScopes()->find($item['agent']))
+                            : null;
+                        if ($agent && $agent->google_access_token) {
+                            $calendarService->deleteEvent($agent, $item['agent_google_event_id']);
+                            Log::info('Agent calendar event deleted via pre-captured slot info', [
+                                'agent_id' => $agent->id,
+                                'event_id' => $item['agent_google_event_id'],
+                            ]);
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    Log::error('Failed to delete calendar event from pre-captured slot info: ' . $e->getMessage());
+                }
+            } elseif (is_numeric($item)) {
+                $rawSlotIds[] = (int)$item;
+            }
+        }
+
+        if (empty($rawSlotIds)) {
+            return;
+        }
+
         $deletedSlots = OrderSlot::with(['vendor', 'order.agent'])
-            ->whereIn('id', $slotIds)
+            ->whereIn('id', $rawSlotIds)
             ->get();
 
         foreach ($deletedSlots as $slot) {

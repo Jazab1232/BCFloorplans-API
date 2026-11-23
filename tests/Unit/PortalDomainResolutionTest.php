@@ -35,11 +35,18 @@ class PortalDomainResolutionTest extends TestCase
         $org->is_whitelabel = true;
         $org->domain = 'realtycorp.com';
 
-        // When no domain records exist, falls back to $org->domain
-        $resolvedAgent = $service->resolvePortalBaseUrl('agent', $org);
-        $resolvedAdmin = $service->resolvePortalBaseUrl('admin', $org);
+        // When domain records exist in relation, resolves portal_type 'agent'
+        $agentDomainRecord = new \App\Models\OrganizationDomain([
+            'domain' => 'agent.realtycorp.com',
+            'portal_type' => 'agent',
+        ]);
+        $org->setRelation('domains', collect([$agentDomainRecord]));
 
-        $this->assertSame('https://realtycorp.com', $resolvedAgent);
+        $resolvedAgent = $service->resolvePortalBaseUrl('agent', $org);
+        $this->assertSame('https://agent.realtycorp.com', $resolvedAgent);
+
+        // When no domain record for a role exists, falls back to $org->domain
+        $resolvedAdmin = $service->resolvePortalBaseUrl('admin', $org);
         $this->assertSame('https://realtycorp.com', $resolvedAdmin);
     }
 

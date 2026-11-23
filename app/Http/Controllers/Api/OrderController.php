@@ -549,214 +549,25 @@ class OrderController extends Controller
             $agentDiscountInput = $request->input('agent_discount') ?? ($agent->agent_discount ?? null);
             $agentDiscount = $this->resolveAgentDiscount($agent, $agentDiscountInput, $totalAmount);
 
-            // 3-Way Best Single Discount Selection: Package vs Agent vs Coupon / Manual Discounts
-            // Rule: Whichever single discount produces the LARGEST absolute savings amount wins.
-            // Only ONE discount is applied to the order.
-            $rawPkgVal = $bestPackage ? (float)$packageDiscountAmount : 0;
-            $rawAgentVal = $agentDiscount ? (float)$agentDiscount['discount_value'] : 0;
-
-            // Calculate potential coupon / manual discounts value on base amount
-            $rawCodeVal = 0.0;
-            $resolvedCodeDiscounts = [];
-            if (isset($data['discounts'])) {
-                foreach ($data['discounts'] as $discount) {
-                    $discountModel = Discount::where('uuid', $discount['discount_id'])->first();
-                    $discSvcInput = $discount['service_id'] ?? null;
-                    $discSvc = null;
-                    if ($discSvcInput) {
-                        $discSvc = is_numeric($discSvcInput)
-                            ? Service::find((int) $discSvcInput)
-                            : (Str::isUuid($discSvcInput) ? Service::where('uuid', $discSvcInput)->first() : null);
-                    }
-
-                    $baseForDisc = $discSvc ? ($serviceAmounts[$discSvc->id] ?? 0) : $totalAmount;
-                    $discVal = $this->calculateDiscountValue($baseForDisc, (float)$discount['value'], $discount['type']);
-                    $rawCodeVal += $discVal;
-
-                    $resolvedCodeDiscounts[] = [
-                        'model' => $discountModel,
-                        'type' => $discount['type'],
-                        'value' => $discount['value'],
-                        'calculated_value' => $discVal,
-                        'service_id' => $discSvc?->id,
-                    ];
-                }
+            $currentMeta = $order->meta ?? [];
+            if ($bestPackage) {
+                $currentMeta['applied_package'] = $packageInfo;
+                $order->package_id = $bestPackage->id;
             }
-
-            $maxDiscountVal = max($rawPkgVal, $rawAgentVal, $rawCodeVal);
-            $winnerType = 'none';
-
-            if ($maxDiscountVal > 0) {
-                if ($rawAgentVal >= $maxDiscountVal) {
-                    $winnerType = 'agent';
-                } elseif ($rawPkgVal >= $maxDiscountVal) {
-                    $winnerType = 'package';
-                } else {
-                    $winnerType = 'code';
-                }
-            }
-
-            Log::info('Best Single Discount Selection (3-Way)', [
-                'winner' => $winnerType,
-                'agent_discount' => $rawAgentVal,
-                'package_discount' => $rawPkgVal,
-                'code_discount' => $rawCodeVal,
-            ]);
-
-            // Add ONLY the winning discount to processing queue
-            if ($winnerType === 'package' && $bestPackage) {
-                $discountDetails[] = [
-                    'model' => null,
-                    'type' => 'package',
-                    'value' => $rawPkgVal,
-                    'service_id' => null,
-                    'package' => $bestPackage,
-                ];
-                // Package won: remove any pre-saved agent_discount from meta so it doesn't
-                // appear on invoices (resolveAgentDiscountForInvoice reads meta['agent_discount']).
-                $currentMeta = $order->meta ?? [];
-                $currentMeta['winning_discount'] = 'package';
-                if (isset($currentMeta['agent_discount'])) {
-                    unset($currentMeta['agent_discount']);
-                }
-                $order->update(['meta' => $currentMeta]);
-            } elseif ($winnerType === 'code' && !empty($resolvedCodeDiscounts)) {
-                foreach ($resolvedCodeDiscounts as $rcd) {
-                    $discountDetails[] = [
-                        'model' => $rcd['model'],
-                        'type' => $rcd['type'],
-                        'value' => $rcd['value'],
-                        'service_id' => $rcd['service_id'],
-                    ];
-                }
-                // Code won: remove any pre-saved agent_discount and applied_package from meta
-                $currentMeta = $order->meta ?? [];
-                $currentMeta['winning_discount'] = 'code';
-                if (isset($currentMeta['agent_discount'])) {
-                    unset($currentMeta['agent_discount']);
-                }
-                if (isset($currentMeta['applied_package'])) {
-                    unset($currentMeta['applied_package']);
-                }
-                $order->package_id = null;
-                $order->meta = $currentMeta;
-                $order->save();
-            } elseif ($winnerType === 'agent' && $agentDiscount) {
-                $discountDetails[] = [
-                    'model' => null,
-                    'type' => 'agent',
-                    'value' => $agentDiscount['discount_value'],
-                    'rate' => $agentDiscount['amount'],
-                    'service_id' => null,
-                    'name' => $agentDiscount['name'],
-                    'data' => $agentDiscount['data'],
-                ];
-
-                $currentMeta = $order->meta ?? [];
-                $currentMeta['winning_discount'] = 'agent';
-                if (isset($currentMeta['applied_package'])) {
-                    unset($currentMeta['applied_package']);
-                }
+            if ($agentDiscount) {
                 $currentMeta['agent_discount'] = array_merge($agentDiscount['data'], [
                     'calculated_discount_amount' => $agentDiscount['discount_value']
                 ]);
-                $order->package_id = null;
-                $order->meta = $currentMeta;
-                $order->save();
-
-                Log::info('✅ AGENT DISCOUNT APPLIED (STORE)', [
-                    'agent_id' => $agent->id,
-                    'discount_name' => $agentDiscount['name'],
-                    'discount_amount' => $agentDiscount['discount_value'],
-                    'is_percentage' => $agentDiscount['is_percentage'],
-                ]);
             }
-
-            // Calculate totals with discounts
-            $discountAmount = 0;
-            $orderTotals = [];
-
-            // First apply service-specific discounts
-            foreach ($discountDetails as $discount) {
-                if ($discount['service_id']) {
-                    if (isset($orderServices[$discount['service_id']])) {
-                        $serviceAmount = $serviceAmounts[$discount['service_id']];
-                        $discountValue = $this->calculateDiscountValue($serviceAmount, $discount['value'], $discount['type']);
-                        
-                        $orderTotals[] = [
-                            'uuid' => Str::uuid()->toString(),
-                            'order_id' => $order->id,
-                            'order_service_id' => $orderServices[$discount['service_id']]->id ?? null,
-                            'discount_id' => $discount['model']->id ?? null,
-                            'amount' => $serviceAmount - $discountValue,
-                            'discount_type' => $discount['type'] ?? null,
-                            'discount_value' => $discount['value'] ?? null,
-                            'sort_order' => 0,
-                        ];
-
-                        $discountAmount += $discountValue;
-                        $serviceAmounts[$discount['service_id']] -= $discountValue;
-                    }
-                }
+            if (!empty($data['discounts'])) {
+                $currentMeta['discounts'] = $data['discounts'];
             }
+            $order->meta = $currentMeta;
+            $order->save();
 
-            // Then apply order-wide discounts (including package and agent)
-            foreach ($discountDetails as $discount) {
-                if (!$discount['service_id']) {
-                    // Package and agent discounts are already calculated, others need calculation
-                    if ($discount['type'] === 'package' || $discount['type'] === 'agent') {
-                        $discountValue = $discount['value']; // Already calculated
-                    } else {
-                        $discountValue = $this->calculateDiscountValue($totalAmount, $discount['value'], $discount['type']);
-                    }
-                    
-                    $orderTotals[] = [
-                        'uuid' => Str::uuid()->toString(),
-                        'order_id' => $order->id,
-                        'order_service_id' => null,
-                        'discount_id' => $discount['model']->id ?? null,
-                        'amount' => -$discountValue,
-                        'discount_type' => $discount['type'] ?? null,
-                        'discount_value' => $discount['rate'] ?? ($discount['value'] ?? null),
-                        'sort_order' => $discount['type'] === 'package' ? 0 : 1,
-                    ];
-
-                    $discountAmount += $discountValue;
-                }
-            }
-
-            // Create service totals (after discounts)
-            foreach ($orderServices as $serviceId => $orderService) {
-                $orderTotals[] = [
-                    'uuid' => Str::uuid()->toString(),
-                    'order_id' => $order->id,
-                    'order_service_id' => $orderService->id ?? null,
-                    'discount_id' => null,
-                    'amount' => $serviceAmounts[$serviceId],
-                    'discount_type' => null,
-                    'discount_value' => null,
-                    'sort_order' => 2,
-                ];
-            }
-
-            // Create the final order total
-            $finalAmount = $totalAmount - $discountAmount;
-            $orderTotals[] = [
-                'uuid' => Str::uuid()->toString(),
-                'order_id' => $order->id,
-                'order_service_id' => null,
-                'discount_id' => null,
-                'amount' => $finalAmount,
-                'discount_type' => null,
-                'discount_value' => null,
-                'sort_order' => 3,
-            ];
-
-            // Update the order amount with the discounted total
-            $order->update(['amount' => $finalAmount]);
-
-            // Create all order totals
-            OrderTotal::insert($orderTotals);
+            // Run Per-Service Best Discount recalculation to generate OrderTotals and calculate final amount
+            $priceResult = $this->recalculateTotals($order, $data['discounts'] ?? [], $serviceAmounts, $totalAmount);
+            $finalAmount = $priceResult['final_amount'] ?? $totalAmount;
 
             // Validate Twilight slots constraint
             if (!empty($request->slots)) {
@@ -2324,8 +2135,31 @@ private function processSlots($order, array $incomingSlots): array
                 'time' => $existing->start_time . ' - ' . $existing->end_time,
             ];
             
-            // ✅ CAPTURE SLOT ID BEFORE DELETION (for calendar cleanup)
-            $deletedSlotIds[] = $existing->id;
+            // ✅ CAPTURE SLOT ID & CLEANUP CALENDAR BEFORE DELETION
+            $existing->loadMissing(['vendor', 'order.agent']);
+            if (class_exists(\App\Services\GoogleCalendarService::class)) {
+                $calendarService = app(\App\Services\GoogleCalendarService::class);
+                if ($existing->google_event_id && $existing->vendor && $existing->vendor->google_access_token) {
+                    try {
+                        $calendarService->deleteEvent($existing->vendor, $existing->google_event_id);
+                    } catch (\Throwable $e) {
+                        Log::warning('Failed to delete vendor calendar event on slot removal: ' . $e->getMessage());
+                    }
+                }
+                if ($existing->agent_google_event_id && $order->agent && $order->agent->google_access_token) {
+                    try {
+                        $calendarService->deleteEvent($order->agent, $existing->agent_google_event_id);
+                    } catch (\Throwable $e) {
+                        Log::warning('Failed to delete agent calendar event on slot removal: ' . $e->getMessage());
+                    }
+                }
+            }
+            $deletedSlotIds[] = [
+                'vendor' => $existing->vendor_id,
+                'google_event_id' => $existing->google_event_id,
+                'agent' => $order->agent_id,
+                'agent_google_event_id' => $existing->agent_google_event_id,
+            ];
             
             // Dispatch slot_cancelled to vendor prior to deletion
             if ($existing->vendor_id && !request()->boolean('suppress_email') && !request()->boolean('skip_email')) {
@@ -2421,151 +2255,98 @@ private function recalculateTotals($order, array $discounts, array $serviceAmoun
     $agent = $order->agent ?? Agent::find($order->agent_id);
     $agentDiscount = $this->resolveAgentDiscount($agent, $agentDiscountInput, $totalAmount);
 
-    // Option B: Pick Maximum / Best Single Discount between Package and Agent Discount
-    $rawPkgVal = (float)$packageDiscountAmount;
-    $rawAgentVal = $agentDiscount ? (float)$agentDiscount['discount_value'] : 0;
-
-    $applyPackage = false;
-    $applyAgent = false;
-
-    // 3-Way Best Single Discount Selection (RECALCULATE): Package vs Agent vs Coupon / Manual Discounts
-    $rawPkgVal = (float)$packageDiscountAmount;
-    $rawAgentVal = $agentDiscount ? (float)$agentDiscount['discount_value'] : 0;
-
-    $rawCodeVal = 0.0;
-    $resolvedCodeDiscounts = [];
-    foreach ($discounts as $discount) {
-        $discountModel = Discount::where('uuid', $discount['discount_id'])->first();
-        if (!$discountModel) continue;
-
-        $val = $this->calculateDiscountValue(
-            $totalAmount,
-            $discount['value'],
-            $discount['type']
-        );
-        $rawCodeVal += $val;
-        $resolvedCodeDiscounts[] = [
-            'model' => $discountModel,
-            'type' => $discount['type'],
-            'value' => $discount['value'],
-            'calculated_value' => $val,
-        ];
+    $currentMeta = $order->meta ?? [];
+    if ($agentDiscount) {
+        $currentMeta['agent_discount'] = array_merge($agentDiscount['data'], [
+            'calculated_discount_amount' => $agentDiscount['discount_value']
+        ]);
     }
+    if (!empty($discounts)) {
+        $currentMeta['discounts'] = $discounts;
+    }
+    $order->meta = $currentMeta;
+    $order->save();
 
-    $maxDiscountVal = max($rawPkgVal, $rawAgentVal, $rawCodeVal);
-    $winnerType = 'none';
+    // Per-Service Best Discount Engine: evaluate each service individually
+    $order->loadMissing(['services.service', 'services.option']);
+    $totalPkgVal = 0.0;
+    $totalAgentVal = 0.0;
+    $totalCodeVal = 0.0;
+    $lineItemDiscounts = [];
 
-    if ($maxDiscountVal > 0) {
-        if ($rawAgentVal >= $maxDiscountVal) {
-            $winnerType = 'agent';
-        } elseif ($rawPkgVal >= $maxDiscountVal) {
-            $winnerType = 'package';
-        } else {
-            $winnerType = 'code';
+    foreach ($order->services as $os) {
+        $winner = \App\Models\Invoice::resolveServiceWinningDiscount($order, $os, 1.0);
+        if (!$winner) {
+            $lineItemDiscounts[$os->id] = ['winner' => 'none', 'amount' => 0.0];
+            continue;
+        }
+
+        $amt = abs((float)($winner['amount'] ?? 0));
+        $type = $winner['type'] ?? '';
+
+        if ($type === 'package_discount') {
+            $totalPkgVal += $amt;
+            $lineItemDiscounts[$os->id] = ['winner' => 'package', 'amount' => $amt, 'description' => $winner['description'] ?? ''];
+        } elseif ($type === 'agent_discount') {
+            $totalAgentVal += $amt;
+            $lineItemDiscounts[$os->id] = ['winner' => 'agent', 'amount' => $amt, 'description' => $winner['description'] ?? ''];
+        } elseif ($type === 'code_discount') {
+            $totalCodeVal += $amt;
+            $lineItemDiscounts[$os->id] = ['winner' => 'code', 'amount' => $amt, 'description' => $winner['description'] ?? ''];
         }
     }
 
-    Log::info('Best Single Discount Selection (RECALCULATE 3-Way)', [
-        'order_uuid' => $order->uuid,
-        'winner' => $winnerType,
-        'agent_discount' => $rawAgentVal,
-        'package_discount' => $rawPkgVal,
-        'code_discount' => $rawCodeVal,
-    ]);
-
-    if ($winnerType === 'package' && $rawPkgVal > 0) {
+    if ($totalPkgVal > 0) {
         $orderTotals[] = [
             'uuid' => (string) Str::uuid(),
             'order_id' => $order->id,
             'discount_id' => null,
-            'amount' => -$rawPkgVal,
+            'amount' => -round($totalPkgVal, 2),
             'discount_type' => 'package',
-            'discount_value' => $rawPkgVal,
+            'discount_value' => round($totalPkgVal, 2),
             'sort_order' => 0,
             'order_service_id' => null,
         ];
-        
-        $discountAmount += $rawPkgVal;
-
-        // Package won: ensure agent_discount is NOT in meta (so invoices don't show it)
-        $currentMeta = $order->meta ?? [];
-        $currentMeta['winning_discount'] = 'package';
-        if (isset($currentMeta['agent_discount'])) {
-            unset($currentMeta['agent_discount']);
-        }
-        $order->meta = $currentMeta;
-        $order->save();
-    } elseif ($winnerType === 'code' && !empty($resolvedCodeDiscounts)) {
-        foreach ($resolvedCodeDiscounts as $rcd) {
-            $val = $rcd['calculated_value'];
-            $discountAmount += $val;
-
-            $orderTotals[] = [
-                'uuid' => (string) Str::uuid(),
-                'order_id' => $order->id,
-                'discount_id' => $rcd['model']->id,
-                'amount' => -$val,
-                'discount_type' => $rcd['type'],
-                'discount_value' => $rcd['value'],
-                'sort_order' => 1,
-                'order_service_id' => null,
-            ];
-        }
-
-        // Code won: ensure agent_discount and applied_package are NOT in meta
-        $currentMeta = $order->meta ?? [];
-        $currentMeta['winning_discount'] = 'code';
-        if (isset($currentMeta['agent_discount'])) {
-            unset($currentMeta['agent_discount']);
-        }
-        if (isset($currentMeta['applied_package'])) {
-            unset($currentMeta['applied_package']);
-        }
-        $order->package_id = null;
-        $order->meta = $currentMeta;
-        $order->save();
-    } elseif ($winnerType === 'agent' && $agentDiscount) {
-        $agentVal = min($agentDiscount['discount_value'], $totalAmount);
-        if ($agentVal > 0) {
-            $discountAmount += $agentVal;
-            $orderTotals[] = [
-                'uuid' => (string) Str::uuid(),
-                'order_id' => $order->id,
-                'discount_id' => null,
-                'amount' => -$agentVal,
-                'discount_type' => 'agent',
-                'discount_value' => $agentDiscount['amount'],
-                'sort_order' => 1,
-                'order_service_id' => null,
-            ];
-
-            $currentMeta = $order->meta ?? [];
-            $currentMeta['winning_discount'] = 'agent';
-            if (isset($currentMeta['applied_package'])) {
-                unset($currentMeta['applied_package']);
-            }
-            $currentMeta['agent_discount'] = array_merge($agentDiscount['data'], [
-                'calculated_discount_amount' => $agentVal
-            ]);
-            $order->package_id = null;
-            $order->meta = $currentMeta;
-            $order->save();
-
-            Log::info("✅ AGENT DISCOUNT APPLIED (RECALCULATE)", [
-                'order_uuid' => $order->uuid,
-                'discount_name' => $agentDiscount['name'],
-                'discount_amount' => $agentVal,
-            ]);
-        }
-    } else {
-        $currentMeta = $order->meta ?? [];
-        $currentMeta['winning_discount'] = 'none';
-        unset($currentMeta['agent_discount']);
-        unset($currentMeta['applied_package']);
-        $order->package_id = null;
-        $order->meta = $currentMeta;
-        $order->save();
     }
+
+    if ($totalAgentVal > 0) {
+        $orderTotals[] = [
+            'uuid' => (string) Str::uuid(),
+            'order_id' => $order->id,
+            'discount_id' => null,
+            'amount' => -round($totalAgentVal, 2),
+            'discount_type' => 'agent',
+            'discount_value' => round($totalAgentVal, 2),
+            'sort_order' => 1,
+            'order_service_id' => null,
+        ];
+    }
+
+    if ($totalCodeVal > 0) {
+        $orderTotals[] = [
+            'uuid' => (string) Str::uuid(),
+            'order_id' => $order->id,
+            'discount_id' => null,
+            'amount' => -round($totalCodeVal, 2),
+            'discount_type' => 'code',
+            'discount_value' => round($totalCodeVal, 2),
+            'sort_order' => 2,
+            'order_service_id' => null,
+        ];
+    }
+
+    $discountAmount = round($totalPkgVal + $totalAgentVal + $totalCodeVal, 2);
+    $currentMeta['line_item_discounts'] = $lineItemDiscounts;
+    $order->meta = $currentMeta;
+    $order->save();
+
+    Log::info("Per-Service Best Discount Selection (RECALCULATE)", [
+        'order_uuid' => $order->uuid,
+        'pkg_discount' => $totalPkgVal,
+        'agent_discount' => $totalAgentVal,
+        'code_discount' => $totalCodeVal,
+        'total_discount' => $discountAmount,
+    ]);
 
     $finalAmount = $totalAmount - $discountAmount;
 
@@ -2901,11 +2682,33 @@ private function createOrderNotification($order, array $changes)
             $serviceModel = $orderService->service;
 
             // 1. Delete associated calendar slot if exists
-            $deletedSlotId = null;
-            $slot = OrderSlot::where('order_id', $order->id)->where('service_id', $serviceId)->with('vendor')->first();
+            $deletedSlotInfo = null;
+            $slot = OrderSlot::where('order_id', $order->id)->where('service_id', $serviceId)->with(['vendor', 'order.agent'])->first();
             $vendor = $slot?->vendor;
             if ($slot) {
-                $deletedSlotId = $slot->id;
+                if (class_exists(\App\Services\GoogleCalendarService::class)) {
+                    $calendarService = app(\App\Services\GoogleCalendarService::class);
+                    if ($slot->google_event_id && $slot->vendor && $slot->vendor->google_access_token) {
+                        try {
+                            $calendarService->deleteEvent($slot->vendor, $slot->google_event_id);
+                        } catch (\Throwable $e) {
+                            Log::warning('Failed to delete vendor calendar event on removeService: ' . $e->getMessage());
+                        }
+                    }
+                    if ($slot->agent_google_event_id && $order->agent && $order->agent->google_access_token) {
+                        try {
+                            $calendarService->deleteEvent($order->agent, $slot->agent_google_event_id);
+                        } catch (\Throwable $e) {
+                            Log::warning('Failed to delete agent calendar event on removeService: ' . $e->getMessage());
+                        }
+                    }
+                }
+                $deletedSlotInfo = [
+                    'vendor' => $slot->vendor_id,
+                    'google_event_id' => $slot->google_event_id,
+                    'agent' => $order->agent_id,
+                    'agent_google_event_id' => $slot->agent_google_event_id,
+                ];
                 $slot->delete();
             }
 
@@ -3020,9 +2823,9 @@ private function createOrderNotification($order, array $changes)
             DB::commit();
 
             // 8. Dispatch Google Calendar event deletion
-            if ($deletedSlotId) {
+            if ($deletedSlotInfo) {
                 try {
-                    \App\Jobs\SyncOrderCalendarEvents::dispatch($order->id, [$deletedSlotId]);
+                    \App\Jobs\SyncOrderCalendarEvents::dispatch($order->id, [$deletedSlotInfo]);
                 } catch (\Throwable $e) {
                     Log::warning('Failed to dispatch SyncOrderCalendarEvents on removeService: ' . $e->getMessage());
                 }
@@ -3663,9 +3466,14 @@ private function createOrderNotification($order, array $changes)
         // 3. Email Dispatch via EmailDispatchService
         $emailDispatched = false;
         try {
+            $orderOrg = $order->organization ?: app(EmailDispatchService::class)->resolveOrganization($order);
+            if ($orderOrg && !$orderOrg->relationLoaded('domains')) {
+                $orderOrg->load('domains');
+            }
+
             $dispatchOptions = [
                 'order' => $order,
-                'organization' => $order->organization,
+                'organization' => $orderOrg,
                 'service' => $targetService,
                 'service_name' => $serviceName,
                 'media_count' => $totalApprovedCount,
@@ -4342,9 +4150,12 @@ private function createOrderNotification($order, array $changes)
                 }
             }
 
-            if (class_exists(SyncOrderCalendarEvents::class) && $slot->order) {
+            if (class_exists(SyncOrderCalendarEvents::class) && ($slot->order_id || $slot->order)) {
                 try {
-                    dispatch(new SyncOrderCalendarEvents($slot->order));
+                    $targetOrderId = $slot->order_id ?? $slot->order?->id;
+                    if ($targetOrderId) {
+                        dispatch(new SyncOrderCalendarEvents((int)$targetOrderId));
+                    }
                 } catch (\Throwable $e) {
                     Log::warning("Failed to dispatch calendar sync on slot reassign: " . $e->getMessage());
                 }
@@ -4527,8 +4338,10 @@ private function createOrderNotification($order, array $changes)
 
             if (class_exists(SyncOrderCalendarEvents::class)) {
                 try {
-                    if ($slot1 && $slot1->order) dispatch(new SyncOrderCalendarEvents($slot1->order));
-                    if ($slot2 && $slot2->order) dispatch(new SyncOrderCalendarEvents($slot2->order));
+                    $order1Id = $slot1->order_id ?? $slot1->order?->id;
+                    $order2Id = $slot2->order_id ?? $slot2->order?->id;
+                    if ($order1Id) dispatch(new SyncOrderCalendarEvents((int)$order1Id));
+                    if ($order2Id && $order2Id !== $order1Id) dispatch(new SyncOrderCalendarEvents((int)$order2Id));
                 } catch (\Throwable $e) {
                     Log::warning("Failed to dispatch calendar sync on slot swap: " . $e->getMessage());
                 }
