@@ -590,14 +590,35 @@ class AgentPaymentController extends Controller
      */
     private function dispatchQuickBooksJob($payment)
     {
-        $invoiceId = $payment->invoice_id;
+        $invoiceId = null;
 
-        // Fallback: if payment does not have invoice_id directly, look up by order_id
-        if (!$invoiceId && $payment->order_id) {
+        // In One Main Invoice Per Order model, always prioritize resolving the Order's Main (Consolidated) Invoice
+        if ($payment->order_id) {
             $invoiceId = \App\Models\Invoice::where('order_id', $payment->order_id)
-                ->where('agent_id', $payment->agent_id)
-                ->value('id')
-                ?? \App\Models\Invoice::where('order_id', $payment->order_id)->value('id');
+                ->where(function ($q) {
+                    $q->where('notes', 'ilike', '%consolidated%')
+                      ->orWhere('notes', 'ilike', '%add-on service invoice%');
+                })
+                ->value('id');
+
+            if (!$invoiceId) {
+                $invoiceId = \App\Models\Invoice::where('order_id', $payment->order_id)
+                    ->where('agent_type', 'primary')
+                    ->where(function ($q) {
+                        $q->whereNull('notes')
+                          ->orWhere('notes', 'not ilike', '%service invoice%');
+                    })
+                    ->value('id');
+            }
+        }
+
+        // Fallback to payment's direct invoice_id if no main invoice found
+        if (!$invoiceId) {
+            $invoiceId = $payment->invoice_id;
+        }
+
+        if (!$invoiceId && $payment->order_id) {
+            $invoiceId = \App\Models\Invoice::where('order_id', $payment->order_id)->value('id');
         }
 
         if (!$invoiceId) {

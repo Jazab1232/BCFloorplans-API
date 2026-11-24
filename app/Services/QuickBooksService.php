@@ -557,6 +557,16 @@ class QuickBooksService
             $user = Auth::user();
             $organization = $user ? ($user->organization ?? ($user->organization_id ? Organization::find($user->organization_id) : null)) : null;
         }
+
+        // If the requested organization has no QB tokens, fall back to the primary connected organization
+        if (!$organization || !$organization->qb_access_token) {
+            $fallbackOrg = Organization::whereNotNull('qb_access_token')
+                ->whereNotNull('qb_refresh_token')
+                ->first();
+            if ($fallbackOrg) {
+                $organization = $fallbackOrg;
+            }
+        }
         
         if (!$organization || !$organization->qb_realm_id || !$organization->qb_access_token) {
             return null;
@@ -1016,6 +1026,34 @@ class QuickBooksService
      */
     public function syncRefundToQB(\App\Models\Invoice $invoice, float $amount): ?string
     {
+        // ONE MAIN INVOICE PER ORDER MODEL:
+        // If this is an individual service invoice, resolve to the Order's Main Invoice
+        if ($invoice->order_id && $invoice->notes && stripos($invoice->notes, 'service invoice') !== false) {
+            $mainInvoice = \App\Models\Invoice::with(['order.organization', 'agent', 'order.property'])
+                ->where('order_id', $invoice->order_id)
+                ->where(function ($q) {
+                    $q->where('notes', 'ilike', '%consolidated%')
+                      ->orWhere('notes', 'ilike', '%add-on service invoice%');
+                })
+                ->first();
+
+            if (!$mainInvoice) {
+                $mainInvoice = \App\Models\Invoice::with(['order.organization', 'agent', 'order.property'])
+                    ->where('order_id', $invoice->order_id)
+                    ->where('agent_type', 'primary')
+                    ->where(function ($q) {
+                        $q->whereNull('notes')
+                          ->orWhere('notes', 'not ilike', '%service invoice%');
+                    })
+                    ->first();
+            }
+
+            if ($mainInvoice) {
+                Log::info("QB refund: resolving service invoice #{$invoice->id} to Order Main Invoice #{$mainInvoice->id}");
+                $invoice = $mainInvoice;
+            }
+        }
+
         $log = QbSyncLog::create([
             'organization_id' => $invoice->organization_id ?? $invoice->order?->organization_id,
             'entity_type' => 'invoice',
@@ -1036,18 +1074,32 @@ class QuickBooksService
             $dataService = $this->getDataService($org);
             $customerId = $this->getOrCreateCustomer($invoice->agent, $org);
 
+            // Dynamically get or create a valid service item for refunds so ItemRef is never null
+            $refundItemId = $this->getOrCreateServiceItem($dataService, null, 'Refund / Adjustment');
+
+            // Resolve tax code if the refunded invoice had tax
+            $taxCodeId = $this->resolveTaxCodeId($dataService, $invoice);
+
+            $salesItemDetail = [
+                'ItemRef' => ['value' => (string)$refundItemId],
+            ];
+            if ($taxCodeId) {
+                $salesItemDetail['TaxCodeRef'] = ['value' => (string)$taxCodeId];
+            }
+
             // Create CreditMemo
             $creditMemoObj = CreditMemo::create([
-                'CustomerRef' => ['value' => $customerId],
-                'TotalAmt' => $amount,
+                'CustomerRef' => ['value' => (string)$customerId],
+                'TotalAmt' => round($amount, 2),
                 'PrivateNote' => "Refund for Invoice #{$invoice->invoice_number}. Property: " . ($invoice->order->property->address ?? 'N/A'),
+                'TxnTaxDetail' => $taxCodeId ? [
+                    'TxnTaxCodeRef' => ['value' => (string)$taxCodeId]
+                ] : null,
                 'Line' => [
                     [
-                        'Amount' => $amount,
+                        'Amount' => round($amount, 2),
                         'DetailType' => 'SalesItemLineDetail',
-                        'SalesItemLineDetail' => [
-                            'ItemRef' => ['value' => config('quickbooks.accounts.income_id', '1')], // Or a specific refund item
-                        ]
+                        'SalesItemLineDetail' => $salesItemDetail,
                     ]
                 ]
             ]);
@@ -1099,9 +1151,14 @@ class QuickBooksService
         ]);
 
         try {
-            $org = $vInvoice->vendor?->organization ?? $vInvoice->organization ?? null;
+            $vendor = $vInvoice->vendor ?: ($vInvoice->vendor_id ? \App\Models\Vendor::where('uuid', $vInvoice->vendor_id)->first() : null);
+            if (!$vendor) {
+                throw new \Exception("Cannot sync bill to QB: Vendor not found for vendor invoice #{$vInvoice->id}.");
+            }
+
+            $org = $vendor->organization ?? $vInvoice->organization ?? null;
             $dataService = $this->getDataService($org);
-            $vendorId = $this->getOrCreateVendor($vInvoice->vendor, $org);
+            $vendorId = $this->getOrCreateVendor($vendor, $org);
 
             // Dynamic expense account discovery
             $expenseAccountId = $this->getExpenseAccountId($dataService);
@@ -1227,9 +1284,14 @@ class QuickBooksService
                 $vInvoice->refresh();
             }
 
-            $org = $vInvoice->vendor?->organization ?? $vInvoice->organization ?? null;
+            $vendor = $vInvoice->vendor ?: ($vInvoice->vendor_id ? \App\Models\Vendor::where('uuid', $vInvoice->vendor_id)->first() : null);
+            if (!$vendor) {
+                throw new \Exception("Cannot sync payout to QB: Vendor not found for vendor invoice #{$vInvoice->id}.");
+            }
+
+            $org = $vendor->organization ?? $vInvoice->organization ?? null;
             $dataService = $this->getDataService($org);
-            $vendorId = $this->getOrCreateVendor($vInvoice->vendor, $org);
+            $vendorId = $this->getOrCreateVendor($vendor, $org);
             $bankAccountId = $this->getBankAccountId($dataService);
 
             $linkedTxn = new IPPLinkedTxn();

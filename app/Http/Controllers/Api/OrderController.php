@@ -206,6 +206,25 @@ class OrderController extends Controller
             ]);
         }
 
+        if ($request->has('services') && is_array($request->services)) {
+            $sanitizedServices = $request->services;
+            foreach ($sanitizedServices as &$svc) {
+                if (isset($svc['vendor_id']) && ($svc['vendor_id'] === '' || $svc['vendor_id'] === 'all' || $svc['vendor_id'] === 'none')) {
+                    $svc['vendor_id'] = null;
+                }
+            }
+            $request->merge(['services' => $sanitizedServices]);
+        }
+        if ($request->has('slots') && is_array($request->slots)) {
+            $sanitizedSlots = $request->slots;
+            foreach ($sanitizedSlots as &$slot) {
+                if (isset($slot['vendor_id']) && ($slot['vendor_id'] === '' || $slot['vendor_id'] === 'all' || $slot['vendor_id'] === 'none')) {
+                    $slot['vendor_id'] = null;
+                }
+            }
+            $request->merge(['slots' => $sanitizedSlots]);
+        }
+
         $validator = Validator::make($request->all(), [
             'agent_id' => 'required|exists:agents,uuid',
             'property_id' => 'required|exists:properties,uuid',
@@ -573,6 +592,9 @@ class OrderController extends Controller
             if (!empty($request->slots)) {
                 $twilightError = $this->validateTwilightSlots($request->slots, $property);
                 if ($twilightError) {
+                    if (DB::transactionLevel() > 0) {
+                        DB::rollBack();
+                    }
                     return $twilightError;
                 }
 
@@ -594,6 +616,9 @@ class OrderController extends Controller
                             [$isValid, $nextAvailableTime] = $this->validateConsecutiveBooking($slotVendor, $date, $groupSlots);
                             
                             if (!$isValid) {
+                                if (DB::transactionLevel() > 0) {
+                                    DB::rollBack();
+                                }
                                 return response()->json([
                                     'success' => false,
                                     'message' => "Vendor {$slotVendor->first_name} requires consecutive booking. Next available slot starts at {$nextAvailableTime}.",

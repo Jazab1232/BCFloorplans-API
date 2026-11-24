@@ -62,12 +62,6 @@ class SyncVendorPayoutToQuickBooks implements ShouldQueue
             return;
         }
 
-        $org = $vInvoice->vendor?->organization ?? $vInvoice->organization ?? null;
-        if (!$qbService->isConnected($org)) {
-            Log::info("QuickBooks Vendor Payout Job: Organization " . ($org?->id ?? 'N/A') . " is not connected to QuickBooks. Skipping.");
-            return;
-        }
-
         Log::info("QuickBooks Vendor Payout Job: Syncing payout for invoice {$vInvoice->id} to QB");
         $qbService->syncVendorPayoutToQB($vInvoice);
     }

@@ -371,7 +371,7 @@ class Invoice extends Model
             return null;
         }
 
-        $matchedTotal = (float) $matchedInInvoice->sum(fn($os) => (float)$os->amount);
+        $matchedTotal = (float) $matchedInInvoice->sum(fn($os) => static::getEffectiveServiceAmount($order, $os));
         if ($matchedTotal <= 0) {
             return null;
         }
@@ -383,7 +383,7 @@ class Invoice extends Model
             $order->loadMissing('services');
             $totalOrderMatched = (float) $order->services
                 ->filter(fn($os) => in_array($os->service_id, $matchedServiceIds))
-                ->sum(fn($os) => (float)$os->amount);
+                ->sum(fn($os) => static::getEffectiveServiceAmount($order, $os));
             $ratio = $totalOrderMatched > 0 ? ($matchedTotal / $totalOrderMatched) : 0;
             $fullDiscount = (float) ($packageInfo['package_discount_amount'] ?? $packageInfo['package_discount'] ?? 0);
             $discountAmount = round($fullDiscount * $ratio * $multiplier, 2);
@@ -459,7 +459,7 @@ class Invoice extends Model
         // Check minimum spend against entire order total if specified
         if (!empty($discountData['minimum_spend']) && (float)$discountData['minimum_spend'] > 0) {
             $order->loadMissing('services');
-            $orderBaseTotal = (float) $order->services->sum(fn($os) => (float)$os->amount);
+            $orderBaseTotal = (float) $order->services->sum(fn($os) => static::getEffectiveServiceAmount($order, $os));
             if ($orderBaseTotal <= 0 && isset($order->amount)) {
                 $orderBaseTotal = (float)$order->amount;
             }
@@ -476,9 +476,8 @@ class Invoice extends Model
         $isPercentage = filter_var($discountData['is_percentage'] ?? true, FILTER_VALIDATE_BOOLEAN);
 
         $servicesCollection = collect($services);
-        // os->amount stores the already-calculated service total (e.g. 2500 sqft × $0.10 = $250).
-        // option->amount is the per-unit RATE ($0.10), NOT the total — never use it as the base.
-        $currentServicesTotal = (float) $servicesCollection->sum(fn($os) => (float)$os->amount);
+        // Includes standalone area charges (custom fixed charges + excess allowance) if applicable
+        $currentServicesTotal = (float) $servicesCollection->sum(fn($os) => static::getEffectiveServiceAmount($order, $os));
         if ($currentServicesTotal <= 0) {
             return null;
         }
@@ -488,7 +487,7 @@ class Invoice extends Model
             $discountAmount = round(($currentServicesTotal * ($amount / 100)) * $multiplier, 2);
         } else {
             $order->loadMissing('services');
-            $totalOrderAmount = (float) $order->services->sum(fn($os) => (float)$os->amount);
+            $totalOrderAmount = (float) $order->services->sum(fn($os) => static::getEffectiveServiceAmount($order, $os));
             $ratio = $totalOrderAmount > 0 ? ($currentServicesTotal / $totalOrderAmount) : 0;
             $fullDiscount = (float)($discountData['calculated_discount_amount'] ?? $amount);
             $discountAmount = round($fullDiscount * $ratio * $multiplier, 2);
@@ -547,15 +546,14 @@ class Invoice extends Model
         }
 
         $servicesCollection = collect($services);
-        // os->amount stores the already-calculated service total (e.g. 2500 sqft × $0.10 = $250).
-        // option->amount is the per-unit RATE ($0.10), NOT the total — never use it as the base.
-        $currentServicesTotal = (float) $servicesCollection->sum(fn($os) => (float)$os->amount);
+        // Includes standalone area charges (custom fixed charges + excess allowance) if applicable
+        $currentServicesTotal = (float) $servicesCollection->sum(fn($os) => static::getEffectiveServiceAmount($order, $os));
         if ($currentServicesTotal <= 0) {
             return null;
         }
 
         $order->loadMissing('services');
-        $totalOrderAmount = (float) $order->services->sum(fn($os) => (float)$os->amount);
+        $totalOrderAmount = (float) $order->services->sum(fn($os) => static::getEffectiveServiceAmount($order, $os));
         $ratio = $totalOrderAmount > 0 ? ($currentServicesTotal / $totalOrderAmount) : 1.0;
 
         $totalDiscountAmount = 0.0;
@@ -599,8 +597,7 @@ class Invoice extends Model
                 if (!$matchingService) {
                     continue;
                 }
-                // Use os->amount (the calculated total) — option->amount is just the per-unit rate
-                $svcAmount = (float)$matchingService->amount;
+                $svcAmount = static::getEffectiveServiceAmount($order, $matchingService);
                 $discAmt = $isPercentage
                     ? round($svcAmount * ($pctRate / 100), 2)
                     : min($svcAmount, $fixedVal);
@@ -747,11 +744,18 @@ class Invoice extends Model
             $province = $order->province;
         }
 
+        $isSingleService = collect($services)->count() === 1;
+
         $preparedItems = [];
         foreach ($services as $os) {
-            // os->amount stores the already-calculated service total (e.g. 2500 sqft × $0.10 = $250).
-            // option->amount is the per-unit RATE — NEVER use it as the invoice line amount.
-            $amount = (float)$os->amount * $multiplier;
+            $isPerSqft = static::isPerSqftRateService($os);
+            // On consolidated invoice, roll totalAreaCharges into the per-sqft service line item
+            $svcBase = (float)$os->amount;
+            if (!$isSingleService && $isPerSqft) {
+                $metrics = static::getOrderAreaMetrics($order);
+                $svcBase += (float)($metrics['total_area_charges'] ?? 0);
+            }
+            $amount = $svcBase * $multiplier;
             $serviceModel = $os->service ?? null;
             $itemDescription = ($os->custom ?: ($serviceModel->name ?? 'Service')) . ($multiplier < 1 ? " (" . ($multiplier * 100) . "%)" : "");
 
@@ -763,10 +767,30 @@ class Invoice extends Model
             ];
         }
 
-        $isSingleService = collect($services)->count() === 1;
-
         if ($isSingleService) {
             $singleService = collect($services)->first();
+            $metrics = static::getOrderAreaMetrics($order);
+            $fixedOther = round((float)($metrics['custom_other_charges'] ?? 0) * $multiplier, 2);
+            $excessOther = round((float)($metrics['excess_other_charge'] ?? 0) * $multiplier, 2);
+            if ($fixedOther > 0) {
+                $preparedItems[] = [
+                    'order_service' => $singleService,
+                    'service' => $singleService->service,
+                    'amount' => $fixedOther,
+                    'description' => 'Other Areas fixed charges',
+                    'is_extra' => true,
+                ];
+            }
+            if ($excessOther > 0) {
+                $preparedItems[] = [
+                    'order_service' => $singleService,
+                    'service' => $singleService->service,
+                    'amount' => $excessOther,
+                    'description' => 'Other Areas above free allowance',
+                    'is_extra' => true,
+                ];
+            }
+
             $winner = static::resolveServiceWinningDiscount($order, $singleService, $multiplier);
             if ($winner) {
                 $type = $winner['type'] ?? '';
@@ -1444,12 +1468,93 @@ class Invoice extends Model
     /**
      * Check if an OrderService uses a per-square-foot rate option (not range).
      */
-    public static function isPerSqftRateService(?OrderService $os): bool
+    public static function isPerSqftRateService($os): bool
     {
-        if (!$os || !$os->option) {
+        if (!$os) {
             return false;
         }
-        return !empty($os->option->sq_ft_rate) && (float)$os->option->sq_ft_rate > 0 && empty($os->option->sq_ft_range);
+        $option = null;
+        if (is_object($os)) {
+            if (isset($os->option)) {
+                $option = $os->option;
+            } elseif (isset($os->option_id) && !empty($os->option_id)) {
+                $option = \App\Models\ProductOption::find($os->option_id);
+            }
+        } elseif (is_array($os)) {
+            if (isset($os['option'])) {
+                $option = $os['option'];
+            } elseif (!empty($os['option_id'])) {
+                $option = \App\Models\ProductOption::find($os['option_id']);
+            }
+        }
+        if (!$option) {
+            return false;
+        }
+        $sqFtRate = is_object($option) ? ($option->sq_ft_rate ?? null) : ($option['sq_ft_rate'] ?? null);
+        $sqFtRange = is_object($option) ? ($option->sq_ft_range ?? null) : ($option['sq_ft_range'] ?? null);
+
+        return !empty($sqFtRate) && (float)$sqFtRate > 0 && empty($sqFtRange);
+    }
+
+    protected static array $orderAreaMetricsCache = [];
+
+    /**
+     * Get or calculate cached area metrics for an order.
+     */
+    public static function getOrderAreaMetrics(Order $order): array
+    {
+        $cacheKey = $order->id ?? spl_object_hash($order);
+        if (isset(static::$orderAreaMetricsCache[$cacheKey])) {
+            return static::$orderAreaMetricsCache[$cacheKey];
+        }
+
+        if (!$order->relationLoaded('areas')) {
+            $order->loadMissing('areas');
+        }
+
+        if (!$order->areas || $order->areas->isEmpty()) {
+            static::$orderAreaMetricsCache[$cacheKey] = [];
+            return [];
+        }
+
+        static::$orderAreaMetricsCache[$cacheKey] = app(\App\Services\AreaPricingService::class)
+            ->calculateAreaMetrics($order->areas->map(fn($area) => [
+                'type' => is_object($area) ? ($area->type ?? '') : ($area['type'] ?? ''),
+                'footage' => is_object($area) ? ($area->footage ?? 0) : ($area['footage'] ?? 0),
+                'custom_title' => is_object($area) ? ($area->custom_title ?? '') : ($area['custom_title'] ?? ''),
+            ])->toArray(), $order->organization_id);
+
+        return static::$orderAreaMetricsCache[$cacheKey];
+    }
+
+    /**
+     * Get the effective gross amount for an OrderService, including standalone area charges
+     * (custom fixed charges + excess allowance charges) if it is a per-sqft rate service.
+     */
+    public static function getEffectiveServiceAmount(Order $order, $os): float
+    {
+        $baseAmount = is_object($os) ? (float)($os->amount ?? 0) : (float)($os['amount'] ?? 0);
+        if (!static::isPerSqftRateService($os)) {
+            return $baseAmount;
+        }
+
+        if (!$order->relationLoaded('services')) {
+            $order->loadMissing('services.option');
+        }
+
+        $allPerSqft = $order->services ? $order->services->filter(fn($s) => static::isPerSqftRateService($s)) : collect();
+        $primaryPerSqftId = is_object($allPerSqft->first()) ? $allPerSqft->first()->id : ($allPerSqft->first()['id'] ?? null);
+        $osId = is_object($os) ? ($os->id ?? null) : ($os['id'] ?? null);
+
+        // Only attach area charges to the primary per-sqft service to avoid duplicate addition
+        if ($osId && $primaryPerSqftId && $osId != $primaryPerSqftId) {
+            return $baseAmount;
+        }
+
+        $metrics = static::getOrderAreaMetrics($order);
+        $totalAreaCharges = (float)($metrics['total_area_charges'] ?? 0);
+
+        return round($baseAmount + $totalAreaCharges, 2);
     }
 
     /**
@@ -1466,6 +1571,7 @@ class Invoice extends Model
                 'custom_title' => $area->custom_title,
             ])->toArray(), $order->organization_id);
 
+        static::$orderAreaMetricsCache[$order->id ?? spl_object_hash($order)] = $areaMetrics;
         $totalAreaCharges = (float)($areaMetrics['total_area_charges'] ?? 0);
 
         $activeInvoices = static::where('order_id', $order->id)
