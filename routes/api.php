@@ -161,6 +161,7 @@ Route::group(["middleware" => ["auth.any:api,agent-api,subaccount-api,vendor-api
     Route::get('vendors/{uuid}', [VendorController::class, 'show']);
 
     // Tours - basic access for all
+    Route::get('tours', [TourController::class, 'index']);
     Route::get('tours/{uuid}', [TourController::class, 'show']);
     Route::get('tours/order/{order_uuid}', [TourController::class, 'getByOrder']);
     Route::get('tours/order/{order_uuid}/processing-status', [TourController::class, 'getProcessingStatus']);

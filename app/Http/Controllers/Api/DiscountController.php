@@ -41,7 +41,7 @@ class DiscountController extends Controller
                 'percentage' => 'required|numeric|between:0.01,99.99',
                 'expiry_date' => 'nullable|date',
                 'description' => 'nullable|string',
-                'services' => 'required|array',
+                'services' => 'nullable|array',
                 'services.*' => 'exists:services,id'
             ]);
 
@@ -57,7 +57,7 @@ class DiscountController extends Controller
             $data['uuid'] = (string) Str::uuid();
 
             $discount = Discount::create($data);
-            $discount->services()->sync($request->services);
+            $discount->services()->sync($request->input('services', []) ?? []);
 
             return response()->json([
                 'status' => true,
@@ -110,7 +110,7 @@ class DiscountController extends Controller
                 'percentage' => 'sometimes|numeric|between:0.01,99.99',
                 'expiry_date' => 'nullable|date',
                 'description' => 'nullable|string',
-                'services' => 'sometimes|array',
+                'services' => 'sometimes|nullable|array',
                 'services.*' => 'exists:services,id'
             ]);
 
@@ -125,7 +125,7 @@ class DiscountController extends Controller
             $discount->update($request->all());
 
             if ($request->has('services')) {
-                $discount->services()->sync($request->services);
+                $discount->services()->sync($request->input('services') ?? []);
             }
 
             return response()->json([

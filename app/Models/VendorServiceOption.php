@@ -30,6 +30,7 @@ class VendorServiceOption extends Model
         'min_price' => 'decimal:2',
         'unit_rate' => 'decimal:2',
         'hourly_rate' => 'decimal:2',
+        'vendor_adjustment_time' => 'integer',
     ];
 
     protected $hidden = ['id'];
@@ -51,6 +52,6 @@ class VendorServiceOption extends Model
 
     public function productOption()
     {
-        return $this->belongsTo(ProductOption::class);
+        return $this->belongsTo(ProductOption::class, 'option_id');
     }
 }

@@ -150,26 +150,77 @@ class TourController extends Controller
     public function index(Request $request): JsonResponse
     {
         try {
-            $includeHidden = $request->boolean('include_hidden');
+            $user = auth()->user() ?: $request->user();
+            if (!$user) {
+                return response()->json([
+                    'success' => false,
+                    'data' => null,
+                    'message' => 'Unauthorized',
+                ], 401);
+            }
 
-            $tours = Tour::with([
+            $isAdminOrVendor = $user instanceof \App\Models\User || $user instanceof Vendor;
+            $includeHidden = $isAdminOrVendor && $request->boolean('include_hidden');
+            $publishedOnly = $request->boolean('published_only', false);
+
+            $query = Tour::with([
                 'files' => function ($query) use ($includeHidden) {
                     if (!$includeHidden) $query->where('is_hidden', false);
-                    $query->with('service');
                 },
+                'files.service',
                 'links' => function ($query) use ($includeHidden) {
                     if (!$includeHidden) $query->where('is_hidden', false);
-                    $query->with('service');
                 },
+                'links.service',
                 'snapshots' => function ($query) use ($includeHidden) {
                     if (!$includeHidden) $query->where('is_hidden', false);
                 },
-                'order'
-            ])->get();
+                'orders.services.vendor',
+                'orders.property',
+                'orders.agent.organization',
+                'orders.organization.domains',
+            ])->visibleToUser($user);
+
+            if ($publishedOnly) {
+                $query->where('is_publish', true);
+            }
+
+            $query->latest('id');
+
+            $shouldPaginate = $request->has('page') || $request->has('per_page') || $request->boolean('paginate');
+
+            if ($shouldPaginate) {
+                $perPage = max(1, min((int) $request->input('per_page', 15), 100));
+                $paginated = $query->paginate($perPage);
+                $paginated->getCollection()->transform(fn (Tour $tour) => $this->transformTourForViewer($tour, $isAdminOrVendor));
+
+                return response()->json([
+                    'success' => true,
+                    'data' => $paginated->values(),
+                    'pagination' => [
+                        'current_page' => $paginated->currentPage(),
+                        'last_page' => $paginated->lastPage(),
+                        'per_page' => $paginated->perPage(),
+                        'total' => $paginated->total(),
+                        'has_more' => $paginated->hasMorePages(),
+                    ],
+                    'message' => 'Tours fetched successfully',
+                ]);
+            }
+
+            $tours = $query->get();
+            $tours->transform(fn (Tour $tour) => $this->transformTourForViewer($tour, $isAdminOrVendor));
 
             return response()->json([
                 'success' => true,
                 'data' => $tours,
+                'pagination' => [
+                    'current_page' => 1,
+                    'last_page' => 1,
+                    'per_page' => $tours->count(),
+                    'total' => $tours->count(),
+                    'has_more' => false,
+                ],
                 'message' => 'Tours fetched successfully',
             ]);
         } catch (\Exception $e) {
@@ -177,7 +228,7 @@ class TourController extends Controller
                 'success' => false,
                 'data' => null,
                 'message' => 'Error: ' . $e->getMessage(),
-            ]);
+            ], 500);
         }
     }
 
@@ -234,55 +285,19 @@ class TourController extends Controller
                 }
             }
 
-            $isAdminOrVendor = $user && ($user instanceof \App\Models\User || $user instanceof \App\Models\Vendor);
-            if (!$isAdminOrVendor) {
-                $order = $tour->order ?? $tour->orders;
-                $isPaidOrder = $order && ($order->payment_status === 'PAID' || (bool) $order->release_media_before_payment);
-                if ($tour->links) {
-                    $tour->links->transform(function ($link) use ($isPaidOrder, $order) {
-                        $isRevoked = false;
-                        if ($link->service_id && $order) {
-                            $orderService = \App\Models\OrderService::where('order_id', $order->id)
-                                ->where('service_id', $link->service_id)
-                                ->first();
-                            if ($orderService && $orderService->media_access === false) {
-                                $isRevoked = true;
-                            }
-                        }
-
-                        $isPaid = !$isRevoked && ($isPaidOrder || (bool) $link->is_paid);
-                        if (!$isPaid) {
-                            $link->link = null;
-                        }
-                        return $link;
-                    });
-                }
-                if ($tour->files) {
-                    $tour->files->transform(function ($file) use ($isPaidOrder) {
-                        $isFloorPlan = $file->type === 'pdf' || 
-                            ($file->service && (
-                                stripos($file->service->name, 'floor plan') !== false ||
-                                stripos($file->service->name, 'floorplan') !== false
-                            ));
-                        $isPaid = ($file->service_id ? $file->is_paid : ($file->is_paid || $isPaidOrder)) || !empty($file->is_complimentary);
-                        if ($isFloorPlan && !$isPaid) {
-                            $file->file_path = null;
-                            $file->variants = [];
-                            $file->variant_urls = null;
-                            $file->download_url = null;
-                            $file->url = null;
-                        }
-                        return $file;
-                    });
+            if ($user instanceof Agent || $user instanceof SubAccount) {
+                $canAccessTour = Tour::where('id', $tour->id)->visibleToUser($user)->exists();
+                if (!$canAccessTour) {
+                    return response()->json([
+                        'success' => false,
+                        'data' => null,
+                        'message' => 'Unauthorized access to this tour.',
+                    ], 403);
                 }
             }
 
-            $order = $tour->order ?? $tour->orders;
-            $settingsService = app(\App\Services\SettingsService::class);
-            $agentUuid = $order?->agent?->uuid;
-            $orgUuid = $order?->organization?->uuid ?? $order?->agent?->organization?->uuid;
-            $tour->effective_tour_appearance = $settingsService->getEffectiveTourAppearance($orgUuid, $agentUuid);
-            $tour->effective_tour_settings = $settingsService->getEffectiveTourSettings($orgUuid, $agentUuid);
+            $isAdminOrVendor = $user && ($user instanceof \App\Models\User || $user instanceof \App\Models\Vendor);
+            $tour = $this->transformTourForViewer($tour, $isAdminOrVendor);
 
             return response()->json([
                 'success' => true,
@@ -1103,55 +1118,7 @@ class TourController extends Controller
 
             $query->latest('id');
 
-            $transformTour = function ($tour) {
-                $order = $tour->orders ?? $tour->order;
-                $isPaidOrder = $order && ($order->payment_status === 'PAID' || (bool) $order->release_media_before_payment);
-                if ($tour->links) {
-                    $tour->links->transform(function ($link) use ($isPaidOrder, $order) {
-                        $isRevoked = false;
-                        if ($link->service_id && $order) {
-                            $orderService = \App\Models\OrderService::where('order_id', $order->id)
-                                ->where('service_id', $link->service_id)
-                                ->first();
-                            if ($orderService && $orderService->media_access === false) {
-                                $isRevoked = true;
-                            }
-                        }
-
-                        $isPaid = !$isRevoked && ($isPaidOrder || (bool) $link->is_paid);
-                        if (!$isPaid) {
-                            $link->link = null;
-                        }
-                        return $link;
-                    });
-                }
-                if ($tour->files) {
-                    $tour->files->transform(function ($file) use ($isPaidOrder) {
-                        $isFloorPlan = $file->type === 'pdf' || 
-                            ($file->service && (
-                                stripos($file->service->name, 'floor plan') !== false ||
-                                stripos($file->service->name, 'floorplan') !== false
-                            ));
-                        $isPaid = ($file->service_id ? $file->is_paid : ($file->is_paid || $isPaidOrder)) || !empty($file->is_complimentary);
-                        if ($isFloorPlan && !$isPaid) {
-                            $file->file_path = null;
-                            $file->variants = [];
-                            $file->variant_urls = null;
-                            $file->download_url = null;
-                            $file->url = null;
-                        }
-                        return $file;
-                    });
-                }
-
-                $settingsService = app(\App\Services\SettingsService::class);
-                $agentUuid = $order?->agent?->uuid;
-                $orgUuid = $order?->organization?->uuid ?? $order?->agent?->organization?->uuid;
-                $tour->effective_tour_appearance = $settingsService->getEffectiveTourAppearance($orgUuid, $agentUuid);
-                $tour->effective_tour_settings = $settingsService->getEffectiveTourSettings($orgUuid, $agentUuid);
-
-                return $tour;
-            };
+            $transformTour = fn (Tour $tour) => $this->transformTourForViewer($tour, false);
 
             // Option to paginate via query parameters: ?page=... or ?per_page=... or ?paginate=true
             $shouldPaginate = $request->has('page') || $request->has('per_page') || $request->boolean('paginate');
@@ -1294,6 +1261,23 @@ class TourController extends Controller
             $includeHidden = $request->boolean('include_hidden');
             $order = Order::with('services')->where('uuid', $orderUuid)->firstOrFail();
 
+            $user = auth()->user();
+            if ($user instanceof Agent || $user instanceof SubAccount) {
+                $canAccessOrder = Order::where('id', $order->id)
+                    ->where(function ($orderQuery) use ($user) {
+                        Tour::applyOrderVisibilityForUser($orderQuery, $user);
+                    })
+                    ->exists();
+
+                if (!$canAccessOrder) {
+                    return response()->json([
+                        'success' => false,
+                        'data' => null,
+                        'message' => 'Unauthorized access to this order tour.',
+                    ], 403);
+                }
+            }
+
             // Auto-recover any files that have been stuck in is_processing for > 10 minutes
             \App\Services\MediaProcessingService::autoRecoverStuckFiles($order->id);
 
@@ -1316,7 +1300,6 @@ class TourController extends Controller
                 ->where('order_id', $order->id)
                 ->get();
 
-            $user = auth()->user();
             $isAdminOrVendor = $user && ($user instanceof \App\Models\User || $user instanceof \App\Models\Vendor);
             $isPaidOrder = $order && ($order->payment_status === 'PAID' || (bool) $order->release_media_before_payment);
 
@@ -3108,6 +3091,63 @@ class TourController extends Controller
         }
 
         return $primaryTour;
+    }
+
+    /**
+     * Redact unpaid/revoked media for non-admin/vendor viewers and attach effective tour settings.
+     */
+    protected function transformTourForViewer(Tour $tour, bool $isAdminOrVendor = false): Tour
+    {
+        $order = $tour->relationLoaded('orders') ? $tour->orders : ($tour->order ?? $tour->orders);
+
+        if (!$isAdminOrVendor) {
+            $isPaidOrder = $order && ($order->payment_status === 'PAID' || (bool) $order->release_media_before_payment);
+            if ($tour->links) {
+                $tour->links->transform(function ($link) use ($isPaidOrder, $order) {
+                    $isRevoked = false;
+                    if ($link->service_id && $order) {
+                        $orderService = \App\Models\OrderService::where('order_id', $order->id)
+                            ->where('service_id', $link->service_id)
+                            ->first();
+                        if ($orderService && $orderService->media_access === false) {
+                            $isRevoked = true;
+                        }
+                    }
+
+                    $isPaid = !$isRevoked && ($isPaidOrder || (bool) $link->is_paid);
+                    if (!$isPaid) {
+                        $link->link = null;
+                    }
+                    return $link;
+                });
+            }
+            if ($tour->files) {
+                $tour->files->transform(function ($file) use ($isPaidOrder) {
+                    $isFloorPlan = $file->type === 'pdf' ||
+                        ($file->service && (
+                            stripos($file->service->name, 'floor plan') !== false ||
+                            stripos($file->service->name, 'floorplan') !== false
+                        ));
+                    $isPaid = ($file->service_id ? $file->is_paid : ($file->is_paid || $isPaidOrder)) || !empty($file->is_complimentary);
+                    if ($isFloorPlan && !$isPaid) {
+                        $file->file_path = null;
+                        $file->variants = [];
+                        $file->variant_urls = null;
+                        $file->download_url = null;
+                        $file->url = null;
+                    }
+                    return $file;
+                });
+            }
+        }
+
+        $settingsService = app(\App\Services\SettingsService::class);
+        $agentUuid = $order?->agent?->uuid;
+        $orgUuid = $order?->organization?->uuid ?? $order?->agent?->organization?->uuid;
+        $tour->effective_tour_appearance = $settingsService->getEffectiveTourAppearance($orgUuid, $agentUuid);
+        $tour->effective_tour_settings = $settingsService->getEffectiveTourSettings($orgUuid, $agentUuid);
+
+        return $tour;
     }
 }
 
