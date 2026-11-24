@@ -40,6 +40,7 @@ class SyncInvoiceToQuickBooks implements ShouldQueue
      */
     public function handle(QuickBooksService $qbService): void
     {
+        @set_time_limit(300);
         $invoice = Invoice::with(['order.property', 'items.orderService.service', 'agent', 'order.organization'])
             ->find($this->invoiceId);
 

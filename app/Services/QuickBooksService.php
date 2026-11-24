@@ -76,6 +76,10 @@ class QuickBooksService
             $config['QBORealmID'] = $realmId;
         }
 
+        if (!defined('QUICKBOOKS_API_TIMEOUT')) {
+            define('QUICKBOOKS_API_TIMEOUT', (int)config('quickbooks.timeout', 60));
+        }
+
         $this->dataService = DataService::Configure($config);
         
         return $this->dataService;
@@ -627,6 +631,7 @@ class QuickBooksService
                     $dataService = $this->getDataService($organization);
                     $qbCustomer = $dataService->FindById('Customer', $agent->quickbooks_customer_id);
                     if ($qbCustomer) {
+                        $this->syncCustomerDetailsIfMissing($dataService, $qbCustomer, $agent);
                         return $agent->quickbooks_customer_id;
                     }
                 } catch (\Exception $e) {
@@ -656,6 +661,7 @@ class QuickBooksService
                         Log::info('Found existing QB customer: ' . $qbCustomer->Id);
 
                         $agent->update(['quickbooks_customer_id' => $qbCustomer->Id]);
+                        $this->syncCustomerDetailsIfMissing($dataService, $qbCustomer, $agent);
 
                         return $qbCustomer->Id;
                     }
@@ -669,19 +675,48 @@ class QuickBooksService
             $displayName = trim($agent->first_name . ' ' . ($agent->last_name ?? ''));
             $uniqueDisplayName = $this->ensureUniqueDisplayName($dataService, $displayName, $agent->id);
             
-            $customer = Customer::create([
+            $customerPayload = [
                 "DisplayName" => $uniqueDisplayName,
                 "GivenName" => $agent->first_name,
                 "FamilyName" => $agent->last_name ?? '',
                 "PrimaryEmailAddr" => [
                     "Address" => $agent->email
                 ],
-                "BillAddr" => [
-                    "Line1" => $agent->address ?? '',
+            ];
+
+            if (!empty($agent->company_name)) {
+                $customerPayload["CompanyName"] = $agent->company_name;
+            }
+
+            $phone = $agent->primary_phone ?? $agent->phone ?? null;
+            if (!empty($phone)) {
+                $customerPayload["PrimaryPhone"] = [
+                    "FreeFormNumber" => $phone
+                ];
+            }
+
+            if (!empty($agent->secondary_phone)) {
+                $customerPayload["Mobile"] = [
+                    "FreeFormNumber" => $agent->secondary_phone
+                ];
+            }
+
+            if (!empty($agent->website)) {
+                $customerPayload["WebAddr"] = [
+                    "URI" => $agent->website
+                ];
+            }
+
+            $address = $agent->headquarter_address ?? $agent->address ?? null;
+            if (!empty($address)) {
+                $customerPayload["BillAddr"] = [
+                    "Line1" => $address,
                     "City" => $agent->city ?? '',
-                    "Country" => $agent->country ?? 'US'
-                ]
-            ]);
+                    "Country" => $agent->country ?? 'Canada',
+                ];
+            }
+
+            $customer = Customer::create($customerPayload);
 
             $createdCustomer = $dataService->Add($customer);
 
@@ -822,10 +857,18 @@ class QuickBooksService
                 foreach ($invoice->items as $item) {
                     $itemAmount = (float)($item->amount ?: ($item->quantity * $item->unit_price));
 
-                    // If item is a discount or credit (negative amount), use QB DiscountLineDetail
+                    // If item is a discount or credit (negative amount), add as a negative SalesItemLineDetail
+                    // (QuickBooks Online API only supports ONE DiscountLineDetail per transaction; multiple discounts must be line items)
                     if ($itemAmount < 0 || (float)$item->unit_price < 0) {
                         $discountDesc = $item->description ?: 'Discount';
-                        $lines[] = $this->createDiscountLine(abs($itemAmount), $discountDesc);
+                        $discountItemId = $this->getOrCreateServiceItem($dataService, null, 'Discounts & Promotions');
+                        $lines[] = $this->createInvoiceLine(
+                            $discountItemId,
+                            1,
+                            $itemAmount,
+                            $discountDesc,
+                            $taxCodeId
+                        );
                         continue;
                     }
 
@@ -843,6 +886,24 @@ class QuickBooksService
                     );
                 }
 
+                // If tax code was not mapped at line/invoice level in QBO (e.g. US company, or manual sales tax),
+                // add explicit tax lines so the invoice total in QuickBooks matches BCF to the exact cent.
+                if (!$taxCodeId && (float)$invoice->tax_amount > 0) {
+                    $taxItemId = $this->getOrCreateServiceItem($dataService, null, 'Sales Tax');
+                    if (!empty($invoice->tax_details) && is_array($invoice->tax_details)) {
+                        foreach ($invoice->tax_details as $taxName => $taxInfo) {
+                            $taxAmt = (float)($taxInfo['amount'] ?? 0);
+                            $rate = $taxInfo['rate'] ?? '';
+                            if ($taxAmt > 0) {
+                                $taxDesc = $rate ? "{$taxName} ({$rate}%)" : $taxName;
+                                $lines[] = $this->createInvoiceLine($taxItemId, 1, $taxAmt, $taxDesc, null);
+                            }
+                        }
+                    } else {
+                        $lines[] = $this->createInvoiceLine($taxItemId, 1, (float)$invoice->tax_amount, 'Sales Tax', null);
+                    }
+                }
+
                 // Fallback 1: If invoice items are empty, populate lines from order services if available
                 if (empty($lines) && $invoice->order && ($invoice->order->relationLoaded('services') ? $invoice->order->services->isNotEmpty() : ($invoice->order?->services()?->exists()))) {
                     $orderServices = $invoice->order->relationLoaded('services') ? $invoice->order->services : $invoice->order->services()->with('service')->get();
@@ -853,7 +914,14 @@ class QuickBooksService
                         $serviceName = $service?->name ?? 'Service';
 
                         if ($amount < 0) {
-                            $lines[] = $this->createDiscountLine(abs($amount), $serviceName . ($invoice->order_id ? " (Order #{$invoice->order_id})" : ""));
+                            $discountItemId = $this->getOrCreateServiceItem($dataService, null, 'Discounts & Promotions');
+                            $lines[] = $this->createInvoiceLine(
+                                $discountItemId,
+                                1,
+                                $amount,
+                                $serviceName . ($invoice->order_id ? " (Order #{$invoice->order_id})" : ""),
+                                $taxCodeId
+                            );
                             continue;
                         }
 
@@ -1203,8 +1271,9 @@ class QuickBooksService
             }
 
             $docNumber = $this->formatDocNumber($vInvoice->invoice_number);
-            $txnDate = $vInvoice->cycle_end?->format('Y-m-d') 
-                ?? $vInvoice->paid_at?->format('Y-m-d') 
+            $txnDate = $vInvoice->paid_at?->format('Y-m-d')
+                ?? $vInvoice->created_at?->format('Y-m-d')
+                ?? $vInvoice->cycle_end?->format('Y-m-d')
                 ?? now()->format('Y-m-d');
 
             $billData = [
@@ -1497,6 +1566,56 @@ class QuickBooksService
     }
 
     /**
+     * Synchronize company name, contact phone, website, and billing address to an existing QB customer if missing.
+     */
+    protected function syncCustomerDetailsIfMissing($dataService, $qbCustomer, Agent $agent): void
+    {
+        $needsUpdate = false;
+        $updatePayload = [];
+
+        if (empty($qbCustomer->CompanyName) && !empty($agent->company_name)) {
+            $updatePayload['CompanyName'] = $agent->company_name;
+            $needsUpdate = true;
+        }
+
+        $phone = $agent->primary_phone ?? $agent->phone ?? null;
+        if (empty($qbCustomer->PrimaryPhone) && !empty($phone)) {
+            $updatePayload['PrimaryPhone'] = ['FreeFormNumber' => $phone];
+            $needsUpdate = true;
+        }
+
+        if (empty($qbCustomer->Mobile) && !empty($agent->secondary_phone)) {
+            $updatePayload['Mobile'] = ['FreeFormNumber' => $agent->secondary_phone];
+            $needsUpdate = true;
+        }
+
+        if (empty($qbCustomer->WebAddr) && !empty($agent->website)) {
+            $updatePayload['WebAddr'] = ['URI' => $agent->website];
+            $needsUpdate = true;
+        }
+
+        $address = $agent->headquarter_address ?? $agent->address ?? null;
+        if (empty($qbCustomer->BillAddr) && !empty($address)) {
+            $updatePayload['BillAddr'] = [
+                'Line1' => $address,
+                'City' => $agent->city ?? '',
+                'Country' => $agent->country ?? 'Canada',
+            ];
+            $needsUpdate = true;
+        }
+
+        if ($needsUpdate) {
+            try {
+                $updateObj = Customer::update($qbCustomer, $updatePayload);
+                $dataService->Update($updateObj);
+                Log::info("QB customer #{$qbCustomer->Id} updated with company/contact details");
+            } catch (\Throwable $e) {
+                Log::warning("Failed to update QB customer #{$qbCustomer->Id} with extra details: " . $e->getMessage());
+            }
+        }
+    }
+
+    /**
      * ✅ NEW: Main invoice creation method with proper service handling
      */
     public function createInvoiceForOrder(Order $order, AgentPayment $payment): ?array
@@ -1756,7 +1875,8 @@ class QuickBooksService
         $line->Amount = round(abs($amount), 2);
 
         $discountDetail = new IPPDiscountLineDetail();
-        $discountDetail->PercentBased = false;
+        // Must be string 'false' so XSD2PHP Php2Xml serializer renders <PercentBased>false</PercentBased>
+        $discountDetail->PercentBased = 'false';
 
         $line->DiscountLineDetail = $discountDetail;
 
@@ -2074,6 +2194,22 @@ class QuickBooksService
 
                     // Priority 3: First active Bank account
                     return (string) $accounts[0]->Id;
+                }
+
+                // Priority 3: If no bank account exists at all in QB, auto-create a standard Checking account
+                try {
+                    $newBank = Account::create([
+                        'Name' => 'Checking (Operating)',
+                        'AccountType' => 'Bank',
+                        'AccountSubType' => 'Checking',
+                    ]);
+                    $createdBank = $dataService->Add($newBank);
+                    if ($createdBank && !($createdBank instanceof \Exception) && !empty($createdBank->Id)) {
+                        Log::info("Auto-created QB Bank Account 'Checking (Operating)' with ID: {$createdBank->Id}");
+                        return (string) $createdBank->Id;
+                    }
+                } catch (\Exception $createEx) {
+                    Log::warning('Could not auto-create QB bank account: ' . $createEx->getMessage());
                 }
 
                 return (string) ($configuredId ?: '1');

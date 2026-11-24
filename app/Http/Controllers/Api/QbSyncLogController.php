@@ -116,6 +116,7 @@ class QbSyncLogController extends Controller
 
     public function retrySingle(Request $request, $uuid, \App\Services\QuickBooksService $qbService)
     {
+        @set_time_limit(300);
         try {
             $orgId = app()->bound('current_organization_id') ? app('current_organization_id') : null;
             $user = auth()->user();
