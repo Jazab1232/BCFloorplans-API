@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\Invoice;
+use App\Models\QbSyncLog;
 use App\Services\QuickBooksService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -10,6 +11,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 class SyncInvoiceToQuickBooks implements ShouldQueue
 {
@@ -86,6 +88,33 @@ class SyncInvoiceToQuickBooks implements ShouldQueue
         }
 
         Log::info("QuickBooks Sync Job: Syncing Main Invoice {$invoice->id} (Order #{$invoice->order_id}) to QB");
-        $qbService->syncInvoiceToQB($invoice);
+        try {
+            $qbService->syncInvoiceToQB($invoice);
+        } catch (\Throwable $e) {
+            Log::error("QuickBooks Sync Job failed for invoice {$invoice->id}: " . $e->getMessage());
+
+            // Ensure a failed log exists in QbSyncLog so user sees it in the UI
+            $existingLog = QbSyncLog::where('entity_type', 'invoice')
+                ->where('entity_id', $invoice->id)
+                ->latest('id')
+                ->first();
+
+            if ($existingLog && $existingLog->status === 'pending') {
+                $existingLog->update([
+                    'status' => 'failed',
+                    'error_message' => $e->getMessage(),
+                ]);
+            } elseif (!$existingLog || $existingLog->status !== 'failed') {
+                QbSyncLog::create([
+                    'organization_id' => $invoice->organization_id ?? $invoice->order?->organization_id,
+                    'entity_type' => 'invoice',
+                    'entity_id' => $invoice->id,
+                    'action' => $invoice->quickbooks_invoice_id ? 'update' : 'create',
+                    'status' => 'failed',
+                    'error_message' => $e->getMessage(),
+                    'request_id' => (string) Str::uuid(),
+                ]);
+            }
+        }
     }
 }

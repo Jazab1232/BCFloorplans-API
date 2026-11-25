@@ -191,25 +191,53 @@ class QuickBooksController extends Controller
                 ]);
             }
 
-            // Perform live health verification with QuickBooks
+            // Ensure tokens are fresh (auto-refreshes via 100-day refresh token if 1-hour access token expired)
             $companyName = null;
+            $orgCacheKey = ($organization?->id ?? 'default') . '_' . ($tokens['realm_id'] ?? 'none');
+            $companyCacheKey = "qb_company_name_{$orgCacheKey}";
+
             try {
                 $dataService = $this->quickBooksService->getDataService($organization);
-                $companyInfo = $dataService->getCompanyInfo();
-                if (!$companyInfo) {
-                    $lastError = $dataService->getLastError();
-                    $errorMsg = $lastError ? ($lastError->getResponseBody() ?: $lastError->getOAuthHelperError()) : 'Failed to retrieve company info';
-                    throw new \Exception($errorMsg);
+                $tokens = $this->quickBooksService->getStoredTokens($organization) ?: $tokens;
+
+                $companyName = Cache::get($companyCacheKey);
+                if (!$companyName) {
+                    $companyInfo = $dataService->getCompanyInfo();
+                    if (!$companyInfo) {
+                        $lastError = $dataService->getLastError();
+                        $errorMsg = $lastError ? ($lastError->getResponseBody() ?: $lastError->getOAuthHelperError()) : 'Failed to retrieve company info';
+                        throw new \Exception($errorMsg);
+                    }
+                    $companyName = $companyInfo->CompanyName ?? 'QuickBooks Company';
+                    Cache::put($companyCacheKey, $companyName, 3600);
                 }
-                $companyName = $companyInfo->CompanyName ?? 'QuickBooks Company';
             } catch (\Exception $healthError) {
-                Log::warning('QuickBooks live health check failed: ' . $healthError->getMessage());
-                return response()->json([
-                    'connected' => false,
-                    'error' => 'Connection to QuickBooks expired or invalid. Please reconnect. (' . $healthError->getMessage() . ')',
-                    'needs_reconnect' => true,
-                    'realm_id' => $tokens['realm_id'],
-                ]);
+                $errMsg = $healthError->getMessage();
+                Log::warning('QuickBooks live health check failed: ' . $errMsg);
+
+                // Only mark as disconnected if it's an actual OAuth / authorization failure,
+                // NOT on a temporary Intuit sandbox network/cURL timeout.
+                $isTimeout = stripos($errMsg, 'cURL error') !== false || stripos($errMsg, 'timed out') !== false;
+                $isAuthFailure = !$isTimeout && (
+                    stripos($errMsg, 'expired') !== false ||
+                    stripos($errMsg, 'invalid_grant') !== false ||
+                    stripos($errMsg, 'reconnect') !== false ||
+                    stripos($errMsg, 'not connected') !== false ||
+                    stripos($errMsg, 'AuthenticationFailed') !== false ||
+                    stripos($errMsg, '401') !== false
+                );
+
+                if ($isAuthFailure || !$isTimeout) {
+                    return response()->json([
+                        'connected' => false,
+                        'error' => 'Connection to QuickBooks expired or invalid. Please reconnect. (' . $errMsg . ')',
+                        'needs_reconnect' => true,
+                        'realm_id' => $tokens['realm_id'],
+                    ]);
+                }
+
+                // Transient network timeout while valid tokens exist: stay connected
+                $companyName = Cache::get($companyCacheKey, 'QuickBooks Company');
             }
 
             return response()->json([

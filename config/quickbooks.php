@@ -5,6 +5,7 @@ return [
     'client_secret' => env('QUICKBOOKS_CLIENT_SECRET'),
     'redirect_uri' => env('QUICKBOOKS_REDIRECT_URI', env('APP_URL') . '/api/quickbooks/callback'),
     'environment' => env('QUICKBOOKS_ENVIRONMENT', 'sandbox'), // 'sandbox' or 'production'
+    'timeout' => (int) env('QUICKBOOKS_API_TIMEOUT', 20),
     'scope' => env('QUICKBOOKS_SCOPE', 'com.intuit.quickbooks.accounting'),
     'base_urls' => [
         'sandbox' => 'development',

@@ -17,6 +17,7 @@ use QuickBooksOnline\API\Facades\CreditMemo;
 use QuickBooksOnline\API\Facades\Bill;
 use QuickBooksOnline\API\Facades\BillPayment;
 use QuickBooksOnline\API\Facades\Vendor;
+use QuickBooksOnline\API\Facades\Account;
 use QuickBooksOnline\API\Data\IPPLine;
 use QuickBooksOnline\API\Data\IPPReferenceType;
 use QuickBooksOnline\API\Data\IPPPayment;
@@ -77,7 +78,7 @@ class QuickBooksService
         }
 
         if (!defined('QUICKBOOKS_API_TIMEOUT')) {
-            define('QUICKBOOKS_API_TIMEOUT', (int)config('quickbooks.timeout', 60));
+            define('QUICKBOOKS_API_TIMEOUT', (int)config('quickbooks.timeout', 25));
         }
 
         $this->dataService = DataService::Configure($config);
@@ -308,7 +309,10 @@ class QuickBooksService
             $updateData['qb_refresh_expires_at'] = now()->addDays(100);
         }
         
+        $previousRealmId = $organization->qb_realm_id;
         $organization->update($updateData);
+        $this->clearCompanyMetadataCache($organization, $previousRealmId);
+        $this->clearCompanyMetadataCache($organization, $realmId);
         
         Log::info('QB Tokens Stored for Organization', [
             'org_id' => $organization->id,
@@ -362,54 +366,73 @@ class QuickBooksService
      */
     public function refreshAccessToken(Organization $organization = null)
     {
-        try {
-            if (!$organization) {
-                $organization = Organization::whereNotNull('qb_refresh_token')
-                    ->whereNotNull('qb_realm_id')
-                    ->first();
-            }
-                
-            if (!$organization) {
-                throw new \Exception('No organization with QuickBooks connection found');
-            }
+        if (!$organization) {
+            $organization = Organization::whereNotNull('qb_refresh_token')
+                ->whereNotNull('qb_realm_id')
+                ->first();
+        }
             
-            $this->initializeDataService(
-                $organization->qb_access_token,
-                $organization->qb_refresh_token,
-                $organization->qb_realm_id
-            );
-            
-            $OAuth2LoginHelper = $this->dataService->getOAuth2LoginHelper();
-            
-            // Decrypt refresh token for the SDK
-            $refreshToken = null;
-            try {
-                $refreshToken = $this->decryptTokenSafely($organization->qb_refresh_token, 'refresh token');
-            } catch (\Exception $e) {
-                // If encrypted with old APP_KEY or corrupted, clear stale tokens so org can reconnect
-                $organization->update([
-                    'qb_access_token' => null,
-                    'qb_refresh_token' => null,
-                    'qb_access_expires_at' => null,
-                    'qb_refresh_expires_at' => null,
-                ]);
-                throw new \Exception('QuickBooks authorization has expired or is invalid. Please reconnect QuickBooks in Global Settings.');
+        if (!$organization) {
+            throw new \Exception('No organization with QuickBooks connection found');
+        }
+
+        // Prevent race conditions: if multiple requests try to refresh simultaneously,
+        // use an atomic lock so only one performs the refresh and the others reuse the newly stored token.
+        $lockKey = 'qb_refresh_token_lock_' . $organization->id;
+        $lock = Cache::lock($lockKey, 30);
+
+        return $lock->block(15, function () use ($organization) {
+            // Re-read fresh token from DB in case another process already refreshed it while waiting for the lock
+            $organization->refresh();
+            $expiresAt = $organization->qb_access_expires_at 
+                ? \Carbon\Carbon::parse($organization->qb_access_expires_at) 
+                : null;
+
+            $buffer = config('quickbooks.token_refresh_buffer', 5);
+            if ($expiresAt && now()->addMinutes($buffer)->lt($expiresAt) && !empty($organization->qb_access_token)) {
+                Log::info('QB token was already refreshed by another concurrent process, reusing.');
+                return null;
             }
 
-            $refreshedToken = $OAuth2LoginHelper->refreshAccessTokenWithRefreshToken($refreshToken);
-            
-            $this->storeTokens($refreshedToken, $organization->qb_realm_id, $organization);
-            
-            Log::info('QuickBooks access token refreshed successfully for Org: ' . $organization->uuid);
-            
-            return $refreshedToken;
-        } catch (\Exception $e) {
-            Log::error('QuickBooks Token Refresh Error: ' . $e->getMessage());
-            if (str_contains($e->getMessage(), 'invalid_grant') || str_contains($e->getMessage(), 'Incorrect or invalid refresh token') || str_contains($e->getMessage(), 'reconnect QuickBooks')) {
-                throw new \Exception('QuickBooks authorization has expired. Please reconnect QuickBooks in Global Settings.');
+            try {
+                $this->initializeDataService(
+                    $organization->qb_access_token,
+                    $organization->qb_refresh_token,
+                    $organization->qb_realm_id
+                );
+                
+                $OAuth2LoginHelper = $this->dataService->getOAuth2LoginHelper();
+                
+                // Decrypt refresh token for the SDK
+                $refreshToken = null;
+                try {
+                    $refreshToken = $this->decryptTokenSafely($organization->qb_refresh_token, 'refresh token');
+                } catch (\Exception $e) {
+                    // If encrypted with old APP_KEY or corrupted, clear stale tokens so org can reconnect
+                    $organization->update([
+                        'qb_access_token' => null,
+                        'qb_refresh_token' => null,
+                        'qb_access_expires_at' => null,
+                        'qb_refresh_expires_at' => null,
+                    ]);
+                    throw new \Exception('QuickBooks authorization has expired or is invalid. Please reconnect QuickBooks in Global Settings.');
+                }
+
+                $refreshedToken = $OAuth2LoginHelper->refreshAccessTokenWithRefreshToken($refreshToken);
+                
+                $this->storeTokens($refreshedToken, $organization->qb_realm_id, $organization);
+                
+                Log::info('QuickBooks access token refreshed successfully for Org: ' . $organization->uuid);
+                
+                return $refreshedToken;
+            } catch (\Exception $e) {
+                Log::error('QuickBooks Token Refresh Error: ' . $e->getMessage());
+                if (str_contains($e->getMessage(), 'invalid_grant') || str_contains($e->getMessage(), 'Incorrect or invalid refresh token') || str_contains($e->getMessage(), 'reconnect QuickBooks')) {
+                    throw new \Exception('QuickBooks authorization has expired. Please reconnect QuickBooks in Global Settings.');
+                }
+                throw new \Exception('QuickBooks token refresh failed: ' . $e->getMessage());
             }
-            throw new \Exception('QuickBooks token refresh failed: ' . $e->getMessage());
-        }
+        });
     }
 
     /**
@@ -534,6 +557,7 @@ class QuickBooksService
                     Log::warning('Failed to revoke token with QuickBooks: ' . $e->getMessage());
                 }
                 
+                $previousRealmId = $organization->qb_realm_id;
                 $organization->update([
                     'qb_access_token' => null,
                     'qb_refresh_token' => null,
@@ -541,6 +565,7 @@ class QuickBooksService
                     'qb_access_expires_at' => null,
                     'qb_refresh_expires_at' => null,
                 ]);
+                $this->clearCompanyMetadataCache($organization, $previousRealmId);
                 
                 Log::info('QuickBooks tokens cleared for Org: ' . $organization->uuid);
             }
@@ -623,21 +648,36 @@ class QuickBooksService
     {
         try {
             if ($agent->quickbooks_customer_id) {
+                if (!$organization) {
+                    $organization = $agent->organization ?? null;
+                }
+                $realmKey = $organization?->qb_realm_id ?? 'default';
+                $custVerifyKey = "qb_cust_verified_{$realmKey}_{$agent->id}_{$agent->quickbooks_customer_id}";
+
+                if (Cache::get($custVerifyKey)) {
+                    return $agent->quickbooks_customer_id;
+                }
+
                 Log::info('Checking if cached QB customer ID is valid: ' . $agent->quickbooks_customer_id);
                 try {
-                    if (!$organization) {
-                        $organization = $agent->organization ?? null;
-                    }
                     $dataService = $this->getDataService($organization);
                     $qbCustomer = $dataService->FindById('Customer', $agent->quickbooks_customer_id);
                     if ($qbCustomer) {
                         $this->syncCustomerDetailsIfMissing($dataService, $qbCustomer, $agent);
+                        Cache::put($custVerifyKey, true, 86400);
                         return $agent->quickbooks_customer_id;
                     }
+                    $agent->update(['quickbooks_customer_id' => null]);
                 } catch (\Exception $e) {
-                    Log::warning('Cached QB customer ID is invalid or not found in current QB instance. Clearing cache. Error: ' . $e->getMessage());
+                    $errMsg = $e->getMessage();
+                    $isTimeout = stripos($errMsg, 'cURL error') !== false || stripos($errMsg, 'timed out') !== false;
+                    if ($isTimeout) {
+                        Log::warning('QB customer verification timed out; keeping cached ID ' . $agent->quickbooks_customer_id);
+                        return $agent->quickbooks_customer_id;
+                    }
+                    Log::warning('Cached QB customer ID is invalid or not found in current QB instance. Clearing cache. Error: ' . $errMsg);
+                    $agent->update(['quickbooks_customer_id' => null]);
                 }
-                $agent->update(['quickbooks_customer_id' => null]);
             }
 
             if (!$organization) {
@@ -809,26 +849,52 @@ class QuickBooksService
         try {
             $invoice->refresh();
 
-            // If Main Invoice is already created in QB, check and sync any pending unsynced payments
+            // If Main Invoice is already created in QB, rebuild/update lines (so tax/discount fixes apply) & sync any unsynced payments
             if ($invoice->quickbooks_invoice_id) {
-                Log::info('QB sync: Main invoice already synced in QB, syncing any unsynced payments', [
+                Log::info('QB sync: Invoice already in QB — rebuilding lines and updating to sync taxes/discounts/payments', [
                     'invoice_id' => $invoice->id,
                     'qb_invoice_id' => $invoice->quickbooks_invoice_id,
                     'doc_number' => $invoice->invoice_number,
                 ]);
 
-                $org = $invoice->organization 
-                    ?? $invoice->order?->organization 
-                    ?? ($invoice->organization_id ? \App\Models\Organization::find($invoice->organization_id) : null);
-                $dataService = $this->getDataService($org);
+                $log = QbSyncLog::create([
+                    'organization_id' => $invoice->organization_id ?? $invoice->order?->organization_id,
+                    'entity_type' => 'invoice',
+                    'entity_id' => $invoice->id,
+                    'action' => 'update',
+                    'status' => 'pending',
+                    'request_id' => (string) Str::uuid(),
+                ]);
 
-                $syncedPaymentIds = $this->syncPendingPaymentsForOrder($dataService, $invoice);
+                try {
+                    $org = $invoice->organization
+                        ?? $invoice->order?->organization
+                        ?? ($invoice->organization_id ? \App\Models\Organization::find($invoice->organization_id) : null);
+                    $dataService = $this->getDataService($org);
 
-                return [
-                    'invoice_id' => $invoice->quickbooks_invoice_id,
-                    'payment_id' => !empty($syncedPaymentIds) ? end($syncedPaymentIds) : null,
-                    'doc_number' => $invoice->invoice_number,
-                ];
+                    $updatedInvoice = $this->rebuildAndUpdateQBInvoice($dataService, $invoice, $org);
+                    $syncedPaymentIds = $this->syncPendingPaymentsForOrder($dataService, $invoice, $updatedInvoice);
+
+                    $log->update([
+                        'status'       => 'success',
+                        'qb_entity_id' => $invoice->quickbooks_invoice_id,
+                        'qb_doc_number' => $updatedInvoice->DocNumber ?? $this->formatDocNumber($invoice->invoice_number),
+                        'synced_at'    => now(),
+                        'response'     => $updatedInvoice ? (array)$updatedInvoice : [],
+                    ]);
+
+                    return [
+                        'invoice_id' => $invoice->quickbooks_invoice_id,
+                        'payment_id' => !empty($syncedPaymentIds) ? end($syncedPaymentIds) : null,
+                        'doc_number' => $updatedInvoice->DocNumber ?? $invoice->invoice_number,
+                    ];
+                } catch (\Throwable $e) {
+                    $log->update([
+                        'status'        => 'failed',
+                        'error_message' => $e->getMessage(),
+                    ]);
+                    throw $e;
+                }
             }
 
             $log = QbSyncLog::create([
@@ -841,152 +907,23 @@ class QuickBooksService
             ]);
 
             try {
-                $org = $invoice->organization 
-                    ?? $invoice->order?->organization 
+                $org = $invoice->organization
+                    ?? $invoice->order?->organization
                     ?? ($invoice->organization_id ? \App\Models\Organization::find($invoice->organization_id) : null);
                 $dataService = $this->getDataService($org);
 
                 // 1. Ensure Customer
                 $customerId = $this->getOrCreateCustomer($invoice->agent, $org);
 
-                // 2. Resolve Tax Code before building lines so line items can link TaxCodeRef
-                $taxCodeId = $this->resolveTaxCodeId($dataService, $invoice);
+                // 2. Build payload (respecting CA GTM vs US UsingSalesTax vs fallback)
+                $invoicePayload = $this->prepareInvoicePayload($dataService, $invoice, $org, $customerId);
 
-                // 3. Build Lines with Tax Support and Discount handling
-                $lines = [];
-                foreach ($invoice->items as $item) {
-                    $itemAmount = (float)($item->amount ?: ($item->quantity * $item->unit_price));
-
-                    // If item is a discount or credit (negative amount), add as a negative SalesItemLineDetail
-                    // (QuickBooks Online API only supports ONE DiscountLineDetail per transaction; multiple discounts must be line items)
-                    if ($itemAmount < 0 || (float)$item->unit_price < 0) {
-                        $discountDesc = $item->description ?: 'Discount';
-                        $discountItemId = $this->getOrCreateServiceItem($dataService, null, 'Discounts & Promotions');
-                        $lines[] = $this->createInvoiceLine(
-                            $discountItemId,
-                            1,
-                            $itemAmount,
-                            $discountDesc,
-                            $taxCodeId
-                        );
-                        continue;
-                    }
-
-                    // Ensure the QB item exists and is valid in the currently connected QB company
-                    $service = $item->orderService?->service;
-                    $fallbackName = !empty($item->description) ? trim(explode("\n", $item->description)[0]) : 'Service';
-                    $itemId = $this->getOrCreateServiceItem($dataService, $service, $fallbackName);
-                    
-                    $lines[] = $this->createInvoiceLine(
-                        $itemId,
-                        $item->quantity,
-                        $itemAmount,
-                        $item->description,
-                        $taxCodeId
-                    );
-                }
-
-                // If tax code was not mapped at line/invoice level in QBO (e.g. US company, or manual sales tax),
-                // add explicit tax lines so the invoice total in QuickBooks matches BCF to the exact cent.
-                if (!$taxCodeId && (float)$invoice->tax_amount > 0) {
-                    $taxItemId = $this->getOrCreateServiceItem($dataService, null, 'Sales Tax');
-                    if (!empty($invoice->tax_details) && is_array($invoice->tax_details)) {
-                        foreach ($invoice->tax_details as $taxName => $taxInfo) {
-                            $taxAmt = (float)($taxInfo['amount'] ?? 0);
-                            $rate = $taxInfo['rate'] ?? '';
-                            if ($taxAmt > 0) {
-                                $taxDesc = $rate ? "{$taxName} ({$rate}%)" : $taxName;
-                                $lines[] = $this->createInvoiceLine($taxItemId, 1, $taxAmt, $taxDesc, null);
-                            }
-                        }
-                    } else {
-                        $lines[] = $this->createInvoiceLine($taxItemId, 1, (float)$invoice->tax_amount, 'Sales Tax', null);
-                    }
-                }
-
-                // Fallback 1: If invoice items are empty, populate lines from order services if available
-                if (empty($lines) && $invoice->order && ($invoice->order->relationLoaded('services') ? $invoice->order->services->isNotEmpty() : ($invoice->order?->services()?->exists()))) {
-                    $orderServices = $invoice->order->relationLoaded('services') ? $invoice->order->services : $invoice->order->services()->with('service')->get();
-                    $serviceCount = max(1, $orderServices->count());
-                    foreach ($orderServices as $orderService) {
-                        $amount = (float)($orderService->price ?? $orderService->amount ?? ($invoice->total ? round($invoice->total / $serviceCount, 2) : 0));
-                        $service = $orderService->service;
-                        $serviceName = $service?->name ?? 'Service';
-
-                        if ($amount < 0) {
-                            $discountItemId = $this->getOrCreateServiceItem($dataService, null, 'Discounts & Promotions');
-                            $lines[] = $this->createInvoiceLine(
-                                $discountItemId,
-                                1,
-                                $amount,
-                                $serviceName . ($invoice->order_id ? " (Order #{$invoice->order_id})" : ""),
-                                $taxCodeId
-                            );
-                            continue;
-                        }
-
-                        $itemId = $this->getOrCreateServiceItem($dataService, $service, $serviceName);
-                        $qty = 1;
-                        $lines[] = $this->createInvoiceLine(
-                            $itemId,
-                            $qty,
-                            $amount,
-                            $serviceName . ($invoice->order_id ? " (Order #{$invoice->order_id})" : ""),
-                            $taxCodeId
-                        );
-                    }
-                }
-
-                // Fallback 2: Final fallback line item if invoice and order still have no lines
-                if (empty($lines)) {
-                    $fallbackItemName = 'General Services';
-                    $fallbackItemId = $this->getOrCreateServiceItem($dataService, null, $fallbackItemName);
-                    $fallbackDesc = !empty($invoice->order_id)
-                        ? "Services for Order #{$invoice->order_id}"
-                        : "Services for Invoice #{$invoice->invoice_number}";
-                    $totalAmount = (float)($invoice->total ?: ($invoice->paid_amount ?: 0));
-                    
-                    $lines[] = $this->createInvoiceLine(
-                        $fallbackItemId,
-                        1,
-                        $totalAmount,
-                        $fallbackDesc,
-                        $taxCodeId
-                    );
-                }
-
-                // 4. Create QB Invoice
-                $invoiceObj = Invoice::create([
-                    'CustomerRef' => ['value' => $customerId],
-                    'Line' => $lines,
-                    'DocNumber' => $this->formatDocNumber($invoice->invoice_number),
-                    'TxnDate' => $invoice->issued_at?->format('Y-m-d') ?? now()->format('Y-m-d'),
-                    'PrivateNote' => "Order #{$invoice->order_id} - Property: " . ($invoice->order->property->address ?? 'N/A'),
-                    'TxnTaxDetail' => $taxCodeId ? [
-                        'TxnTaxCodeRef' => ['value' => $taxCodeId]
-                    ] : null,
-                ]);
-
+                $invoiceObj = Invoice::create($invoicePayload);
                 $qbInvoice = $dataService->Add($invoiceObj);
 
-                // The QB SDK can return an Exception object instead of null on failure.
-                // A truthy check (!$qbInvoice) misses this case, so we check explicitly.
                 if (!$qbInvoice || $qbInvoice instanceof \Exception) {
-                    $error = $dataService->getLastError();
-                    $sdkMsg = ($qbInvoice instanceof \Exception) ? $qbInvoice->getMessage() : null;
-                    $errorBody = $error?->getResponseBody();
-
-                    // Parse detailed message from XML / JSON responseBody if available
-                    $detailMsg = null;
-                    if ($errorBody) {
-                        if (preg_match('/<Detail>(.*?)<\/Detail>/i', $errorBody, $m)) {
-                            $detailMsg = $m[1];
-                        } elseif (preg_match('/<Message>(.*?)<\/Message>/i', $errorBody, $m)) {
-                            $detailMsg = $m[1];
-                        }
-                    }
-
-                    $resolvedError = $detailMsg ?: ($errorBody ?: ($sdkMsg ?: 'Unknown QuickBooks API error'));
+                    $resolvedError = $this->extractQBErrorMessage($dataService, $qbInvoice);
+                    $this->handleInvalidCustomerError($resolvedError, $invoice, $org);
                     throw new \Exception('QB invoice creation failed: ' . $resolvedError);
                 }
 
@@ -995,7 +932,7 @@ class QuickBooksService
                     'quickbooks_synced_at' => now(),
                 ]);
 
-                // 5. Sync any successful payments for this order against the new Main Invoice
+                // 3. Sync any successful payments for this order against the new Main Invoice
                 $syncedPaymentIds = $this->syncPendingPaymentsForOrder($dataService, $invoice, $qbInvoice);
                 $qbPaymentId = !empty($syncedPaymentIds) ? end($syncedPaymentIds) : null;
 
@@ -1027,11 +964,538 @@ class QuickBooksService
     }
 
     /**
+     * Rebuild lines/tax/discount payload for an already-synced QB Invoice and update it in place.
+     */
+    protected function rebuildAndUpdateQBInvoice($dataService, \App\Models\Invoice $invoice, ?Organization $org = null)
+    {
+        $qbInvoiceId = (string)$invoice->quickbooks_invoice_id;
+        $existingQbInvoice = $this->callReadWithRetry(
+            fn() => $dataService->FindById('Invoice', $qbInvoiceId),
+            "FindById(Invoice, {$qbInvoiceId})"
+        );
+
+        if (!$existingQbInvoice || $existingQbInvoice instanceof \Exception) {
+            $err = $this->extractQBErrorMessage($dataService, $existingQbInvoice);
+            throw new \Exception("Failed to fetch existing QB invoice #{$qbInvoiceId} for update: {$err}");
+        }
+
+        // Skip redundant Update() if QB already matches BCF total and expected tax mode
+        $caps = $this->getCompanyCapabilities($dataService, $org);
+        $useNativeTaxBox = !$caps['is_us'] || $caps['using_sales_tax'];
+        $existingTotal = (float)($existingQbInvoice->TotalAmt ?? 0);
+        $targetTotal = (float)($invoice->total ?? 0);
+        $hasNativeTxnTax = !empty($existingQbInvoice->TxnTaxDetail) && (float)($existingQbInvoice->TxnTaxDetail->TotalTax ?? 0) > 0;
+        $taxModeMatches = ($useNativeTaxBox && (float)$invoice->tax_amount > 0) ? $hasNativeTxnTax : !$hasNativeTxnTax;
+
+        if (abs($existingTotal - $targetTotal) < 0.01 && $taxModeMatches) {
+            Log::info("QB sync: QB invoice #{$qbInvoiceId} already matches BCF total (\${$existingTotal}) and tax mode; skipping Update()");
+            return $existingQbInvoice;
+        }
+
+        $customerId = $this->getOrCreateCustomer($invoice->agent, $org);
+        $invoicePayload = $this->prepareInvoicePayload($dataService, $invoice, $org, $customerId);
+
+        // Preserve original TxnDate if QB already has one, unless local issued_at is set
+        if (empty($invoice->issued_at) && !empty($existingQbInvoice->TxnDate)) {
+            $invoicePayload['TxnDate'] = $existingQbInvoice->TxnDate;
+        }
+
+        $updatedObj = Invoice::update($existingQbInvoice, $invoicePayload);
+
+        // FacadeHelper::mergeObj does not unset omitted properties, so explicitly clear
+        // tax fields when switching to a payload mode that omits them (e.g. UsingSalesTax=false).
+        if (!array_key_exists('TxnTaxDetail', $invoicePayload)) {
+            $updatedObj->TxnTaxDetail = null;
+        }
+        if (!array_key_exists('GlobalTaxCalculation', $invoicePayload)) {
+            $updatedObj->GlobalTaxCalculation = null;
+        }
+        if (!array_key_exists('ApplyTaxAfterDiscount', $invoicePayload)) {
+            $updatedObj->ApplyTaxAfterDiscount = null;
+        }
+
+        $qbUpdated = $dataService->Update($updatedObj);
+        if (!$qbUpdated || $qbUpdated instanceof \Exception) {
+            $resolvedError = $this->extractQBErrorMessage($dataService, $qbUpdated);
+            $this->handleInvalidCustomerError($resolvedError, $invoice, $org);
+            throw new \Exception('QB invoice update failed: ' . $resolvedError);
+        }
+
+        $invoice->update(['quickbooks_synced_at' => now()]);
+        return $qbUpdated;
+    }
+
+    /**
+     * Build the QuickBooks Invoice payload shared by both create and update flows.
+     */
+    protected function prepareInvoicePayload($dataService, \App\Models\Invoice $invoice, ?Organization $org, string $customerId): array
+    {
+        $caps = $this->getCompanyCapabilities($dataService, $org);
+        $isUSCompany = $caps['is_us'];
+        $usingSalesTax = $caps['using_sales_tax'];
+
+        $taxAmount = round((float)($invoice->tax_amount ?? 0), 2);
+        $taxCodeId = $this->resolveTaxCodeId($dataService, $invoice, $isUSCompany);
+
+        // Determine per-line TaxCodeRef before constructing lines:
+        // - Canadian GTM: actual mapped/matched QB TaxCode ID (e.g. GST/PST)
+        // - US + SalesTax enabled: 'TAX' if taxable, 'NON' otherwise
+        // - US + SalesTax disabled: 'NON' (QBO strips TxnTaxDetail when UsingSalesTax=false)
+        $lineTaxCode = null;
+        if ($isUSCompany) {
+            $lineTaxCode = ($usingSalesTax && $taxAmount > 0) ? 'TAX' : 'NON';
+        } else {
+            $lineTaxCode = $taxCodeId;
+        }
+
+        // Build service lines + aggregate negative discounts
+        $lines = [];
+        $totalDiscount = 0.0;
+        $discountBreakdown = [];
+
+        foreach ($invoice->items as $item) {
+            $itemAmount = (float)($item->amount ?: ($item->quantity * $item->unit_price));
+
+            if ($itemAmount < 0 || (float)$item->unit_price < 0) {
+                $absAmount = abs($itemAmount);
+                $totalDiscount += $absAmount;
+                $desc = $item->description ?: 'Discount';
+                $discountBreakdown[] = "{$desc}: -$" . number_format($absAmount, 2);
+                continue;
+            }
+
+            $service = $item->orderService?->service;
+            $fallbackName = !empty($item->description) ? trim(explode("\n", $item->description)[0]) : 'Service';
+            $itemId = $this->getOrCreateServiceItem($dataService, $service, $fallbackName);
+
+            $lines[] = $this->createInvoiceLine(
+                $itemId,
+                $item->quantity,
+                $itemAmount,
+                $item->description,
+                $lineTaxCode,
+                false
+            );
+        }
+
+        // Fallback 1: If invoice items are empty, populate from order services
+        if (empty($lines) && $invoice->order && ($invoice->order->relationLoaded('services') ? $invoice->order->services->isNotEmpty() : ($invoice->order?->services()?->exists()))) {
+            $orderServices = $invoice->order->relationLoaded('services') ? $invoice->order->services : $invoice->order->services()->with('service')->get();
+            $serviceCount = max(1, $orderServices->count());
+            foreach ($orderServices as $orderService) {
+                $amount = (float)($orderService->price ?? $orderService->amount ?? ($invoice->total ? round($invoice->total / $serviceCount, 2) : 0));
+                $service = $orderService->service;
+                $serviceName = $service?->name ?? 'Service';
+
+                if ($amount < 0) {
+                    $absAmount = abs($amount);
+                    $totalDiscount += $absAmount;
+                    $discountBreakdown[] = "{$serviceName}: -$" . number_format($absAmount, 2);
+                    continue;
+                }
+
+                $itemId = $this->getOrCreateServiceItem($dataService, $service, $serviceName);
+                $lines[] = $this->createInvoiceLine(
+                    $itemId,
+                    1,
+                    $amount,
+                    $serviceName . ($invoice->order_id ? " (Order #{$invoice->order_id})" : ""),
+                    $lineTaxCode,
+                    false
+                );
+            }
+        }
+
+        // Fallback 2: General service line if order/invoice still has no positive lines
+        if (empty($lines)) {
+            $fallbackItemId = $this->getOrCreateServiceItem($dataService, null, 'General Services');
+            $fallbackDesc = !empty($invoice->order_id)
+                ? "Services for Order #{$invoice->order_id}"
+                : "Services for Invoice #{$invoice->invoice_number}";
+            $fallbackAmt = (float)($invoice->subtotal ?: ($invoice->total ?: ($invoice->paid_amount ?: 0)));
+
+            $lines[] = $this->createInvoiceLine(
+                $fallbackItemId,
+                1,
+                $fallbackAmt,
+                $fallbackDesc,
+                $lineTaxCode,
+                false
+            );
+        }
+
+        // Compile PrivateNote with Order, Property, Discount & Tax breakdown
+        $privateNoteParts = [];
+        $privateNoteParts[] = "Order #{$invoice->order_id} - Property: " . ($invoice->order->property->address ?? 'N/A');
+
+        if (!empty($discountBreakdown)) {
+            $privateNoteParts[] = "Discounts: " . implode(" | ", $discountBreakdown);
+        }
+
+        $taxBreakdownParts = [];
+        if (!empty($invoice->tax_details) && is_array($invoice->tax_details)) {
+            foreach ($invoice->tax_details as $tName => $tInfo) {
+                $rateStr = isset($tInfo['rate']) ? " ({$tInfo['rate']}%)" : "";
+                $amtStr = isset($tInfo['amount']) ? "$" . number_format((float)$tInfo['amount'], 2) : "";
+                $taxBreakdownParts[] = trim("{$tName}{$rateStr}: {$amtStr}");
+            }
+            if (!empty($taxBreakdownParts)) {
+                $privateNoteParts[] = "Taxes: " . implode(" | ", $taxBreakdownParts);
+            }
+        }
+
+        $taxableNet = max(0, (float)$invoice->subtotal - $totalDiscount);
+        $invoicePayload = [
+            'CustomerRef' => ['value' => $customerId],
+            'DocNumber'   => $this->formatDocNumber($invoice->invoice_number),
+            'TxnDate'     => $invoice->issued_at?->format('Y-m-d') ?? now()->format('Y-m-d'),
+            'PrivateNote' => implode("\n", $privateNoteParts),
+        ];
+
+        $useNativeTaxBox = !$isUSCompany || $usingSalesTax;
+
+        if ($useNativeTaxBox) {
+            if ($totalDiscount > 0) {
+                $lines[] = $this->createDiscountLine($totalDiscount, 'Total Discounts');
+            }
+
+            if ($isUSCompany) {
+                // US QBO with Sales Tax enabled: override AST using a user-defined TaxCode + TotalTax (no TaxLine)
+                $txnTaxDetail = null;
+                if ($taxAmount > 0) {
+                    $customTax = $this->resolveOrCreateUSCustomTaxCode($dataService, $invoice, $org);
+                    if ($customTax) {
+                        $txnTaxDetail = [
+                            'TxnTaxCodeRef' => [
+                                'value' => $customTax['id'],
+                                'name'  => $customTax['name'],
+                            ],
+                            'TotalTax' => $taxAmount,
+                        ];
+                    } else {
+                        Log::warning("QB US company ({$org?->qb_realm_id}) has UsingSalesTax=true but no USER_DEFINED TaxCode could be resolved; falling back to Sales Tax line.");
+                        $useNativeTaxBox = false;
+                    }
+                }
+            } else {
+                // Canadian GTM: full TxnTaxDetail with TaxCodeRef + TaxLine breakdown
+                $txnTaxDetail = $this->buildTxnTaxDetail($dataService, $invoice, $taxCodeId, $taxableNet);
+            }
+
+            if ($useNativeTaxBox) {
+                $invoicePayload['Line'] = $lines;
+                $invoicePayload['GlobalTaxCalculation'] = 'TaxExcluded';
+                $invoicePayload['ApplyTaxAfterDiscount'] = 'true';
+                if (!empty($txnTaxDetail)) {
+                    $invoicePayload['TxnTaxDetail'] = $txnTaxDetail;
+                }
+                return $invoicePayload;
+            }
+        }
+
+        // Fallback for US QBO when UsingSalesTax=false (Intuit silently strips all TxnTaxDetail
+        // when Sales Tax is turned off in QBO settings). Force service lines NON and add one
+        // reusable 'Sales Tax' line item so QB invoice TotalAmt and Balance match BCF exactly.
+        if ($taxAmount > 0) {
+            $realmId = $org?->qb_realm_id ?? 'unknown';
+            Log::warning("QB realm {$realmId} has UsingSalesTax=false in QBO Preferences; Intuit strips TxnTaxDetail unless Sales Tax is enabled in QB UI or a Canadian QB account is connected. Using 'Sales Tax' line so total matches BCF.");
+
+            foreach ($lines as $line) {
+                if ($line instanceof IPPLine && $line->DetailType === 'SalesItemLineDetail' && $line->SalesItemLineDetail) {
+                    $line->SalesItemLineDetail->TaxCodeRef = new IPPReferenceType(['value' => 'NON']);
+                }
+            }
+
+            $taxItemId = $this->getOrCreateServiceItem($dataService, null, 'Sales Tax');
+            $taxLineDesc = !empty($taxBreakdownParts) ? implode(' | ', $taxBreakdownParts) : 'Sales Tax';
+            $lines[] = $this->createInvoiceLine(
+                $taxItemId,
+                1,
+                $taxAmount,
+                $taxLineDesc,
+                'NON',
+                false
+            );
+        }
+
+        if ($totalDiscount > 0) {
+            // Re-ensure DiscountLineDetail sits cleanly after all SalesItemLineDetail lines (prevent duplicates)
+            $lines = array_values(array_filter($lines, fn($l) => !($l instanceof IPPLine && $l->DetailType === 'DiscountLineDetail')));
+            $lines[] = $this->createDiscountLine($totalDiscount, 'Total Discounts');
+        }
+
+        $invoicePayload['Line'] = $lines;
+        return $invoicePayload;
+    }
+
+    /**
+     * Extract human-readable error message from a failed QuickBooks SDK operation.
+     */
+    protected function extractQBErrorMessage($dataService, $qbResult): string
+    {
+        $error = $dataService->getLastError();
+        $sdkMsg = ($qbResult instanceof \Exception) ? $qbResult->getMessage() : null;
+        $errorBody = $error?->getResponseBody();
+
+        $detailMsg = null;
+        if ($errorBody) {
+            if (preg_match('/<Detail>(.*?)<\/Detail>/i', $errorBody, $m)) {
+                $detailMsg = $m[1];
+            } elseif (preg_match('/<Message>(.*?)<\/Message>/i', $errorBody, $m)) {
+                $detailMsg = $m[1];
+            }
+        }
+
+        return $detailMsg ?: ($errorBody ?: ($sdkMsg ?: 'Unknown QuickBooks API error'));
+    }
+
+    /**
+     * Clear stale customer reference if QuickBooks reports "Names element id X not found".
+     */
+    protected function handleInvalidCustomerError(string $resolvedError, \App\Models\Invoice $invoice, ?Organization $org): void
+    {
+        if (stripos($resolvedError, 'Names element id') !== false && stripos($resolvedError, 'not found') !== false && $invoice->agent) {
+            $realmKey = $org?->qb_realm_id ?? 'default';
+            Cache::forget("qb_cust_verified_{$realmKey}_{$invoice->agent->id}_{$invoice->agent->quickbooks_customer_id}");
+            $invoice->agent->update(['quickbooks_customer_id' => null]);
+        }
+    }
+
+    /**
+     * Clear cached QuickBooks company, tax, and account metadata for an organization/realm.
+     */
+    public function clearCompanyMetadataCache(?Organization $org = null, ?string $realmId = null): void
+    {
+        $orgId = $org?->id ?? 'default';
+        $realmKey = $realmId ?? ($org?->qb_realm_id ?? 'default');
+
+        $keys = [
+            "qb_is_us_company_{$orgId}",
+            "qb_is_us_company_{$orgId}_{$realmKey}",
+            "qb_using_sales_tax_{$orgId}_{$realmKey}",
+            "qb_company_name_{$orgId}_{$realmKey}",
+            "qb_tax_codes_{$orgId}",
+            "qb_tax_codes_{$orgId}_{$realmKey}",
+            "qb_tax_rates_{$orgId}",
+            "qb_tax_rates_{$orgId}_{$realmKey}",
+            "qb_income_account_id_{$orgId}",
+            "qb_income_account_id_{$orgId}_{$realmKey}",
+            "qb_expense_account_id_{$orgId}",
+            "qb_expense_account_id_{$orgId}_{$realmKey}",
+            "qb_bank_account_id_{$orgId}",
+            "qb_bank_account_id_{$orgId}_{$realmKey}",
+        ];
+
+        foreach ($keys as $key) {
+            Cache::forget($key);
+        }
+    }
+
+    /**
+     * Execute an idempotent QB read/query call with a short retry on transient cURL timeouts.
+     */
+    protected function callReadWithRetry(callable $fn, string $operationName, int $maxAttempts = 2)
+    {
+        $lastException = null;
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            try {
+                return $fn();
+            } catch (\Throwable $e) {
+                $lastException = $e;
+                $msg = $e->getMessage();
+                $isTransient = stripos($msg, 'cURL error') !== false || stripos($msg, 'timed out') !== false;
+                if (!$isTransient || $attempt >= $maxAttempts) {
+                    throw $e;
+                }
+                Log::warning("QB transient timeout during {$operationName} (attempt {$attempt}/{$maxAttempts}), retrying: {$msg}");
+                usleep(250000);
+            }
+        }
+        throw $lastException ?? new \Exception("QB operation {$operationName} failed");
+    }
+
+    /**
+     * Detect connected QB company country and Sales Tax preference safely without poisoning cache on errors.
+     */
+    protected function getCompanyCapabilities($dataService, ?Organization $org = null): array
+    {
+        $orgCacheId = $org?->id ?? ($this->organization?->id ?? 'default');
+        $realmKey = $org?->qb_realm_id ?? ($this->organization?->qb_realm_id ?? 'default');
+
+        $usKey = "qb_is_us_company_{$orgCacheId}_{$realmKey}";
+        $taxKey = "qb_using_sales_tax_{$orgCacheId}_{$realmKey}";
+
+        $isUS = Cache::get($usKey);
+        if ($isUS === null) {
+            try {
+                $companyInfo = $this->callReadWithRetry(fn() => $dataService->getCompanyInfo(), 'getCompanyInfo');
+                if ($companyInfo && !empty($companyInfo->Country)) {
+                    $isUS = strcasecmp($companyInfo->Country, 'US') === 0;
+                    Cache::put($usKey, $isUS, 3600);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('Failed to detect QB company country: ' . $e->getMessage());
+            }
+        }
+
+        $usingSalesTax = Cache::get($taxKey);
+        if ($usingSalesTax === null) {
+            try {
+                $prefs = $this->callReadWithRetry(fn() => $dataService->getCompanyPreferences(), 'getCompanyPreferences');
+                if ($prefs && isset($prefs->TaxPrefs)) {
+                    $raw = $prefs->TaxPrefs->UsingSalesTax ?? false;
+                    $usingSalesTax = ($raw === true || $raw === 'true' || $raw === 1 || $raw === '1');
+                    Cache::put($taxKey, $usingSalesTax, 300);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('Failed to detect QB UsingSalesTax preference: ' . $e->getMessage());
+            }
+        }
+
+        return [
+            // Default safely: if US detection timed out twice, assume false (or true? wait: never cache error)
+            'is_us' => (bool)($isUS ?? false),
+            'using_sales_tax' => (bool)($usingSalesTax ?? false),
+        ];
+    }
+
+    /**
+     * Find an existing user-defined QB TaxCode suitable for overriding US AST TxnTaxDetail.
+     */
+    protected function resolveOrCreateUSCustomTaxCode($dataService, \App\Models\Invoice $invoice, ?Organization $org = null): ?array
+    {
+        $orgCacheId = $org?->id ?? ($this->organization?->id ?? ($invoice->organization_id ?? 'default'));
+        $realmKey = $org?->qb_realm_id ?? ($this->organization?->qb_realm_id ?? 'default');
+        $cacheKey = "qb_tax_codes_{$orgCacheId}_{$realmKey}";
+
+        try {
+            $taxCodes = Cache::get($cacheKey);
+            if (empty($taxCodes)) {
+                $queried = $this->callReadWithRetry(
+                    fn() => $dataService->Query("SELECT * FROM TaxCode WHERE Active = true"),
+                    'Query(TaxCode)'
+                );
+                if (!empty($queried) && is_array($queried)) {
+                    $taxCodes = $queried;
+                    Cache::put($cacheKey, $taxCodes, 3600);
+                }
+            }
+
+            if (!empty($taxCodes) && is_array($taxCodes)) {
+                foreach ($taxCodes as $tc) {
+                    $idStr = (string)($tc->Id ?? '');
+                    $nameStr = (string)($tc->Name ?? '');
+                    // Never use US system-reserved codes for TxnTaxCodeRef
+                    if (in_array(strtoupper($idStr), ['TAX', 'NON', 'CUSTOMSALESTAX'], true)) {
+                        continue;
+                    }
+                    if (!($tc->Taxable === true || $tc->Taxable === 'true')) {
+                        continue;
+                    }
+                    return ['id' => $idStr, 'name' => $nameStr ?: $idStr];
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Failed to resolve US custom TaxCode: ' . $e->getMessage());
+        }
+
+        return null;
+    }
+
+    /**
+     * Build native QuickBooks TxnTaxDetail for Canadian Global Tax Model
+     */
+    protected function buildTxnTaxDetail($dataService, \App\Models\Invoice $invoice, ?string $taxCodeId, float $taxableNet = 0): ?array
+    {
+        $taxAmount = (float)$invoice->tax_amount;
+        if ($taxAmount <= 0 && empty($taxCodeId)) {
+            return null;
+        }
+
+        $taxDetail = [
+            'TotalTax' => round($taxAmount, 2),
+        ];
+
+        if ($taxCodeId) {
+            $taxDetail['TxnTaxCodeRef'] = ['value' => $taxCodeId];
+        }
+
+        // If invoice has detailed tax breakdown (e.g. GST and PST), build native TaxLine entries
+        if (!empty($invoice->tax_details) && is_array($invoice->tax_details)) {
+            $taxLines = [];
+            $orgCacheId = $this->organization?->id ?? ($invoice->organization_id ?? 'default');
+            $realmKey = $this->organization?->qb_realm_id ?? 'default';
+            $rateCacheKey = "qb_tax_rates_{$orgCacheId}_{$realmKey}";
+
+            $qbTaxRates = Cache::get($rateCacheKey);
+            if (empty($qbTaxRates)) {
+                try {
+                    $rates = $this->callReadWithRetry(
+                        fn() => $dataService->Query("SELECT * FROM TaxRate WHERE Active = true"),
+                        'Query(TaxRate)'
+                    );
+                    if (!empty($rates) && is_array($rates)) {
+                        $qbTaxRates = $rates;
+                        Cache::put($rateCacheKey, $qbTaxRates, 3600);
+                    } else {
+                        $qbTaxRates = [];
+                    }
+                } catch (\Exception $e) {
+                    Log::warning('Failed to query QB TaxRates for TaxLine building: ' . $e->getMessage());
+                    $qbTaxRates = [];
+                }
+            }
+
+            foreach ($invoice->tax_details as $taxName => $taxInfo) {
+                $lineAmt = round((float)($taxInfo['amount'] ?? 0), 2);
+                $lineRate = (float)($taxInfo['rate'] ?? 0);
+                if ($lineAmt <= 0) continue;
+
+                $taxRateRef = null;
+                foreach ($qbTaxRates as $tr) {
+                    if (stripos($tr->Name, $taxName) !== false || (abs((float)$tr->RateValue - $lineRate) < 0.01)) {
+                        $taxRateRef = (string)$tr->Id;
+                        break;
+                    }
+                }
+
+                // Intuit requires TaxRateRef on every TaxLineDetail; skip TaxLine if TaxRateRef could not be resolved
+                if ($taxRateRef) {
+                    $effectiveBase = ($lineRate > 0)
+                        ? min(round($taxableNet, 2), round($lineAmt / ($lineRate / 100), 2))
+                        : round($taxableNet, 2);
+
+                    $taxLines[] = [
+                        'DetailType' => 'TaxLineDetail',
+                        'Amount' => $lineAmt,
+                        'TaxLineDetail' => [
+                            'TaxRateRef' => ['value' => $taxRateRef],
+                            'PercentBased' => 'true',
+                            'TaxPercent' => $lineRate,
+                            'NetAmountTaxable' => $effectiveBase,
+                        ],
+                    ];
+                }
+            }
+
+            if (!empty($taxLines)) {
+                $taxDetail['TaxLine'] = $taxLines;
+            }
+        }
+
+        return $taxDetail;
+    }
+
+    /**
      * ✅ NEW: Resolve QuickBooks TaxCode ID from Invoice tax_details
      */
-    protected function resolveTaxCodeId($dataService, \App\Models\Invoice $invoice): ?string
+    protected function resolveTaxCodeId($dataService, \App\Models\Invoice $invoice, bool $isUSCompany = false): ?string
     {
         if (empty($invoice->tax_details) || !is_array($invoice->tax_details)) return null;
+
+        if ($isUSCompany) {
+            return 'TAX';
+        }
 
         $orgUuid = $invoice->order?->organization?->uuid ?? null;
         $mappings = null;
@@ -1039,11 +1503,9 @@ class QuickBooksService
             $mappings = \App\Models\Setting::where('org_id', $orgUuid)->where('key', 'quickbooks_tax_mappings')->first();
         }
 
-        // Check each tax entry in invoice tax_details
         $taxNames = array_keys($invoice->tax_details);
         $primaryTaxName = $taxNames[0] ?? null;
 
-        // Try mapping by full combination (e.g. "GST/PST" if multiple) or primary tax name
         $combinedName = implode('/', $taxNames);
         if ($mappings && is_array($mappings->value)) {
             if (isset($mappings->value[$combinedName])) {
@@ -1054,31 +1516,49 @@ class QuickBooksService
             }
         }
 
-        // Fallback: Search QB TaxCode by name
         try {
-            // First search combined name e.g. "GST/PST"
-            if (count($taxNames) > 1) {
-                $escapedCombined = str_replace("'", "''", $combinedName);
-                $taxCodes = $dataService->Query("SELECT * FROM TaxCode WHERE Name = '{$escapedCombined}' AND Active = true");
-                if (!empty($taxCodes)) {
-                    return $taxCodes[0]->Id;
+            $orgCacheId = $this->organization?->id ?? ($invoice->organization_id ?? 'default');
+            $realmKey = $this->organization?->qb_realm_id ?? 'default';
+            $cacheKey = "qb_tax_codes_{$orgCacheId}_{$realmKey}";
+
+            $taxCodes = Cache::get($cacheKey);
+            if (empty($taxCodes)) {
+                $queried = $this->callReadWithRetry(
+                    fn() => $dataService->Query("SELECT * FROM TaxCode WHERE Active = true"),
+                    'Query(TaxCode)'
+                );
+                if (!empty($queried) && is_array($queried)) {
+                    $taxCodes = $queried;
+                    Cache::put($cacheKey, $taxCodes, 3600);
                 }
             }
-
-            // Search primary name e.g. "GST", "HST", "PST"
-            if ($primaryTaxName) {
-                $escapedName = str_replace("'", "''", $primaryTaxName);
-                $taxCodes = $dataService->Query("SELECT * FROM TaxCode WHERE Name = '{$escapedName}' AND Active = true");
-                if (!empty($taxCodes)) {
-                    return $taxCodes[0]->Id;
+            if (!empty($taxCodes) && is_array($taxCodes)) {
+                if (count($taxNames) > 1) {
+                    foreach ($taxCodes as $tc) {
+                        $allMatch = true;
+                        foreach ($taxNames as $tName) {
+                            if (stripos($tc->Name, $tName) === false) {
+                                $allMatch = false;
+                                break;
+                            }
+                        }
+                        if ($allMatch) {
+                            return (string)$tc->Id;
+                        }
+                    }
                 }
 
-                $taxRate = $invoice->tax_details[$primaryTaxName]['rate'] ?? null;
-                if ($taxRate) {
-                    $query = "SELECT * FROM TaxCode WHERE Name LIKE '%{$taxRate}%' AND Active = true";
-                    $taxCodes = $dataService->Query($query);
-                    if (!empty($taxCodes)) {
-                        return $taxCodes[0]->Id;
+                if ($primaryTaxName) {
+                    foreach ($taxCodes as $tc) {
+                        if (stripos($tc->Name, $primaryTaxName) !== false) {
+                            return (string)$tc->Id;
+                        }
+                    }
+                }
+
+                foreach ($taxCodes as $tc) {
+                    if (strcasecmp($tc->Name, 'TAX') === 0) {
+                        return (string)$tc->Id;
                     }
                 }
             }
@@ -1145,32 +1625,41 @@ class QuickBooksService
             // Dynamically get or create a valid service item for refunds so ItemRef is never null
             $refundItemId = $this->getOrCreateServiceItem($dataService, null, 'Refund / Adjustment');
 
-            // Resolve tax code if the refunded invoice had tax
-            $taxCodeId = $this->resolveTaxCodeId($dataService, $invoice);
+            $caps = $this->getCompanyCapabilities($dataService, $org);
+            $isUSCompany = $caps['is_us'];
+            $usingSalesTax = $caps['using_sales_tax'];
 
-            $salesItemDetail = [
-                'ItemRef' => ['value' => (string)$refundItemId],
-            ];
-            if ($taxCodeId) {
-                $salesItemDetail['TaxCodeRef'] = ['value' => (string)$taxCodeId];
+            // Resolve tax code if the refunded invoice had tax
+            $taxCodeId = $this->resolveTaxCodeId($dataService, $invoice, $isUSCompany);
+
+            // Build CreditMemo directly with IPP objects to avoid FacadeHelper ReferenceType issues
+            $creditMemoObj = new \QuickBooksOnline\API\Data\IPPCreditMemo();
+            $creditMemoObj->CustomerRef = new IPPReferenceType(['value' => (string)$customerId]);
+            $creditMemoObj->TotalAmt = round($amount, 2);
+            $creditMemoObj->PrivateNote = "Refund for Invoice #{$invoice->invoice_number}. Property: " . ($invoice->order->property->address ?? 'N/A');
+
+            $cmLine = new IPPLine();
+            $cmLine->DetailType = 'SalesItemLineDetail';
+            $cmSalesDetail = new IPPSalesItemLineDetail();
+            $cmSalesDetail->ItemRef = new IPPReferenceType(['value' => (string)$refundItemId]);
+
+            if ($isUSCompany) {
+                // US QB: use NON so AST doesn't alter the exact refund amount; no TxnTaxDetail
+                $cmSalesDetail->TaxCodeRef = new IPPReferenceType(['value' => 'NON']);
+                $cmLine->Amount = round($amount, 2);
+            } else {
+                // Canadian QB: attach TxnTaxDetail with actual tax code
+                if ($taxCodeId) {
+                    $txnTax = new \QuickBooksOnline\API\Data\IPPTxnTaxDetail();
+                    $txnTax->TxnTaxCodeRef = new IPPReferenceType(['value' => (string)$taxCodeId]);
+                    $creditMemoObj->TxnTaxDetail = $txnTax;
+                    $cmSalesDetail->TaxCodeRef = new IPPReferenceType(['value' => (string)$taxCodeId]);
+                }
+                $cmLine->Amount = round($amount, 2);
             }
 
-            // Create CreditMemo
-            $creditMemoObj = CreditMemo::create([
-                'CustomerRef' => ['value' => (string)$customerId],
-                'TotalAmt' => round($amount, 2),
-                'PrivateNote' => "Refund for Invoice #{$invoice->invoice_number}. Property: " . ($invoice->order->property->address ?? 'N/A'),
-                'TxnTaxDetail' => $taxCodeId ? [
-                    'TxnTaxCodeRef' => ['value' => (string)$taxCodeId]
-                ] : null,
-                'Line' => [
-                    [
-                        'Amount' => round($amount, 2),
-                        'DetailType' => 'SalesItemLineDetail',
-                        'SalesItemLineDetail' => $salesItemDetail,
-                    ]
-                ]
-            ]);
+            $cmLine->SalesItemLineDetail = $cmSalesDetail;
+            $creditMemoObj->Line = [$cmLine];
 
             $qbCreditMemo = $dataService->Add($creditMemoObj);
 
@@ -1741,29 +2230,49 @@ class QuickBooksService
     protected function getOrCreateServiceItem($dataService, ?Service $service = null, string $fallbackName = 'Service'): string
     {
         $itemName = $service ? $service->name : $fallbackName;
+        $realmKey = $this->organization?->qb_realm_id ?? 'default';
+        $namedCacheKey = !$service ? "qb_named_item_{$realmKey}_" . md5(strtolower($itemName)) : null;
+
+        if ($namedCacheKey && ($cachedId = Cache::get($namedCacheKey))) {
+            return (string)$cachedId;
+        }
 
         // 1️⃣ Check if service already has QB item ID
         if ($service && $service->quickbooks_item_id) {
+            $itemVerifyKey = "qb_item_verified_{$realmKey}_{$service->id}_{$service->quickbooks_item_id}";
+
+            if (Cache::get($itemVerifyKey)) {
+                return $service->quickbooks_item_id;
+            }
+
             Log::info('Checking if cached QB item ID is valid', [
                 'service_id' => $service->id,
                 'qb_item_id' => $service->quickbooks_item_id,
             ]);
             try {
-                $qbItem = $dataService->FindById('Item', $service->quickbooks_item_id);
+                $qbItem = $this->callReadWithRetry(fn() => $dataService->FindById('Item', $service->quickbooks_item_id), "FindById(Item, {$service->quickbooks_item_id})");
                 if ($qbItem) {
+                    Cache::put($itemVerifyKey, true, 86400);
                     return $service->quickbooks_item_id;
                 }
+                $service->update(['quickbooks_item_id' => null]);
             } catch (\Exception $e) {
-                Log::warning('Cached QB item ID is invalid or not found in current QB instance. Clearing cache. Error: ' . $e->getMessage());
+                $errMsg = $e->getMessage();
+                $isTimeout = stripos($errMsg, 'cURL error') !== false || stripos($errMsg, 'timed out') !== false;
+                if ($isTimeout) {
+                    Log::warning('QB item verification timed out; keeping cached item ID ' . $service->quickbooks_item_id);
+                    return $service->quickbooks_item_id;
+                }
+                Log::warning('Cached QB item ID is invalid or not found in current QB instance. Clearing cache. Error: ' . $errMsg);
+                $service->update(['quickbooks_item_id' => null]);
             }
-            $service->update(['quickbooks_item_id' => null]);
         }
 
         // 2️⃣ Search QB for existing item by name (handles existing client QB setup)
         try {
             $escapedName = str_replace("'", "''", $itemName);
             $query = "SELECT * FROM Item WHERE Name = '{$escapedName}' AND Type = 'Service' MAXRESULTS 1";
-            $items = $dataService->Query($query);
+            $items = $this->callReadWithRetry(fn() => $dataService->Query($query), "Query(Item {$itemName})");
 
             if (!empty($items) && is_array($items)) {
                 $qbItem = $items[0];
@@ -1776,6 +2285,8 @@ class QuickBooksService
 
                 if ($service) {
                     $service->update(['quickbooks_item_id' => $qbItem->Id]);
+                } elseif ($namedCacheKey) {
+                    Cache::put($namedCacheKey, (string)$qbItem->Id, 86400);
                 }
 
                 return $qbItem->Id;
@@ -1808,10 +2319,12 @@ class QuickBooksService
             // Handle duplicate name collision if it exists in QB
             if ($errorBody && (strpos($errorBody, 'Duplicate Name Exists Error') !== false || strpos($errorBody, '6240') !== false)) {
                 $escapedName = str_replace("'", "''", $itemName);
-                $existing = $dataService->Query("SELECT * FROM Item WHERE Name = '{$escapedName}' MAXRESULTS 1");
+                $existing = $this->callReadWithRetry(fn() => $dataService->Query("SELECT * FROM Item WHERE Name = '{$escapedName}' MAXRESULTS 1"), "Query(Item duplicate {$itemName})");
                 if (!empty($existing) && is_array($existing)) {
                     if ($service) {
                         $service->update(['quickbooks_item_id' => $existing[0]->Id]);
+                    } elseif ($namedCacheKey) {
+                        Cache::put($namedCacheKey, (string)$existing[0]->Id, 86400);
                     }
                     return $existing[0]->Id;
                 }
@@ -1822,6 +2335,8 @@ class QuickBooksService
 
         if ($service) {
             $service->update(['quickbooks_item_id' => $createdItem->Id]);
+        } elseif ($namedCacheKey) {
+            Cache::put($namedCacheKey, (string)$createdItem->Id, 86400);
         }
 
         Log::info('QB item created/resolved', [
@@ -1836,7 +2351,7 @@ class QuickBooksService
     /**
      * Create invoice line item with accurate quantity, price, and tax code
      */
-    protected function createInvoiceLine($itemId, $quantity, $totalAmount, $description = '', ?string $taxCodeId = null)
+    protected function createInvoiceLine($itemId, $quantity, $totalAmount, $description = '', ?string $taxCodeId = null, bool $isUSCompany = false)
     {
         $qty = max(1, (int)$quantity);
         $total = (float)$totalAmount;
@@ -1852,7 +2367,9 @@ class QuickBooksService
         $salesItemLineDetail->UnitPrice = $unitPrice;
 
         if ($taxCodeId) {
-            $salesItemLineDetail->TaxCodeRef = new IPPReferenceType(['value' => $taxCodeId]);
+            // For US QBO companies, line TaxCode must be 'TAX' (or 'NON'). For Canadian GTM, line uses the actual TaxCode ID.
+            $lineTaxCode = ($isUSCompany && (is_numeric($taxCodeId) || strlen($taxCodeId) > 3)) ? 'TAX' : $taxCodeId;
+            $salesItemLineDetail->TaxCodeRef = new IPPReferenceType(['value' => $lineTaxCode]);
         }
 
         $line->SalesItemLineDetail = $salesItemLineDetail;
@@ -1874,7 +2391,7 @@ class QuickBooksService
         // DiscountLine amount must be positive in QuickBooks Online
         $line->Amount = round(abs($amount), 2);
 
-        $discountDetail = new IPPDiscountLineDetail();
+        $discountDetail = new \QuickBooksOnline\API\Data\IPPDiscountLineDetail();
         // Must be string 'false' so XSD2PHP Php2Xml serializer renders <PercentBased>false</PercentBased>
         $discountDetail->PercentBased = 'false';
 
@@ -1990,12 +2507,12 @@ class QuickBooksService
         $qbPayment = $dataService->Add($paymentObj);
 
         if (!$qbPayment || $qbPayment instanceof \Exception) {
-            $error = $dataService->getLastError();
+            $errMsg = $this->extractQBErrorMessage($dataService, $qbPayment);
             Log::error('QB payment creation failed', [
                 'invoice_id' => $qbInvoiceId,
-                'error' => ($qbPayment instanceof \Exception) ? $qbPayment->getMessage() : ($error ? $error->getResponseBody() : null),
+                'error' => $errMsg,
             ]);
-            return null;
+            throw new \Exception("QB payment creation failed for invoice #{$qbInvoiceId}: {$errMsg}");
         }
 
         return $qbPayment;
@@ -2018,13 +2535,25 @@ class QuickBooksService
             ->where('amount', '>', 0)
             ->whereNull('quickbooks_payment_id')
             ->orderBy('id', 'asc')
-            ->get();
+            ->get()
+            ->values();
 
         $syncedPaymentIds = [];
+        $paymentCount = $unsyncedPayments->count();
 
-        foreach ($unsyncedPayments as $payment) {
+        foreach ($unsyncedPayments as $idx => $payment) {
             $payAmount = (float)$payment->amount;
             if ($payAmount <= 0) continue;
+
+            // Absorb <= $0.02 split-invoice tax rounding delta on the final payment of a paid invoice
+            if ($mainInvoice->status === 'paid' && $idx === ($paymentCount - 1) && is_object($qbInvoice)) {
+                $qbBalance = (float)($qbInvoice->Balance ?? 0);
+                $delta = round($qbBalance - $payAmount, 2);
+                if ($qbBalance > 0 && abs($delta) > 0 && abs($delta) <= 0.02) {
+                    Log::info("QB payment: adjusting final payment #{$payment->id} by {$delta} to match QB balance \${$qbBalance}");
+                    $payAmount = round($qbBalance, 2);
+                }
+            }
 
             $note = "Payment #{$payment->id} for Order #{$mainInvoice->order_id}";
             $qbPayment = $this->createPaymentForInvoice($dataService, $qbInvoice ?: $qbInvoiceId, $payAmount, $note);
@@ -2041,9 +2570,10 @@ class QuickBooksService
             }
         }
 
-        // Also update any payments already linked that missed invoice_id reference
+        // Also update any already-synced payments that missed quickbooks_invoice_id reference
         AgentPayment::where('order_id', $mainInvoice->order_id)
             ->where('status', 'succeeded')
+            ->whereNotNull('quickbooks_payment_id')
             ->whereNull('quickbooks_invoice_id')
             ->update([
                 'quickbooks_invoice_id' => $qbInvoiceId,
@@ -2054,35 +2584,88 @@ class QuickBooksService
     }
 
     /**
+     * Discover and cache an active QuickBooks account ID per organization + realm (without caching fallback errors).
+     */
+    protected function discoverAccountId(
+        $dataService,
+        string $cachePrefix,
+        string $accountTypeFilter,
+        array $preferredNames,
+        ?string $configuredId = null,
+        bool $verifyConfigured = false,
+        string $fallbackId = '1',
+        ?callable $onEmpty = null
+    ): string {
+        $orgId = $this->organization?->id ?? 'default';
+        $realmKey = $this->organization?->qb_realm_id ?? 'default';
+        $cacheKey = "{$cachePrefix}_{$orgId}_{$realmKey}";
+
+        $cached = Cache::get($cacheKey);
+        if (!empty($cached)) {
+            return (string)$cached;
+        }
+
+        try {
+            if ($verifyConfigured && $configuredId) {
+                try {
+                    $acc = $this->callReadWithRetry(fn() => $dataService->FindById('Account', $configuredId), "FindById(Account, {$configuredId})");
+                    if ($acc && ($acc->Active === true || $acc->Active === 'true')) {
+                        Cache::put($cacheKey, (string)$configuredId, 3600);
+                        return (string)$configuredId;
+                    }
+                } catch (\Exception $e) {
+                    Log::warning("Configured QB account {$configuredId} invalid: " . $e->getMessage());
+                }
+            }
+
+            $accounts = $this->callReadWithRetry(
+                fn() => $dataService->Query("SELECT * FROM Account WHERE {$accountTypeFilter} AND Active = true"),
+                "Query(Account {$cachePrefix})"
+            );
+
+            if (!empty($accounts) && is_array($accounts)) {
+                foreach ($preferredNames as $preferred) {
+                    foreach ($accounts as $account) {
+                        $name = strtolower(trim($account->Name ?? ''));
+                        if ($name === $preferred || str_contains($name, $preferred)) {
+                            Cache::put($cacheKey, (string)$account->Id, 3600);
+                            return (string)$account->Id;
+                        }
+                    }
+                }
+
+                Cache::put($cacheKey, (string)$accounts[0]->Id, 3600);
+                return (string)$accounts[0]->Id;
+            }
+
+            if ($onEmpty) {
+                $createdId = $onEmpty($dataService);
+                if ($createdId) {
+                    Cache::put($cacheKey, (string)$createdId, 3600);
+                    return (string)$createdId;
+                }
+            }
+        } catch (\Exception $e) {
+            Log::warning("Could not discover QB account ({$cachePrefix}): " . $e->getMessage());
+        }
+
+        return (string)($configuredId ?: $fallbackId);
+    }
+
+    /**
      * Get income account ID from QuickBooks with intelligent discovery
      */
     protected function getIncomeAccountId($dataService)
     {
-        $orgId = $this->organization?->id ?? 'default';
-        $cacheKey = 'qb_income_account_id_' . $orgId;
-        
-        return Cache::remember($cacheKey, 3600, function () use ($dataService) {
-            try {
-                $accounts = $dataService->Query("SELECT * FROM Account WHERE AccountType = 'Income' AND Active = true");
-                
-                if (!empty($accounts) && is_array($accounts)) {
-                    // Check for standard service income account names
-                    foreach ($accounts as $account) {
-                        $name = strtolower($account->Name ?? '');
-                        if (in_array($name, ['services', 'sales', 'service/fee income', 'sales of product income', 'fee income', 'operating revenue'])) {
-                            return $account->Id;
-                        }
-                    }
-                    // Otherwise use the first active income account found
-                    return $accounts[0]->Id;
-                }
-                
-                return config('quickbooks.accounts.income_id', config('quickbooks.default_income_account_id', '1'));
-            } catch (\Exception $e) {
-                Log::warning('Could not fetch income account: ' . $e->getMessage());
-                return config('quickbooks.accounts.income_id', config('quickbooks.default_income_account_id', '1'));
-            }
-        });
+        return $this->discoverAccountId(
+            $dataService,
+            'qb_income_account_id',
+            "AccountType = 'Income'",
+            ['services', 'sales', 'service/fee income', 'sales of product income', 'fee income', 'operating revenue'],
+            config('quickbooks.accounts.income_id', config('quickbooks.default_income_account_id', '1')),
+            false,
+            '1'
+        );
     }
 
     /**
@@ -2090,59 +2673,25 @@ class QuickBooksService
      */
     protected function getExpenseAccountId($dataService): string
     {
-        $orgId = $this->organization?->id ?? 'default';
-        $cacheKey = 'qb_expense_account_id_' . $orgId;
-
-        return Cache::remember($cacheKey, 3600, function () use ($dataService) {
-            try {
-                // Priority 1: Config override, verified via FindById
-                $configuredId = config('quickbooks.accounts.expense_id');
-                if ($configuredId) {
-                    try {
-                        $acc = $dataService->FindById('Account', $configuredId);
-                        if ($acc && ($acc->Active === true || $acc->Active === 'true')) {
-                            return (string) $configuredId;
-                        }
-                    } catch (\Exception $e) {
-                        Log::warning("Configured QB expense account {$configuredId} invalid: " . $e->getMessage());
-                    }
-                }
-
-                // Priority 2: Query active Cost of Goods Sold & Expense accounts
-                $accounts = $dataService->Query("SELECT * FROM Account WHERE AccountType IN ('Cost of Goods Sold', 'Expense') AND Active = true");
-
-                if (!empty($accounts) && is_array($accounts)) {
-                    $preferredNames = [
-                        'subcontracted services',
-                        'contractors',
-                        'subcontractors',
-                        'cost of labor - cos',
-                        'cost of labor',
-                        'job expenses',
-                        'contract labor',
-                        'cost of goods sold',
-                        'subcontractor expense',
-                    ];
-
-                    foreach ($preferredNames as $preferred) {
-                        foreach ($accounts as $account) {
-                            $name = strtolower(trim($account->Name ?? ''));
-                            if ($name === $preferred || str_contains($name, $preferred)) {
-                                return (string) $account->Id;
-                            }
-                        }
-                    }
-
-                    // Priority 3: First active COGS or Expense account
-                    return (string) $accounts[0]->Id;
-                }
-
-                return (string) ($configuredId ?: '1');
-            } catch (\Exception $e) {
-                Log::warning('Could not discover QB expense account: ' . $e->getMessage());
-                return (string) (config('quickbooks.accounts.expense_id', '1'));
-            }
-        });
+        return $this->discoverAccountId(
+            $dataService,
+            'qb_expense_account_id',
+            "AccountType IN ('Cost of Goods Sold', 'Expense')",
+            [
+                'subcontracted services',
+                'contractors',
+                'subcontractors',
+                'cost of labor - cos',
+                'cost of labor',
+                'job expenses',
+                'contract labor',
+                'cost of goods sold',
+                'subcontractor expense',
+            ],
+            config('quickbooks.accounts.expense_id'),
+            true,
+            '1'
+        );
     }
 
     /**
@@ -2150,74 +2699,32 @@ class QuickBooksService
      */
     protected function getBankAccountId($dataService): string
     {
-        $orgId = $this->organization?->id ?? 'default';
-        $cacheKey = 'qb_bank_account_id_' . $orgId;
-
-        return Cache::remember($cacheKey, 3600, function () use ($dataService) {
-            try {
-                // Priority 1: Config override, verified via FindById
-                $configuredId = config('quickbooks.accounts.bank_id');
-                if ($configuredId) {
-                    try {
-                        $acc = $dataService->FindById('Account', $configuredId);
-                        if ($acc && ($acc->Active === true || $acc->Active === 'true')) {
-                            return (string) $configuredId;
-                        }
-                    } catch (\Exception $e) {
-                        Log::warning("Configured QB bank account {$configuredId} invalid: " . $e->getMessage());
-                    }
-                }
-
-                // Priority 2: Query active Bank accounts
-                $accounts = $dataService->Query("SELECT * FROM Account WHERE AccountType = 'Bank' AND Active = true");
-
-                if (!empty($accounts) && is_array($accounts)) {
-                    $preferredNames = [
-                        'stripe clearing',
-                        'stripe',
-                        'checking',
-                        'chequing',
-                        'operating',
-                        'operating account',
-                        'business checking',
-                        'main checking',
-                    ];
-
-                    foreach ($preferredNames as $preferred) {
-                        foreach ($accounts as $account) {
-                            $name = strtolower(trim($account->Name ?? ''));
-                            if ($name === $preferred || str_contains($name, $preferred)) {
-                                return (string) $account->Id;
-                            }
-                        }
-                    }
-
-                    // Priority 3: First active Bank account
-                    return (string) $accounts[0]->Id;
-                }
-
-                // Priority 3: If no bank account exists at all in QB, auto-create a standard Checking account
+        return $this->discoverAccountId(
+            $dataService,
+            'qb_bank_account_id',
+            "AccountType = 'Bank'",
+            ['stripe clearing', 'stripe', 'checking', 'chequing', 'operating', 'operating account', 'business checking', 'main checking'],
+            config('quickbooks.accounts.bank_id'),
+            true,
+            '1',
+            function ($ds) {
                 try {
                     $newBank = Account::create([
                         'Name' => 'Checking (Operating)',
                         'AccountType' => 'Bank',
                         'AccountSubType' => 'Checking',
                     ]);
-                    $createdBank = $dataService->Add($newBank);
+                    $createdBank = $ds->Add($newBank);
                     if ($createdBank && !($createdBank instanceof \Exception) && !empty($createdBank->Id)) {
                         Log::info("Auto-created QB Bank Account 'Checking (Operating)' with ID: {$createdBank->Id}");
-                        return (string) $createdBank->Id;
+                        return (string)$createdBank->Id;
                     }
                 } catch (\Exception $createEx) {
                     Log::warning('Could not auto-create QB bank account: ' . $createEx->getMessage());
                 }
-
-                return (string) ($configuredId ?: '1');
-            } catch (\Exception $e) {
-                Log::warning('Could not discover QB bank account: ' . $e->getMessage());
-                return (string) (config('quickbooks.accounts.bank_id', '1'));
+                return null;
             }
-        });
+        );
     }
 
     /**
@@ -2231,7 +2738,19 @@ class QuickBooksService
         $user = Auth::user();
         $orgId = $user ? ($user->organization_id ?? $user->organization?->id) : null;
 
-        $query = \App\Models\Invoice::whereNull('quickbooks_invoice_id')
+        $unsyncedPaymentOrderIds = AgentPayment::where('status', 'succeeded')
+            ->where('amount', '>', 0)
+            ->whereNull('quickbooks_payment_id')
+            ->whereNotNull('order_id')
+            ->distinct()
+            ->pluck('order_id');
+
+        $query = \App\Models\Invoice::where(function ($q) use ($unsyncedPaymentOrderIds) {
+                $q->whereNull('quickbooks_invoice_id');
+                if ($unsyncedPaymentOrderIds->isNotEmpty()) {
+                    $q->orWhereIn('order_id', $unsyncedPaymentOrderIds);
+                }
+            })
             ->whereIn('status', ['paid', 'partially_paid'])
             ->where('total', '>', 0)
             ->where(function ($q) {

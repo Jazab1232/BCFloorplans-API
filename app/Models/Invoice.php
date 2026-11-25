@@ -1212,6 +1212,7 @@ class Invoice extends Model
              }
 
              $allPaid = true;
+             $allActivePaid = true;
              $allRefunded = true;
              $hasRefunded = false;
              $hasItems = false;
@@ -1261,6 +1262,9 @@ class Invoice extends Model
                      $hasRefunded = true;
                  } else {
                      $allRefunded = false;
+                     if (!$servicePaidForInvoiceOwner) {
+                         $allActivePaid = false;
+                     }
                  }
 
                  if ($servicePaidForInvoiceOwner) {
@@ -1391,7 +1395,7 @@ class Invoice extends Model
                  $newNetPaid = round($newPaidAmount - (float)$invoice->refunded_amount, 2);
              }
  
-             $isFullyPaid = ($newNetPaid >= (float)$invoice->total) || $allPaid;
+             $isFullyPaid = ($newNetPaid >= (float)$invoice->total) || $allPaid || ($hasRefunded && $allActivePaid);
 
              $updateData = [
                  'paid_amount' => $newPaidAmount,
@@ -1400,11 +1404,13 @@ class Invoice extends Model
              if ($isFullyPaid && !in_array($invoice->status, ['paid', 'partially_refunded'])) {
                  $updateData['status'] = ($hasRefunded || (float)$invoice->refunded_amount > 0) ? 'partially_refunded' : 'paid';
                  $updateData['paid_at'] = $invoice->paid_at ?? now();
-                 $updateData['paid_amount'] = (float)$invoice->refunded_amount > 0 
-                     ? round((float)$invoice->total + (float)$invoice->refunded_amount, 2) 
-                     : $invoice->total; // Ensure it's exactly total (plus refunded_amount if applicable)
+                 if ($allPaid || $newNetPaid >= (float)$invoice->total) {
+                     $updateData['paid_amount'] = (float)$invoice->refunded_amount > 0 
+                         ? round((float)$invoice->total + (float)$invoice->refunded_amount, 2) 
+                         : $invoice->total; // Ensure it's exactly total (plus refunded_amount if applicable)
+                 }
              } elseif (!$isFullyPaid && $newNetPaid > 0) {
-                if ($hasRefunded || (float)$invoice->refunded_amount > 0) {
+                if ((float)$invoice->refunded_amount > 0) {
                     $updateData['status'] = 'partially_refunded';
                 } else {
                     $updateData['status'] = 'partially_paid';
@@ -1412,7 +1418,7 @@ class Invoice extends Model
              } elseif ($newNetPaid <= 0) {
                  if ($allRefunded || ((float)$invoice->total > 0 && (float)$invoice->refunded_amount >= (float)$invoice->total)) {
                      $updateData['status'] = 'refunded';
-                 } elseif ($hasRefunded || (float)$invoice->refunded_amount > 0) {
+                 } elseif ((float)$invoice->refunded_amount > 0) {
                      $updateData['status'] = 'partially_refunded';
                  } else {
                      $updateData['status'] = 'issued';

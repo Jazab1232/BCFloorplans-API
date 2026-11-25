@@ -53,7 +53,27 @@ class AgentPaymentController extends Controller
                 $invPaid = (float)$invoiceRecord->paid_amount;
                 $invRefunded = (float)($invoiceRecord->refunded_amount ?? 0);
                 $netPaid = max(0, $invPaid - $invRefunded);
-                $remainingBalance = max(0, round($invTotal - $netPaid, 2));
+
+                // Deduct any sibling service invoices that were refunded so refunded services are not re-charged
+                $refundedServiceIds = $invoiceRecord->items()
+                    ->whereHas('orderService', fn($q) => $q->where('payment_status', 'REFUNDED'))
+                    ->pluck('order_service_id')
+                    ->filter()
+                    ->unique()
+                    ->toArray();
+
+                $refundedSiblingAmount = 0.0;
+                if (!empty($refundedServiceIds) && $invRefunded <= 0) {
+                    $refundedSiblingAmount = (float) \App\Models\Invoice::withoutGlobalScopes()
+                        ->where('order_id', $invoiceRecord->order_id)
+                        ->where('id', '!=', $invoiceRecord->id)
+                        ->where('status', 'refunded')
+                        ->whereHas('items', fn($q) => $q->whereIn('order_service_id', $refundedServiceIds))
+                        ->sum('refunded_amount');
+                }
+
+                $effectiveInvTotal = max(0, round($invTotal - $refundedSiblingAmount, 2));
+                $remainingBalance = max(0, round($effectiveInvTotal - $netPaid, 2));
 
                 if (in_array(strtolower($invoiceRecord->status), ['paid', 'refunded', 'partially_refunded', 'partial_refunded']) || ($invTotal > 0 && $remainingBalance <= 0)) {
                     return response()->json([
@@ -531,7 +551,11 @@ class AgentPaymentController extends Controller
 
             // AFTER successful commit, dispatch QuickBooks job for paid payments
             if ($session->payment_status == 'paid' && $payment->quickbooks_invoice_id == null && $payment->order_id) {
-                $this->dispatchQuickBooksJob($payment);
+                try {
+                    $this->dispatchQuickBooksJob($payment);
+                } catch (\Throwable $qbEx) {
+                    Log::error('QuickBooks sync dispatch failed for payment ' . $payment->id . ': ' . $qbEx->getMessage());
+                }
             }
             else{
                 Log::info('QuickBooks job not dispatched. Either payment not paid or already synced.', [

@@ -200,17 +200,17 @@ class QbSyncLogController extends Controller
                     $result = $qbService->syncRefundToQB($invoice, (float) $amount);
                     $finalizeLog($result);
                 } else {
-                    // Invoice already in QB — mark success directly without re-syncing
-                    if ($invoice->quickbooks_invoice_id) {
-                        $log->update([
-                            'status'        => 'success',
-                            'qb_entity_id'  => $invoice->quickbooks_invoice_id,
-                            'error_message' => null,
-                            'attempts'      => $log->attempts + 1,
-                        ]);
-                    } else {
+                    try {
+                        // Always run syncInvoiceToQB even if quickbooks_invoice_id already exists,
+                        // so unsynced payments (e.g. manual/e-transfer payments) and invoice updates retry too.
                         $result = $qbService->syncInvoiceToQB($invoice);
                         $finalizeLog($result);
+                    } catch (\Throwable $syncEx) {
+                        $log->update([
+                            'status'        => 'failed',
+                            'error_message' => $syncEx->getMessage(),
+                            'attempts'      => $log->attempts + 1,
+                        ]);
                     }
                 }
 
@@ -277,7 +277,14 @@ class QbSyncLogController extends Controller
                 'status'  => $log->status,
             ]);
 
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
+            if (isset($log) && $log->exists && $log->status === 'pending') {
+                $log->update([
+                    'status'        => 'failed',
+                    'error_message' => $e->getMessage(),
+                    'attempts'      => $log->attempts + 1,
+                ]);
+            }
             return response()->json([
                 'success' => false,
                 'message' => 'Failed to retry sync log.',
