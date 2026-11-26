@@ -91,16 +91,29 @@ class Invoice extends Model
                 $org = $invoice->organization ?? Organization::find($invoice->organization_id);
                 $prefix = $org ? strtoupper($org->slug) : 'BCF';
 
-                // Get the last invoice of the current year for THIS organization
-                $lastInvoice = static::where('organization_id', $invoice->organization_id)
+                // Get recent invoices of the current year for THIS organization to find highest base number
+                $recentInvoiceNumbers = static::where('organization_id', $invoice->organization_id)
                     ->whereYear('created_at', $year)
                     ->orderBy('id', 'desc')
-                    ->first();
+                    ->limit(100)
+                    ->pluck('invoice_number');
                 
-                $nextNum = 1;
-                if ($lastInvoice && preg_match('/-(\d+)$/', $lastInvoice->invoice_number, $matches)) {
-                    $nextNum = intval($matches[1]) + 1;
+                $maxNum = 0;
+                foreach ($recentInvoiceNumbers as $numStr) {
+                    if (preg_match('/-(?:19|20)\d{2}-(\d+)(?:-\d+)?$/', $numStr, $matches)) {
+                        $num = intval($matches[1]);
+                        if ($num > $maxNum) {
+                            $maxNum = $num;
+                        }
+                    } elseif (preg_match('/-(\d+)$/', $numStr, $matches)) {
+                        $num = intval($matches[1]);
+                        if ($num > $maxNum) {
+                            $maxNum = $num;
+                        }
+                    }
                 }
+                
+                $nextNum = $maxNum > 0 ? ($maxNum + 1) : 1;
                 
                 $invoice->invoice_number = sprintf('INV-%s-%s-%05d', $prefix, $year, $nextNum);
             }
@@ -143,10 +156,11 @@ class Invoice extends Model
         $resolvedSplits = static::resolveSplits($order);
 
         // 3. Create Consolidated Invoice(s)
+        $mainInvoices = [];
         if (!empty($resolvedSplits)) {
             $splitGroupId = (string) \Illuminate\Support\Str::uuid();
             foreach ($resolvedSplits as $split) {
-                static::createInvoice(
+                $mainInvoices[] = static::createInvoice(
                     $order, 
                     $agent, 
                     $order->services, 
@@ -159,14 +173,22 @@ class Invoice extends Model
                 );
             }
         } else {
-            static::createInvoice($order, $agent, $order->services, $taxInfo, 1.0, 'Consolidated Invoice', null, 'primary');
+            $mainInvoices[] = static::createInvoice($order, $agent, $order->services, $taxInfo, 1.0, 'Consolidated Invoice', null, 'primary');
         }
 
-        // 4. Create Service-Specific Invoices
+        $primaryMainInvoice = $mainInvoices[0] ?? null;
+        $baseInvoiceNumber = $primaryMainInvoice?->invoice_number;
+
+        // 4. Create Service-Specific Invoices (numbered as {MainInvoiceNumber}-1, -2, etc.)
+        $svcIndex = 1;
         foreach ($order->services as $os) {
             if (!empty($resolvedSplits)) {
                 $serviceSplitGroupId = (string) \Illuminate\Support\Str::uuid();
-                foreach ($resolvedSplits as $split) {
+                foreach ($resolvedSplits as $sIdx => $split) {
+                    $splitMainInv = $mainInvoices[$sIdx] ?? $primaryMainInvoice;
+                    $splitBaseNum = $splitMainInv?->invoice_number ?? $baseInvoiceNumber;
+                    $serviceNum = $splitBaseNum ? "{$splitBaseNum}-{$svcIndex}" : null;
+
                     static::createInvoice(
                         $order, 
                         $agent, 
@@ -176,12 +198,26 @@ class Invoice extends Model
                         ($os->service->name ?? 'Service') . " Invoice ({$split['percentage']}%)",
                         ['group_id' => $serviceSplitGroupId, 'splits' => $resolvedSplits],
                         $split['type'] ?? 'co-agent',
-                        $split['agent_id']
+                        $split['agent_id'],
+                        $serviceNum
                     );
                 }
             } else {
-                static::createInvoice($order, $agent, collect([$os]), $taxInfo, 1.0, "Service Invoice: " . ($os->service->name ?? 'Service'), null, 'primary');
+                $serviceNum = $baseInvoiceNumber ? "{$baseInvoiceNumber}-{$svcIndex}" : null;
+                static::createInvoice(
+                    $order, 
+                    $agent, 
+                    collect([$os]), 
+                    $taxInfo, 
+                    1.0, 
+                    "Service Invoice: " . ($os->service->name ?? 'Service'), 
+                    null, 
+                    'primary', 
+                    null, 
+                    $serviceNum
+                );
             }
+            $svcIndex++;
         }
 
         // Add fixed-area and allowance-excess lines to consolidated invoices.
@@ -294,11 +330,43 @@ class Invoice extends Model
             }
         }
 
+        // Find the main invoice for this order to determine base invoice number
+        $mainInvoice = static::where('order_id', $order->id)
+            ->where('agent_type', 'primary')
+            ->where(function($q) {
+                $q->where('notes', 'like', '%Consolidated%')
+                  ->orWhere('notes', 'not like', '%Service Invoice:%');
+            })
+            ->orderBy('id', 'asc')
+            ->first() ?? $primaryInvoice;
+
+        $baseInvoiceNumber = $mainInvoice?->invoice_number;
+
+        // Determine next service index based on existing service invoices for this order
+        $existingServiceInvoices = static::where('order_id', $order->id)
+            ->where(function($q) {
+                $q->where('notes', 'like', 'Service Invoice:%')
+                  ->orWhere('notes', 'like', '%Invoice (%');
+            })
+            ->pluck('invoice_number');
+
+        $maxExistingSvcIndex = 0;
+        foreach ($existingServiceInvoices as $invNum) {
+            if ($invNum && preg_match('/-(\d+)$/', $invNum, $m)) {
+                $idx = intval($m[1]);
+                if ($idx > $maxExistingSvcIndex) {
+                    $maxExistingSvcIndex = $idx;
+                }
+            }
+        }
+        $svcIndex = $maxExistingSvcIndex > 0 ? ($maxExistingSvcIndex + 1) : ($existingServiceInvoices->count() + 1);
+
         // 2. ALWAYS Create Individual Service-Specific Invoices for the new services
         foreach ($orderServices as $os) {
             if (!empty($resolvedSplits)) {
                 $serviceSplitGroupId = (string) \Illuminate\Support\Str::uuid();
                 foreach ($resolvedSplits as $split) {
+                    $serviceNum = $baseInvoiceNumber ? "{$baseInvoiceNumber}-{$svcIndex}" : null;
                     static::createInvoice(
                         $order, 
                         $agent, 
@@ -308,12 +376,26 @@ class Invoice extends Model
                         ($os->service->name ?? 'Service') . " Invoice ({$split['percentage']}%)",
                         ['group_id' => $serviceSplitGroupId, 'splits' => $resolvedSplits],
                         $split['type'] ?? 'co-agent',
-                        $split['agent_id']
+                        $split['agent_id'],
+                        $serviceNum
                     );
                 }
             } else {
-                static::createInvoice($order, $agent, collect([$os]), $taxInfo, 1.0, "Service Invoice: " . ($os->service->name ?? 'Service'), null, 'primary');
+                $serviceNum = $baseInvoiceNumber ? "{$baseInvoiceNumber}-{$svcIndex}" : null;
+                static::createInvoice(
+                    $order, 
+                    $agent, 
+                    collect([$os]), 
+                    $taxInfo, 
+                    1.0, 
+                    "Service Invoice: " . ($os->service->name ?? 'Service'), 
+                    null, 
+                    'primary', 
+                    null, 
+                    $serviceNum
+                );
             }
+            $svcIndex++;
         }
 
         // Sync order and invoice statuses and area charges
@@ -733,7 +815,7 @@ class Invoice extends Model
         return 'code';
     }
 
-    public static function createInvoice($order, $agent, $services, $taxInfo, $multiplier, $note, $splitDetails = null, $agentType = 'primary', $targetAgentId = null)
+    public static function createInvoice($order, $agent, $services, $taxInfo, $multiplier, $note, $splitDetails = null, $agentType = 'primary', $targetAgentId = null, $customInvoiceNumber = null)
     {
         $province = 'BC';
         if (isset($order->property) && !empty($order->property->state)) {
@@ -967,7 +1049,7 @@ class Invoice extends Model
             ];
         }
 
-        $invoice = static::create([
+        $invoiceData = [
             'organization_id' => $order->organization_id,
             'order_id' => $order->id,
             'agent_id' => $targetAgentId ?? $agent->id,
@@ -983,7 +1065,13 @@ class Invoice extends Model
             'notes' => $note,
             'split_details' => $splitDetails,
             'agent_type' => $agentType,
-        ]);
+        ];
+
+        if (!empty($customInvoiceNumber)) {
+            $invoiceData['invoice_number'] = $customInvoiceNumber;
+        }
+
+        $invoice = static::create($invoiceData);
 
         foreach ($items as $item) {
             $invoice->items()->create($item);
