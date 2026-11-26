@@ -207,21 +207,21 @@ class OrderController extends Controller
         }
 
         if ($request->has('services') && is_array($request->services)) {
-            $sanitizedServices = $request->services;
-            foreach ($sanitizedServices as &$svc) {
+            $sanitizedServices = array_map(function ($svc) {
                 if (isset($svc['vendor_id']) && ($svc['vendor_id'] === '' || $svc['vendor_id'] === 'all' || $svc['vendor_id'] === 'none')) {
                     $svc['vendor_id'] = null;
                 }
-            }
+                return $svc;
+            }, $request->services);
             $request->merge(['services' => $sanitizedServices]);
         }
         if ($request->has('slots') && is_array($request->slots)) {
-            $sanitizedSlots = $request->slots;
-            foreach ($sanitizedSlots as &$slot) {
+            $sanitizedSlots = array_map(function ($slot) {
                 if (isset($slot['vendor_id']) && ($slot['vendor_id'] === '' || $slot['vendor_id'] === 'all' || $slot['vendor_id'] === 'none')) {
                     $slot['vendor_id'] = null;
                 }
-            }
+                return $slot;
+            }, $request->slots);
             $request->merge(['slots' => $sanitizedSlots]);
         }
 
@@ -274,6 +274,8 @@ class OrderController extends Controller
             'slots.*.est_time' => 'nullable|string',
             'slots.*.distance' => 'nullable|string',
             'slots.*.km_price' => 'nullable|string',
+            'slots.*.custom_duration' => 'nullable|integer|min:1',
+            'slots.*.buffer_minutes' => 'nullable|integer|min:0',
             'slots.*.date' => 'required_with:slots',
         ]);
 
@@ -285,12 +287,14 @@ class OrderController extends Controller
             ], 422);
         }
 
+        $isAdmin = auth()->user() instanceof \App\Models\User;
+
         // Validate slots against vendor Google Calendar appointments
         if ($request->filled('slots') && is_array($request->slots)) {
             $calendarService = class_exists(\App\Services\GoogleCalendarService::class) ? app(\App\Services\GoogleCalendarService::class) : null;
             if ($calendarService) {
                 foreach ($request->slots as $s) {
-                    $isOverride = !empty($s['schedule_override']);
+                    $isOverride = $isAdmin && !empty($s['schedule_override']);
                     if ($isOverride) {
                         continue;
                     }
@@ -311,7 +315,7 @@ class OrderController extends Controller
                     $province = $property?->province ?? $property?->state ?? 'AB';
                     $propertyTz = GoogleCalendarService::resolveTimezoneFromProvince(
                         $province,
-                        $slotVendor->workHours->first()?->timezone ?? 'America/Vancouver'
+                        $slotVendor->workHours?->timezone ?? 'America/Vancouver'
                     );
 
                     $slotStartDt = Carbon::createFromFormat('Y-m-d H:i:s', "{$slotDate} {$slotStart}", $propertyTz);
@@ -330,8 +334,15 @@ class OrderController extends Controller
                             );
                         });
 
+                        $internalVendorEventIds = OrderSlot::where('vendor_id', $slotVendor->id)
+                            ->whereDate('date', $slotDate)
+                            ->whereNotNull('google_event_id')
+                            ->pluck('google_event_id')
+                            ->all();
+
                         foreach ($events as $event) {
                             if (($event['status'] ?? '') === 'cancelled') continue;
+                            if (!empty($event['id']) && in_array($event['id'], $internalVendorEventIds, true)) continue;
                             $summary = (string)($event['summary'] ?? '');
                             if (preg_match('/^Order\s*#\d+/i', $summary)) continue;
 
@@ -590,6 +601,14 @@ class OrderController extends Controller
 
             // Validate Twilight slots constraint
             if (!empty($request->slots)) {
+                $slotValidationError = $this->validateSlotTimeAndAvailability($request->slots, null, $isAdmin, $property);
+                if ($slotValidationError) {
+                    if (DB::transactionLevel() > 0) {
+                        DB::rollBack();
+                    }
+                    return $slotValidationError;
+                }
+
                 $twilightError = $this->validateTwilightSlots($request->slots, $property);
                 if ($twilightError) {
                     if (DB::transactionLevel() > 0) {
@@ -630,10 +649,26 @@ class OrderController extends Controller
                     }
                 }
 
+                $defaultKmPrice = 0.50;
+                $orgUuidForRate = $order->organization_id ? \App\Models\Organization::find($order->organization_id)?->uuid : null;
+                if ($orgUuidForRate) {
+                    $orgRateSetting = \App\Models\Setting::where('org_id', $orgUuidForRate)->where('key', 'default_travel_rate')->first();
+                    if ($orgRateSetting && !is_null($orgRateSetting->value)) {
+                        $val = $orgRateSetting->value;
+                        $defaultKmPrice = is_array($val) ? (isset($val['rate']) ? (float)$val['rate'] : (isset($val[0]) ? (float)$val[0] : 0.50)) : (float)$val;
+                    } else {
+                        $globalRateSetting = \App\Models\Setting::whereNull('org_id')->where('key', 'default_travel_rate')->first();
+                        if ($globalRateSetting && !is_null($globalRateSetting->value)) {
+                            $val = $globalRateSetting->value;
+                            $defaultKmPrice = is_array($val) ? (isset($val['rate']) ? (float)$val['rate'] : (isset($val[0]) ? (float)$val[0] : 0.50)) : (float)$val;
+                        }
+                    }
+                }
+
                 // Create order slots
                 foreach ($request->slots as $slot) {
                     $slotService = Service::where('uuid', $slot['service_id'])->first();
-                    $slotVendor = Vendor::where('uuid', $slot['vendor_id'])->first();
+                    $slotVendor = Vendor::with('settings')->where('uuid', $slot['vendor_id'])->first();
 
                     if (!$slotService || !$slotVendor) {
                         continue;
@@ -650,19 +685,31 @@ class OrderController extends Controller
                         ]));
                     }
 
+                    $kmPrice = $slot['km_price'] ?? null;
+                    if (is_null($kmPrice) || $kmPrice === '') {
+                        $vendorSetting = $slotVendor->settings;
+                        if ($vendorSetting && !is_null($vendorSetting->payment_per_km)) {
+                            $kmPrice = (float)$vendorSetting->payment_per_km;
+                        } else {
+                            $kmPrice = $defaultKmPrice;
+                        }
+                    }
+
                     OrderSlot::create([
                         'order_id' => $order->id,
                         'service_id' => $slotService->id,
                         'vendor_id' => $slotVendor->id,
                         'show_all_vendors' => $slot['show_all_vendors'] ?? true,
-                        'schedule_override' => $slot['schedule_override'] ?? true,
+                        'schedule_override' => ($isAdmin && !empty($slot['schedule_override'])),
                         'recommend_time' => $slot['recommend_time'] ?? true,
                         'travel' => $slot['travel'] ?? null,
                         'start_time' => $slot['start_time'],
                         'end_time' => $slot['end_time'],
+                        'custom_duration' => isset($slot['custom_duration']) && is_numeric($slot['custom_duration']) ? (int)$slot['custom_duration'] : null,
+                        'buffer_minutes' => isset($slot['buffer_minutes']) && is_numeric($slot['buffer_minutes']) ? (int)$slot['buffer_minutes'] : 0,
                         'est_time' => $slot['est_time'] ?? null,
                         'distance' => $slot['distance'] ?? null,
-                        'km_price' => $slot['km_price'] ?? null,
+                        'km_price' => $kmPrice,
                         'date' => $slot['date'] ?? null,
                         'address' => $address,
                         'location' => $location,
@@ -738,7 +785,7 @@ class OrderController extends Controller
             'success' => true,
             'data' => $this->filterOrderNotes($order->load(['services', 'slots', 'totals'])),
             'message' => 'Order created successfully',
-        ]);
+        ], 201);
         } catch (\Throwable $e) {
             if (DB::transactionLevel() > 0) {
                 DB::rollBack();
@@ -950,11 +997,23 @@ class OrderController extends Controller
             ->first();
 
         if (!$order) {
+            DB::rollBack();
             return response()->json([
                 'success' => false,
                 'data' => null,
                 'message' => 'Order not found',
             ], 404);
+        }
+
+        $authUser = auth()->user();
+        if (($authUser instanceof \App\Models\Agent && $authUser->id !== $order->agent_id) ||
+            ($authUser instanceof \App\Models\SubAccount && $authUser->agent_id !== $order->agent_id)) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'data' => null,
+                'message' => 'Unauthorized to modify this order',
+            ], 403);
         }
 
         // Track all changes for notifications
@@ -1103,6 +1162,12 @@ class OrderController extends Controller
         $deletedSlotIds = [];
         if ($request->has('slots') && is_array($request->input('slots'))) {
             if (!empty($request->slots)) {
+                $isAdminUpdate = auth()->user() instanceof \App\Models\User;
+                $slotValidationError = $this->validateSlotTimeAndAvailability($request->slots, $order->id, $isAdminUpdate, $order->property);
+                if ($slotValidationError) {
+                    return $slotValidationError;
+                }
+
                 $twilightError = $this->validateTwilightSlots($request->slots, $order->property);
                 if ($twilightError) {
                     return $twilightError;
@@ -2628,14 +2693,50 @@ private function createOrderNotification($order, array $changes)
     public function destroy($uuid): JsonResponse
     {
         try {
-            $order = Order::where('uuid', $uuid)->first();
+            $user = auth()->user();
+            if (!$user || !($user instanceof \App\Models\User)) {
+                return response()->json([
+                    'success' => false,
+                    'data' => null,
+                    'message' => 'Unauthorized: Only administrators can delete orders.',
+                ], 403);
+            }
+
+            $order = Order::with(['slots.vendor', 'agent'])->where('uuid', $uuid)->first();
 
             if (!$order) {
                 return response()->json([
                     'success' => false,
                     'data' => null,
                     'message' => 'Order not found',
-                ]);
+                ], 404);
+            }
+
+            if (class_exists(\App\Services\GoogleCalendarService::class)) {
+                $calendarService = app(\App\Services\GoogleCalendarService::class);
+                foreach ($order->slots as $slot) {
+                    if ($slot->google_event_id && $slot->vendor && $slot->vendor->google_access_token) {
+                        try {
+                            $calendarService->deleteEvent($slot->vendor, $slot->google_event_id);
+                        } catch (\Throwable $e) {
+                            Log::warning('Failed to delete vendor Google Calendar event on order destroy: ' . $e->getMessage());
+                        }
+                    }
+                    if ($slot->agent_google_event_id && $order->agent && $order->agent->google_access_token) {
+                        try {
+                            $calendarService->deleteEvent($order->agent, $slot->agent_google_event_id);
+                        } catch (\Throwable $e) {
+                            Log::warning('Failed to delete agent Google Calendar event on order destroy: ' . $e->getMessage());
+                        }
+                    }
+                }
+                if ($order->agent_google_event_id && $order->agent && $order->agent->google_access_token) {
+                    try {
+                        $calendarService->deleteEvent($order->agent, $order->agent_google_event_id);
+                    } catch (\Throwable $e) {
+                        Log::warning('Failed to delete order-level agent Google Calendar event on order destroy: ' . $e->getMessage());
+                    }
+                }
             }
 
             $order->delete();
@@ -3216,6 +3317,15 @@ private function createOrderNotification($order, array $changes)
 
     public function updateOrderServiceMediaAccess(Request $request): JsonResponse
     {
+        $user = auth()->user();
+        if (!($user instanceof \App\Models\User) && !($user instanceof \App\Models\Vendor)) {
+            return response()->json([
+                'success' => false,
+                'data' => null,
+                'message' => 'Unauthorized',
+            ], 403);
+        }
+
         $validator = Validator::make($request->all(), [
             'order_uuid' => 'required|exists:orders,uuid',
             'orderservice_uuid' => 'required|exists:order_services,uuid',
@@ -3750,16 +3860,18 @@ private function createOrderNotification($order, array $changes)
     {
         try {
             $today = Carbon::today()->toDateString();
+            $orgId = app()->bound('current_organization_id') ? app('current_organization_id') : null;
 
             $slots = OrderSlot::with([ 'service', 'vendor'])
                 ->whereDate('date', '>=', $today)
+                ->when($orgId, function ($q) use ($orgId) {
+                    $q->whereHas('order', fn ($oq) => $oq->where('organization_id', $orgId));
+                })
                 ->where(function ($q) {
                     $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
                 })
                 ->orderBy('date', 'asc')
                 ->get();
-
-            $orgId = app()->bound('current_organization_id') ? app('current_organization_id') : null;
             $orgDetails = null;
 
             if ($slots->isEmpty() && $orgId) {
@@ -3858,11 +3970,35 @@ private function createOrderNotification($order, array $changes)
             };
         }
 
-        $serviceUuids = array_filter(array_column($slots, 'service_id'));
-        $services = !empty($serviceUuids) ? Service::whereIn('uuid', $serviceUuids)->get()->keyBy('uuid') : collect();
-        $vendorUuids = array_filter(array_column($slots, 'vendor_id'));
-        $vendors = !empty($vendorUuids) ? Vendor::whereIn('uuid', $vendorUuids)->get()->keyBy('uuid') : collect();
+        $serviceIds = array_filter(array_column($slots, 'service_id'));
+        $validServiceUuids = array_filter($serviceIds, fn($id) => \Illuminate\Support\Str::isUuid((string)$id));
+        $numericServiceIds = array_filter($serviceIds, fn($id) => is_numeric($id));
+        $services = (!empty($validServiceUuids) || !empty($numericServiceIds))
+            ? Service::where(function($q) use ($validServiceUuids, $numericServiceIds) {
+                if (!empty($validServiceUuids)) {
+                    $q->whereIn('uuid', $validServiceUuids);
+                }
+                if (!empty($numericServiceIds)) {
+                    $q->orWhereIn('id', $numericServiceIds);
+                }
+            })->get()->keyBy(function($s) { return (string)($s->uuid ?: $s->id); })
+            : collect();
 
+        $vendorIds = array_filter(array_column($slots, 'vendor_id'));
+        $validVendorUuids = array_filter($vendorIds, fn($id) => \Illuminate\Support\Str::isUuid((string)$id));
+        $numericVendorIds = array_filter($vendorIds, fn($id) => is_numeric($id));
+        $vendors = (!empty($validVendorUuids) || !empty($numericVendorIds))
+            ? Vendor::where(function($q) use ($validVendorUuids, $numericVendorIds) {
+                if (!empty($validVendorUuids)) {
+                    $q->whereIn('uuid', $validVendorUuids);
+                }
+                if (!empty($numericVendorIds)) {
+                    $q->orWhereIn('id', $numericVendorIds);
+                }
+            })->get()->keyBy(function($v) { return (string)($v->uuid ?: $v->id); })
+            : collect();
+
+        $twilightGroups = [];
         foreach ($slots as $slot) {
             if (empty($slot['service_id'])) continue;
             $serviceModel = $services->get($slot['service_id']) ?? Service::where('uuid', $slot['service_id'])->first();
@@ -3871,22 +4007,55 @@ private function createOrderNotification($order, array $changes)
             }
 
             $date = $slot['date'];
-            $startTime = Carbon::parse($slot['start_time'])->format('H:i');
-            $window = $twilightService->calculateSunsetWindow($date, $lat, $lng, $timezone);
+            $groupKey = $slot['service_id'] . '|' . $date;
+            $startCarbon = Carbon::parse($slot['start_time']);
+            $endCarbon = !empty($slot['end_time'])
+                ? Carbon::parse($slot['end_time'])
+                : $startCarbon->copy()->addMinutes(15);
+            $startMins = $startCarbon->hour * 60 + $startCarbon->minute;
+            $endMins = $endCarbon->hour * 60 + $endCarbon->minute;
+            if ($endMins <= $startMins) {
+                $endMins += 24 * 60;
+            }
 
-            if (!$twilightService->isSlotInTwilightWindow($startTime, $window)) {
+            if (!isset($twilightGroups[$groupKey])) {
+                $twilightGroups[$groupKey] = [
+                    'date' => $date,
+                    'start_mins' => $startMins,
+                    'end_mins' => $endMins,
+                    'vendor_ids' => [],
+                ];
+            } else {
+                $twilightGroups[$groupKey]['start_mins'] = min($twilightGroups[$groupKey]['start_mins'], $startMins);
+                $twilightGroups[$groupKey]['end_mins'] = max($twilightGroups[$groupKey]['end_mins'], $endMins);
+            }
+
+            if (!empty($slot['vendor_id'])) {
+                $twilightGroups[$groupKey]['vendor_ids'][$slot['vendor_id']] = true;
+            }
+        }
+
+        foreach ($twilightGroups as $group) {
+            $date = $group['date'];
+            $window = $twilightService->calculateSunsetWindow($date, $lat, $lng, $timezone);
+            $midMins = (int) round(($group['start_mins'] + $group['end_mins']) / 2);
+            $midTime = sprintf('%02d:%02d', intdiv($midMins, 60) % 24, $midMins % 60);
+
+            if (!$twilightService->isSlotInTwilightWindow($midTime, $window)) {
                 return response()->json([
                     'success' => false,
                     'message' => "Twilight shoots must be scheduled strictly within the sunset window ({$window['formatted_window']}).",
                 ], 422);
             }
 
-            $slotVendor = $vendors->get($slot['vendor_id'] ?? '') ?? (!empty($slot['vendor_id']) ? Vendor::where('uuid', $slot['vendor_id'])->first() : null);
-            if ($slotVendor && !$twilightService->isVendorAvailableForTwilight($slotVendor, $date, $window)) {
-                return response()->json([
-                    'success' => false,
-                    'message' => "Vendor {$slotVendor->first_name} {$slotVendor->last_name} is not scheduled to work during evening twilight on this date.",
-                ], 422);
+            foreach (array_keys($group['vendor_ids']) as $vendorId) {
+                $slotVendor = $vendors->get($vendorId) ?? Vendor::where('uuid', $vendorId)->first();
+                if ($slotVendor && !$twilightService->isVendorAvailableForTwilight($slotVendor, $date, $window)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => "Vendor {$slotVendor->first_name} {$slotVendor->last_name} is not scheduled to work during evening twilight on this date.",
+                    ], 422);
+                }
             }
         }
 
@@ -3935,6 +4104,212 @@ private function createOrderNotification($order, array $changes)
     }
 
     /**
+     * Validate slot time ordering, intra-request overlaps, DB overlaps, work hours, and vendor breaks.
+     */
+    private function validateSlotTimeAndAvailability(array $slots, ?int $excludeOrderId = null, bool $isAdmin = false, $property = null): ?JsonResponse
+    {
+        $propertyTz = 'America/Vancouver';
+        if ($property && !empty($property->province)) {
+            $propertyTz = GoogleCalendarService::resolveTimezoneFromProvince($property->province, 'America/Vancouver');
+        } elseif ($property && !empty($property->state)) {
+            $propertyTz = GoogleCalendarService::resolveTimezoneFromProvince($property->state, 'America/Vancouver');
+        }
+
+        $twilightService = app(\App\Services\TwilightCalculatorService::class);
+        $serviceIds = array_filter(array_column($slots, 'service_id'));
+        $validUuids = array_filter($serviceIds, fn($id) => \Illuminate\Support\Str::isUuid((string)$id));
+        $numericIds = array_filter($serviceIds, fn($id) => is_numeric($id));
+        $services = (!empty($validUuids) || !empty($numericIds))
+            ? Service::where(function($q) use ($validUuids, $numericIds) {
+                if (!empty($validUuids)) {
+                    $q->whereIn('uuid', $validUuids);
+                }
+                if (!empty($numericIds)) {
+                    $q->orWhereIn('id', $numericIds);
+                }
+            })->get()->keyBy(function($s) { return (string)($s->uuid ?: $s->id); })
+            : collect();
+
+        $normalizedByVendorDate = [];
+
+        foreach ($slots as $slot) {
+            $date = $slot['date'] ?? null;
+            $startRaw = $slot['start_time'] ?? null;
+            $endRaw = $slot['end_time'] ?? null;
+            $vendorUuid = $slot['vendor_id'] ?? null;
+
+            if (!$date || !$startRaw || !$endRaw || !$vendorUuid) {
+                continue;
+            }
+
+            try {
+                $startDt = Carbon::parse($startRaw);
+                $endDt = Carbon::parse($endRaw);
+            } catch (\Throwable $e) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Invalid slot time format.',
+                ], 422);
+            }
+
+            if ($endDt->lte($startDt)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Slot end time must be after start time.',
+                ], 422);
+            }
+
+            $normalizedByVendorDate[$vendorUuid][$date][] = [
+                'start' => $startDt,
+                'end' => $endDt,
+                'uuid' => $slot['uuid'] ?? null,
+                'service_id' => $slot['service_id'] ?? null,
+                'override' => $isAdmin && !empty($slot['schedule_override']),
+            ];
+        }
+
+        // Intra-request overlap check
+        foreach ($normalizedByVendorDate as $vendorUuid => $dates) {
+            foreach ($dates as $date => $daySlots) {
+                $count = count($daySlots);
+                for ($i = 0; $i < $count; $i++) {
+                    for ($j = $i + 1; $j < $count; $j++) {
+                        if ($daySlots[$i]['start']->lt($daySlots[$j]['end']) && $daySlots[$i]['end']->gt($daySlots[$j]['start'])) {
+                            return response()->json([
+                                'success' => false,
+                                'message' => 'Overlapping slots detected for the same vendor within this request.',
+                            ], 422);
+                        }
+                    }
+                }
+            }
+        }
+
+        // DB overlap, work hours, and break checks
+        foreach ($normalizedByVendorDate as $vendorUuid => $dates) {
+            $vendor = \Illuminate\Support\Str::isUuid((string)$vendorUuid)
+                ? Vendor::with('workHours')->where('uuid', $vendorUuid)->first()
+                : Vendor::with('workHours')->find($vendorUuid);
+            if (!$vendor) {
+                continue;
+            }
+
+            $vendorTz = $vendor->workHours?->timezone ?: 'America/Vancouver';
+
+            foreach ($dates as $date => $daySlots) {
+                $breaks = \App\Models\VendorBreak::where('vendor_id', $vendor->id)
+                    ->where(function ($q) use ($date) {
+                        $q->whereDate('date', $date)
+                          ->orWhere(function ($q2) use ($date) {
+                              $q2->whereNotNull('start_date')
+                                 ->whereNotNull('end_date')
+                                 ->whereDate('start_date', '<=', $date)
+                                 ->whereDate('end_date', '>=', $date);
+                          });
+                    })
+                    ->get();
+
+                foreach ($daySlots as $item) {
+                    $startStr = $item['start']->format('H:i:s');
+                    $endStr = $item['end']->format('H:i:s');
+
+                    $overlapQuery = OrderSlot::where('vendor_id', $vendor->id)
+                        ->whereDate('date', $date)
+                        ->where(function ($q) {
+                            $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                        })
+                        ->whereHas('order', function ($q) {
+                            $q->where('order_status', '!=', 'Cancelled');
+                        })
+                        ->where('start_time', '<', $endStr)
+                        ->where('end_time', '>', $startStr)
+                        ->lockForUpdate();
+
+                    if ($excludeOrderId) {
+                        $overlapQuery->where('order_id', '!=', $excludeOrderId);
+                    }
+                    if (!empty($item['uuid'])) {
+                        $overlapQuery->where('uuid', '!=', $item['uuid']);
+                    }
+
+                    if ($overlapQuery->exists()) {
+                        return response()->json([
+                            'success' => false,
+                            'message' => "Vendor {$vendor->first_name} {$vendor->last_name} already has a booking overlapping {$startStr} - {$endStr} on {$date}.",
+                        ], 422);
+                    }
+
+                    if (!$item['override']) {
+                        // Check if this is a twilight service
+                        $svcModel = !empty($item['service_id'])
+                            ? ($services->get((string)$item['service_id'])
+                                ?? (\Illuminate\Support\Str::isUuid((string)$item['service_id']) ? Service::where('uuid', $item['service_id'])->first() : Service::find($item['service_id'])))
+                            : null;
+                        $isTwilight = $svcModel && $twilightService->isTwilightService($svcModel);
+
+                        // If slot belongs to Twilight, vendor twilight availability is validated in validateTwilightSlots
+                        if (!$isTwilight) {
+                            // Convert slot time to vendor timezone for work hours & break checking
+                            $slotStartInVendor = Carbon::createFromFormat('Y-m-d H:i:s', "{$date} {$startStr}", $propertyTz)->setTimezone($vendorTz);
+                            $slotEndInVendor = Carbon::createFromFormat('Y-m-d H:i:s', "{$date} {$endStr}", $propertyTz)->setTimezone($vendorTz);
+                            $vendorDayOfWeek = strtolower($slotStartInVendor->format('D'));
+
+                            $vendorDayConfig = ($vendor->workHours && $vendor->workHours->work_days)
+                                ? collect($vendor->workHours->work_days)->firstWhere('day', $vendorDayOfWeek)
+                                : null;
+
+                            if ($vendorDayConfig) {
+                                if (!empty($vendorDayConfig['is_off'])) {
+                                    return response()->json([
+                                        'success' => false,
+                                        'message' => "Vendor {$vendor->first_name} is off on {$vendorDayOfWeek}.",
+                                    ], 422);
+                                }
+                                $workStart = !empty($vendorDayConfig['start_time']) ? Carbon::parse($vendorDayConfig['start_time'])->format('H:i') : null;
+                                $workEnd = !empty($vendorDayConfig['end_time']) ? Carbon::parse($vendorDayConfig['end_time'])->format('H:i') : null;
+
+                                $slotStartFormatted = $slotStartInVendor->format('H:i');
+                                $slotEndFormatted = $slotEndInVendor->format('H:i');
+
+                                if ($workStart && $slotStartFormatted < $workStart) {
+                                    return response()->json([
+                                        'success' => false,
+                                        'message' => "Slot starts before vendor work hours ({$workStart}).",
+                                    ], 422);
+                                }
+                                if ($workEnd && $slotEndFormatted > $workEnd) {
+                                    return response()->json([
+                                        'success' => false,
+                                        'message' => "Slot ends after vendor work hours ({$workEnd}).",
+                                    ], 422);
+                                }
+                            }
+
+                            $vendorStartStr = $slotStartInVendor->format('H:i:s');
+                            $vendorEndStr = $slotEndInVendor->format('H:i:s');
+                            foreach ($breaks as $brk) {
+                                if (!$brk->start_time || !$brk->end_time) {
+                                    continue;
+                                }
+                                $brkStart = Carbon::parse($brk->start_time)->format('H:i:s');
+                                $brkEnd = Carbon::parse($brk->end_time)->format('H:i:s');
+                                if ($vendorStartStr < $brkEnd && $vendorEndStr > $brkStart) {
+                                    return response()->json([
+                                        'success' => false,
+                                        'message' => "Selected time overlaps a vendor break ({$brkStart} - {$brkEnd}).",
+                                    ], 422);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Validate consecutive booking for a vendor on a specific date
      * Returns [true, null] if valid, or [false, nextAvailableTime] if invalid.
      */
@@ -3959,6 +4334,9 @@ private function createOrderNotification($order, array $changes)
             ->whereDate('date', $date)
             ->where(function ($q) {
                 $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+            })
+            ->whereHas('order', function ($q) {
+                $q->where('order_status', '!=', 'Cancelled');
             });
             
         if ($excludeOrderUuid) {
@@ -4048,6 +4426,14 @@ private function createOrderNotification($order, array $changes)
     public function reassignSlot(Request $request, $slotUuid): JsonResponse
     {
         try {
+            $user = auth()->user();
+            if (!$user || !($user instanceof \App\Models\User)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unauthorized: Only administrators can reassign slots.'
+                ], 403);
+            }
+
             $validator = Validator::make($request->all(), [
                 'vendor_id' => 'required',
             ]);
@@ -4104,6 +4490,46 @@ private function createOrderNotification($order, array $changes)
                 ? Vendor::withoutGlobalScopes()->where('id', $request->vendor_id)->firstOrFail()
                 : Vendor::withoutGlobalScopes()->where('uuid', $request->vendor_id)->firstOrFail();
 
+            $newStart = $request->filled('start_time') ? $request->start_time : $slot->start_time;
+            $newEnd = $slot->end_time;
+            if ($request->filled('end_time')) {
+                $newEnd = $request->end_time;
+            } elseif ($request->has('custom_duration') && is_numeric($request->custom_duration) && $newStart) {
+                try {
+                    $newEnd = Carbon::parse($newStart)->addMinutes((int)$request->custom_duration)->format('H:i:s');
+                } catch (\Throwable $e) {
+                    // keep existing end_time
+                }
+            } elseif ($slot->custom_duration && $newStart) {
+                try {
+                    $newEnd = Carbon::parse($newStart)->addMinutes($slot->custom_duration)->format('H:i:s');
+                } catch (\Throwable $e) {
+                    // keep existing end_time
+                }
+            }
+
+            $newStartNorm = Carbon::parse($newStart)->format('H:i:s');
+            $newEndNorm = Carbon::parse($newEnd)->format('H:i:s');
+            $hasConflict = OrderSlot::where('vendor_id', $newVendor->id)
+                ->where('id', '!=', $slot->id)
+                ->whereDate('date', $slot->date)
+                ->where(function ($q) {
+                    $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                })
+                ->whereHas('order', function ($q) {
+                    $q->where('order_status', '!=', 'Cancelled');
+                })
+                ->where('start_time', '<', $newEndNorm)
+                ->where('end_time', '>', $newStartNorm)
+                ->exists();
+
+            if ($hasConflict) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Vendor {$newVendor->first_name} {$newVendor->last_name} has a conflicting booking during {$newStartNorm} - {$newEndNorm}."
+                ], 422);
+            }
+
             $slot->vendor_id = $newVendor->id;
 
             if ($request->has('custom_duration')) {
@@ -4122,7 +4548,7 @@ private function createOrderNotification($order, array $changes)
                 $slot->end_time = $request->end_time;
             } elseif ($slot->custom_duration && $slot->start_time) {
                 try {
-                    $slot->end_time = Carbon::parse($slot->start_time)->addMinutes($slot->custom_duration)->format('H:i');
+                    $slot->end_time = Carbon::parse($slot->start_time)->addMinutes($slot->custom_duration)->format('H:i:s');
                 } catch (\Throwable $e) {
                     // keep existing end_time
                 }
@@ -4205,6 +4631,14 @@ private function createOrderNotification($order, array $changes)
     public function swapSlots(Request $request): JsonResponse
     {
         try {
+            $user = auth()->user();
+            if (!$user || !($user instanceof \App\Models\User)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unauthorized: Only administrators can swap slots.'
+                ], 403);
+            }
+
             $validator = Validator::make($request->all(), [
                 'slot1_uuid' => 'required',
                 'slot2_uuid' => 'required',
@@ -4230,6 +4664,51 @@ private function createOrderNotification($order, array $changes)
 
             $vendor1 = $s1->vendor ?: ($s1->vendor_id ? Vendor::withoutGlobalScopes()->find($s1->vendor_id) : null);
             $vendor2 = $s2->vendor ?: ($s2->vendor_id ? Vendor::withoutGlobalScopes()->find($s2->vendor_id) : null);
+            if (!$vendor1 || !$vendor2) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Both slots must have assigned vendors to swap.'
+                ], 422);
+            }
+
+            // Check conflicts for vendor2 taking s1 and vendor1 taking s2
+            $s1Start = Carbon::parse($s1->start_time)->format('H:i:s');
+            $s1End = Carbon::parse($s1->end_time)->format('H:i:s');
+            $s2Start = Carbon::parse($s2->start_time)->format('H:i:s');
+            $s2End = Carbon::parse($s2->end_time)->format('H:i:s');
+
+            $v2Conflict = OrderSlot::where('vendor_id', $vendor2->id)
+                ->whereNotIn('id', [$s1->id, $s2->id])
+                ->whereDate('date', $s1->date)
+                ->where(function ($q) {
+                    $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                })
+                ->whereHas('order', function ($q) {
+                    $q->where('order_status', '!=', 'Cancelled');
+                })
+                ->where('start_time', '<', $s1End)
+                ->where('end_time', '>', $s1Start)
+                ->exists();
+
+            $v1Conflict = OrderSlot::where('vendor_id', $vendor1->id)
+                ->whereNotIn('id', [$s1->id, $s2->id])
+                ->whereDate('date', $s2->date)
+                ->where(function ($q) {
+                    $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                })
+                ->whereHas('order', function ($q) {
+                    $q->where('order_status', '!=', 'Cancelled');
+                })
+                ->where('start_time', '<', $s2End)
+                ->where('end_time', '>', $s2Start)
+                ->exists();
+
+            if ($v2Conflict || $v1Conflict) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cannot swap slots: one of the vendors has a conflicting booking.'
+                ], 422);
+            }
             $event1Id = $s1->google_event_id;
             $event2Id = $s2->google_event_id;
 
@@ -4297,6 +4776,17 @@ private function createOrderNotification($order, array $changes)
 
                 $slot1->save();
                 $slot2->save();
+
+                if ($slot1->order_id && $slot1->service_id) {
+                    OrderService::where('order_id', $slot1->order_id)
+                        ->where('service_id', $slot1->service_id)
+                        ->update(['vendor_id' => $vendor2->uuid]);
+                }
+                if ($slot2->order_id && $slot2->service_id) {
+                    OrderService::where('order_id', $slot2->order_id)
+                        ->where('service_id', $slot2->service_id)
+                        ->update(['vendor_id' => $vendor1->uuid]);
+                }
             });
 
             // Notify both vendors of their new bookings
@@ -4473,6 +4963,16 @@ private function createOrderNotification($order, array $changes)
             $oldStartTime = $slot->start_time;
             $oldEndTime = $slot->end_time;
             $oldVendor = $slot->vendor;
+
+            if ($oldVendorId && $oldVendorId != $vendor->id && $slot->google_event_id && $oldVendor && $oldVendor->google_access_token && class_exists(\App\Services\GoogleCalendarService::class)) {
+                try {
+                    $calendarService = app(\App\Services\GoogleCalendarService::class);
+                    $calendarService->deleteEvent($oldVendor, $slot->google_event_id);
+                    $slot->google_event_id = null;
+                } catch (\Throwable $e) {
+                    Log::warning("Failed to delete old vendor Google Calendar event on updateSlotTime: " . $e->getMessage());
+                }
+            }
 
             // Update the Slot
             $slot->vendor_id = $vendor->id;

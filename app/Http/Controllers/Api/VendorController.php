@@ -84,6 +84,9 @@ class VendorController extends Controller
                 'portfolioImages',
                 'orderSlots' => function ($query) {
                     $query->where('date', '>=', now()->toDateString())
+                        ->where(function ($q) {
+                            $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                        })
                         ->orderBy('date', 'asc')
                         ->orderBy('start_time', 'asc');
                 }
@@ -246,7 +249,7 @@ class VendorController extends Controller
             'work_hours.work_days' => 'required|array',
             'work_hours.work_days.*.day' => 'required|in:mon,tue,wed,thu,fri,sat,sun',
             'work_hours.work_days.*.start_time' => 'nullable|date_format:H:i',
-            'work_hours.work_days.*.end_time' => 'nullable|date_format:H:i|after:start_time',
+            'work_hours.work_days.*.end_time' => 'nullable|date_format:H:i|after:work_hours.work_days.*.start_time',
 
             // 'work_hours.work_days.*.end_time' => 'nullable|date_format:H:i|after:work_hours.work_days.*.start_time',
             'work_hours.work_days.*.is_off' => 'boolean',
@@ -681,6 +684,9 @@ class VendorController extends Controller
                 'vendorServices.options.productOption',
                 'orderSlots' => function ($query) {
                     $query->where('date', '>=', now()->toDateString())
+                        ->where(function ($q) {
+                            $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                        })
                         ->orderBy('date', 'asc')
                         ->orderBy('start_time', 'asc');
                 },
@@ -772,7 +778,7 @@ class VendorController extends Controller
             'work_hours.work_days' => 'sometimes|array',
             'work_hours.work_days.*.day' => 'required|in:mon,tue,wed,thu,fri,sat,sun',
             'work_hours.work_days.*.start_time' => 'nullable|date_format:H:i',
-            'work_hours.work_days.*.end_time' => 'nullable|date_format:H:i|after:start_time',
+            'work_hours.work_days.*.end_time' => 'nullable|date_format:H:i|after:work_hours.work_days.*.start_time',
             // 'work_hours.work_days.*.end_time' => 'nullable|date_format:H:i|after:work_hours.work_days.*.start_time',
 
             'work_hours.work_days.*.is_off' => 'boolean',
@@ -1514,14 +1520,14 @@ class VendorController extends Controller
     public function addBreak(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
-            'vendor_id' => 'required|exists:vendors,id',
+            'vendor_id' => 'required',
             'title' => 'required|string|max:255',
             'date' => 'required|date',
             'start_date' => 'required|date',
             'end_date' => 'required|date|after_or_equal:start_date',
             'start_time' => 'required',
             'end_time' => 'required|after:start_time',
-            'address' => 'required|string|max:500',
+            'address' => 'nullable|string|max:500',
         ], [
             'vendor_id.required' => 'Vendor is required.',
             'title.required' => 'Title is required.',
@@ -1530,7 +1536,6 @@ class VendorController extends Controller
             'end_date.required' => 'End date is required.',
             'start_time.required' => 'Start time is required.',
             'end_time.required' => 'End time is required.',
-            'address.required' => 'Address is required.',
         ]);
 
         if ($validator->fails()) {
@@ -1541,18 +1546,62 @@ class VendorController extends Controller
             ], 422);
         }
 
+        $vendor = is_numeric($request->vendor_id)
+            ? Vendor::find($request->vendor_id)
+            : Vendor::where('uuid', $request->vendor_id)->first();
+
+        if (!$vendor) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation error',
+                'errors' => ['vendor_id' => ['The selected vendor is invalid.']]
+            ], 422);
+        }
+
+        $authUser = auth()->user();
+        if ($authUser instanceof \App\Models\Vendor && (int)$authUser->id !== (int)$vendor->id) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized: Vendors can only add breaks to their own schedule.'
+            ], 403);
+        }
+
+        $brkStart = \Carbon\Carbon::parse($request->start_time)->format('H:i:s');
+        $brkEnd = \Carbon\Carbon::parse($request->end_time)->format('H:i:s');
+        $hasSlotOverlap = \App\Models\OrderSlot::where('vendor_id', $vendor->id)
+            ->where(function ($q) use ($request) {
+                $q->whereDate('date', '>=', $request->start_date)
+                  ->whereDate('date', '<=', $request->end_date);
+            })
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+            })
+            ->whereHas('order', function ($q) {
+                $q->where('order_status', '!=', 'Cancelled');
+            })
+            ->where('start_time', '<', $brkEnd)
+            ->where('end_time', '>', $brkStart)
+            ->exists();
+
+        if ($hasSlotOverlap) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot add break: it overlaps with an existing active booking.'
+            ], 422);
+        }
+
         try {
 
             $vendorBreak = VendorBreak::create([
                 'uuid' => (string) Str::uuid(),
-                'vendor_id' => $request->vendor_id,
+                'vendor_id' => $vendor->id,
                 'title' => $request->title,
                 'date' => $request->date,
                 'start_date' => $request->start_date,
                 'end_date' => $request->end_date,
                 'start_time' => $request->start_time,
                 'end_time' => $request->end_time,
-                'address' => $request->address,
+                'address' => $request->address ?? '',
             ]);
 
             return response()->json([
@@ -1604,8 +1653,66 @@ class VendorController extends Controller
             ], 422);
         }
 
+        $authUser = auth()->user();
+        if ($authUser instanceof \App\Models\Vendor && (int)$authUser->id !== (int)$request->vendor_id) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized: Vendors can only add breaks to their own schedule.'
+            ], 403);
+        }
+
+        $brkStart = \Carbon\Carbon::parse($request->start_time)->format('H:i:s');
+        $brkEnd = \Carbon\Carbon::parse($request->end_time)->format('H:i:s');
+        $hasSlotOverlap = \App\Models\OrderSlot::where('vendor_id', $request->vendor_id)
+            ->where(function ($q) use ($request) {
+                $q->whereDate('date', '>=', $request->start_date)
+                  ->whereDate('date', '<=', $request->end_date);
+            })
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+            })
+            ->whereHas('order', function ($q) {
+                $q->where('order_status', '!=', 'Cancelled');
+            })
+            ->where('start_time', '<', $brkEnd)
+            ->where('end_time', '>', $brkStart)
+            ->exists();
+
+        if ($hasSlotOverlap) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot add break: it overlaps with an existing active booking.'
+            ], 422);
+        }
+
         try {
             $vendorBreak = VendorBreak::where('uuid', $uuid)->firstOrFail();
+
+            $targetVendorId = $request->has('vendor_id') ? $request->vendor_id : $vendorBreak->vendor_id;
+            $targetStartDate = $request->has('start_date') ? $request->start_date : ($vendorBreak->start_date ?? $vendorBreak->date);
+            $targetEndDate = $request->has('end_date') ? $request->end_date : ($vendorBreak->end_date ?? $vendorBreak->date);
+            $targetStartTime = \Carbon\Carbon::parse($request->has('start_time') ? $request->start_time : $vendorBreak->start_time)->format('H:i:s');
+            $targetEndTime = \Carbon\Carbon::parse($request->has('end_time') ? $request->end_time : $vendorBreak->end_time)->format('H:i:s');
+
+            $hasSlotOverlap = \App\Models\OrderSlot::where('vendor_id', $targetVendorId)
+                ->whereDate('date', '>=', $targetStartDate)
+                ->whereDate('date', '<=', $targetEndDate)
+                ->where(function ($q) {
+                    $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                })
+                ->whereHas('order', function ($q) {
+                    $q->where('order_status', '!=', 'Cancelled');
+                })
+                ->where('start_time', '<', $targetEndTime)
+                ->where('end_time', '>', $targetStartTime)
+                ->exists();
+
+            if ($hasSlotOverlap) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cannot update break: it overlaps with an existing active booking.'
+                ], 422);
+            }
 
             $vendorBreak->update([
                 'vendor_id' => $request->has('vendor_id') ? $request->vendor_id : $vendorBreak->vendor_id,

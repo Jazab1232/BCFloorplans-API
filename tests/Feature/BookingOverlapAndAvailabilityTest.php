@@ -244,7 +244,7 @@ class BookingOverlapAndAvailabilityTest extends TestCase
 
         $response->assertStatus(201);
         $this->assertEquals(2, OrderSlot::count());
-        Queue::assertDispatched(SyncOrderCalendarEvents::class);
+        Queue::assertPushed(SyncOrderCalendarEvents::class);
     }
 
     /**
@@ -395,8 +395,8 @@ class BookingOverlapAndAvailabilityTest extends TestCase
             [
                 'id' => 'ext-gcal-evt-1',
                 'summary' => 'Dentist Appointment',
-                'start' => "{$this->futureDate}T09:00:00-07:00",
-                'end' => "{$this->futureDate}T10:30:00-07:00",
+                'start' => Carbon::parse("{$this->futureDate} 09:00:00", 'America/Vancouver')->toIso8601String(),
+                'end' => Carbon::parse("{$this->futureDate} 10:30:00", 'America/Vancouver')->toIso8601String(),
                 'all_day' => false,
             ],
         ]);

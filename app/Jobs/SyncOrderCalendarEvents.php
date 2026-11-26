@@ -168,10 +168,10 @@ class SyncOrderCalendarEvents implements ShouldQueue
                 $slot->loadMissing('service');
 
                 $province = $order->property->state ?? $order->property->province ?? $order->province ?? 'BC';
-                $tz = GoogleCalendarService::resolveTimezoneFromProvince($province, $vendor->workHours->first()?->timezone ?? 'America/Vancouver');
+                $tz = GoogleCalendarService::resolveTimezoneFromProvince($province, $vendor->workHours?->timezone ?? 'America/Vancouver');
 
-                $start = Carbon::createFromFormat('Y-m-d H:i:s', "{$slot->date} {$slot->start_time}", $tz);
-                $end = Carbon::createFromFormat('Y-m-d H:i:s', "{$slot->date} {$slot->end_time}", $tz);
+                $start = Carbon::parse("{$slot->date} {$slot->start_time}", $tz);
+                $end = Carbon::parse("{$slot->date} {$slot->end_time}", $tz);
 
                 $eventData = [
                     'summary' => $this->resolveVendorJobTitle($order, $slot),
@@ -272,15 +272,16 @@ class SyncOrderCalendarEvents implements ShouldQueue
         ]);
 
         try {
-            foreach ($order->slots as $slot) {
+            $activeAgentSlots = $order->slots->filter(fn($s) => ($s->status ?? 'booked') !== 'cancelled');
+            foreach ($activeAgentSlots as $slot) {
                 // Ensure service and vendor are loaded
                 $slot->loadMissing(['service', 'vendor']);
 
                 $province = $order->property->state ?? $order->property->province ?? $order->province ?? 'BC';
                 $tz = GoogleCalendarService::resolveTimezoneFromProvince($province, 'America/Vancouver');
 
-                $start = Carbon::createFromFormat('Y-m-d H:i:s', "{$slot->date} {$slot->start_time}", $tz);
-                $end = Carbon::createFromFormat('Y-m-d H:i:s', "{$slot->date} {$slot->end_time}", $tz);
+                $start = Carbon::parse("{$slot->date} {$slot->start_time}", $tz);
+                $end = Carbon::parse("{$slot->date} {$slot->end_time}", $tz);
 
                 $serviceName = $slot->service->name ?? 'Service';
                 $vendorName = $slot->vendor ? "{$slot->vendor->first_name} {$slot->vendor->last_name}" : 'N/A';
@@ -681,12 +682,8 @@ class SyncOrderCalendarEvents implements ShouldQueue
             try {
                 $vendor = $slot->vendor;
 
-                if (!$vendor || !$vendor->google_access_token) {
-                    continue;
-                }
-
                 // If slot has google_event_id for vendor, delete it
-                if ($slot->google_event_id) {
+                if ($slot->google_event_id && $vendor && $vendor->google_access_token) {
                     $success = $calendarService->deleteEvent($vendor, $slot->google_event_id);
                     if ($success) {
                         $slot->update(['google_event_id' => null]);
@@ -699,7 +696,7 @@ class SyncOrderCalendarEvents implements ShouldQueue
                 }
 
                 // If slot has agent_google_event_id for agent, delete it
-                if ($slot->agent_google_event_id && $slot->order && $slot->order->agent) {
+                if ($slot->agent_google_event_id && $slot->order && $slot->order->agent && $slot->order->agent->google_access_token) {
                     $success = $calendarService->deleteEvent($slot->order->agent, $slot->agent_google_event_id);
                     if ($success) {
                         $slot->update(['agent_google_event_id' => null]);

@@ -90,6 +90,10 @@ class TwilightCalculatorService
     public function isSlotInTwilightWindow(string $startTime, array $sunsetWindow): bool
     {
         $startMins = $this->timeToMinutes($startTime);
+        if (empty($sunsetWindow)) {
+            $sunsetWindow = $this->calculateSunsetWindow($date);
+        }
+
         $windowStartMins = $this->timeToMinutes($sunsetWindow['window_start']);
         $windowEndMins = $this->timeToMinutes($sunsetWindow['window_end']);
 
@@ -105,9 +109,9 @@ class TwilightCalculatorService
      * - If vendor does NOT have `is_twilight` checked:
      *   The vendor is only available if the twilight window falls within their standard `start_time`..`end_time` and day is not off.
      */
-    public function isVendorAvailableForTwilight(Vendor $vendor, string $date, array $sunsetWindow): bool
+    public function isVendorAvailableForTwilight(Vendor $vendor, string $date, array $sunsetWindow = []): bool
     {
-        $dayOfWeek = strtolower(Carbon::parse($date)->format('ddd'));
+        $dayOfWeek = strtolower(Carbon::parse($date)->format('D'));
         $workHours = $vendor->workHours;
 
         if (!$workHours || empty($workHours->work_days)) {
@@ -136,6 +140,10 @@ class TwilightCalculatorService
 
         $workStart = $daySchedule['start_time'] ?? $workHours->start_time ?? '09:00';
         $workEnd = $daySchedule['end_time'] ?? $workHours->end_time ?? '17:00';
+
+        if (empty($sunsetWindow)) {
+            $sunsetWindow = $this->calculateSunsetWindow($date);
+        }
 
         $windowStartMins = $this->timeToMinutes($sunsetWindow['window_start']);
         $windowEndMins = $this->timeToMinutes($sunsetWindow['window_end']);
@@ -199,15 +207,19 @@ class TwilightCalculatorService
 
             $H = rad2deg(acos($cosH)) / 15.0;
             $T = $H + $RA - (0.06571 * $t) - 6.622;
-            $UT = $T - $lngHour;
-            $UT = fmod($UT, 24.0);
-            if ($UT < 0) $UT += 24.0;
+            $UTRaw = $T - $lngHour;
+            $dayOffset = (int)floor($UTRaw / 24.0);
+            $UT = $UTRaw - ($dayOffset * 24.0);
 
             $utSec = (int)round($UT * 3600);
             $utHours = (int)floor($utSec / 3600);
             $utMins = (int)floor(($utSec % 3600) / 60);
 
-            $utcDt = new DateTime(sprintf('%04d-%02d-%02dT%02d:%02d:00Z', $year, $month, $day, $utHours, $utMins), new DateTimeZone('UTC'));
+            $utcBase = new DateTime("{$dateStr} 00:00:00", new DateTimeZone('UTC'));
+            if ($dayOffset !== 0) {
+                $utcBase->modify(($dayOffset > 0 ? '+' : '') . $dayOffset . ' days');
+            }
+            $utcDt = new DateTime(sprintf('%sT%02d:%02d:00Z', $utcBase->format('Y-m-d'), $utHours, $utMins), new DateTimeZone('UTC'));
             $utcDt->setTimezone(new DateTimeZone($tzName));
 
             return $utcDt->format('H:i');

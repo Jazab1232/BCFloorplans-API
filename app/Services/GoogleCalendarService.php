@@ -258,9 +258,12 @@ class GoogleCalendarService
                 }
 
                 if (isset($event->start->date)) {
-                    // All-day event
+                    // All-day event (Google end.date is exclusive)
                     $start = Carbon::parse($event->start->date)->startOfDay();
-                    $end = Carbon::parse($event->end->date)->endOfDay();
+                    $end = Carbon::parse($event->end->date)->subDay()->endOfDay();
+                    if ($end->lt($start)) {
+                        $end = $start->copy()->endOfDay();
+                    }
                 } else {
                     $start = Carbon::parse($event->start->dateTime);
                     $end = Carbon::parse($event->end->dateTime);
@@ -315,23 +318,38 @@ class GoogleCalendarService
     /**
      * Get all unavailable dates for vendor in a month
      */
-    public function getUnavailableDates(Vendor $vendor, int $year, int $month): array
+    public function getUnavailableDates(Vendor $vendor, int|string $yearOrStart, int|string $monthOrEnd): array
     {
-        $startDate = Carbon::create($year, $month, 1)->startOfMonth();
-        $endDate = $startDate->copy()->endOfMonth();
+        if (is_string($yearOrStart) && !ctype_digit($yearOrStart)) {
+            $startDate = Carbon::parse($yearOrStart)->startOfDay();
+            $endDate = Carbon::parse((string)$monthOrEnd)->endOfDay();
+            $rangeLabel = "{$startDate->toDateString()} to {$endDate->toDateString()}";
+        } else {
+            $year = (int)$yearOrStart;
+            $month = (int)$monthOrEnd;
+            $startDate = Carbon::create($year, $month, 1)->startOfMonth();
+            $endDate = $startDate->copy()->endOfMonth();
+            $rangeLabel = "{$year}-{$month}";
+        }
 
         $busySlots = $this->getVendorBusySlots($vendor, $startDate, $endDate);
-        Log::info('Calculating unavailable dates for ' . $year . '-' . $month . '. Found ' . count($busySlots) . ' busy slots.');
+        Log::info('Calculating unavailable dates for ' . $rangeLabel . '. Found ' . count($busySlots) . ' busy slots.');
         Log::info('Busy Slots: ' . print_r($busySlots, true));
         $unavailableDates = [];
         foreach ($busySlots as $slot) {
             if ($slot['all_day']) {
-                // Full day event
-                $unavailableDates[] = $slot['start']->format('Y-m-d');
+                $cursor = $slot['start']->copy()->startOfDay();
+                $lastDay = $slot['end']->copy()->startOfDay();
+                while ($cursor->lte($lastDay)) {
+                    if ($cursor->between($startDate, $endDate)) {
+                        $unavailableDates[] = $cursor->format('Y-m-d');
+                    }
+                    $cursor->addDay();
+                }
             }
         }
 
-        return array_unique($unavailableDates);
+        return array_values(array_unique($unavailableDates));
     }
 
     /**
@@ -341,8 +359,12 @@ class GoogleCalendarService
     {
         try {
             if ($model->google_access_token) {
-                $this->setClientToken($model);
-                $this->client->revokeToken();
+                try {
+                    $this->setClientToken($model);
+                    $this->client->revokeToken();
+                } catch (\Throwable $e) {
+                    Log::warning('Google token revocation failed during disconnect: ' . $e->getMessage());
+                }
             }
 
             $model->update([
@@ -365,11 +387,12 @@ class GoogleCalendarService
      */
     public static function resolveTimezoneFromProvince($province = null, $defaultTz = 'America/Vancouver'): string
     {
-        $prov = strtoupper(trim((string)$province));
-        
-        if (str_contains($prov, '/')) {
-            return $prov;
+        $raw = trim((string)$province);
+        if (str_contains($raw, '/')) {
+            return $raw;
         }
+
+        $prov = strtoupper($raw);
 
         return match ($prov) {
             // Canadian Provinces
@@ -378,7 +401,8 @@ class GoogleCalendarService
             'SK', 'SASKATCHEWAN' => 'America/Regina',
             'MB', 'MANITOBA' => 'America/Winnipeg',
             'ON', 'ONTARIO', 'QC', 'QUEBEC' => 'America/Toronto',
-            'NB', 'NEW BRUNSWICK', 'NS', 'NOVA SCOTIA', 'PE', 'PRINCE EDWARD ISLAND', 'NL', 'NEWFOUNDLAND' => 'America/Halifax',
+            'NB', 'NEW BRUNSWICK', 'NS', 'NOVA SCOTIA', 'PE', 'PRINCE EDWARD ISLAND' => 'America/Halifax',
+            'NL', 'NEWFOUNDLAND', 'NEWFOUNDLAND AND LABRADOR' => 'America/St_Johns',
 
             // US States - Pacific
             'CA', 'CALIFORNIA', 'WA', 'WASHINGTON', 'OR', 'OREGON', 'NV', 'NEVADA' => 'America/Los_Angeles',

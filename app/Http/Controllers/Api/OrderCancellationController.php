@@ -94,7 +94,7 @@ class OrderCancellationController extends Controller
                     'timezone' => $timezone,
                     'message' => $this->getCancellationMessage($canCancel, $isFree, $cancellationFee, $deadline)
                 ]
-            ]);
+            ], 200, [], JSON_PRESERVE_ZERO_FRACTION);
         } catch (\Throwable $e) {
             Log::error('Cancellation Preview Error: ' . $e->getMessage(), [
                 'uuid' => $uuid,
@@ -164,7 +164,7 @@ class OrderCancellationController extends Controller
                     'timezone' => $timezone,
                     'message' => $this->getCancellationMessage($canCancel, $isFree, $cancellationFee, $deadline)
                 ]
-            ]);
+            ], 200, [], JSON_PRESERVE_ZERO_FRACTION);
 
         } catch (\Throwable $e) {
             Log::error('Service Cancellation Preview Error: ' . $e->getMessage(), [
@@ -246,6 +246,8 @@ class OrderCancellationController extends Controller
                 'cancelled_by_uuid' => $user->uuid,
                 'cancellation_reason' => $request->reason
             ]);
+
+            $order->slots()->update(['status' => 'cancelled']);
 
             // 2. Handle Invoices & Refunds
             $totalPaid = (float) $invoices->sum('paid_amount');
@@ -416,23 +418,31 @@ class OrderCancellationController extends Controller
 
             // Track slot for calendar sync and email notifications
             $cancelledSlotId = null;
-            $slot = OrderSlot::withoutGlobalScopes()
+            $slots = OrderSlot::withoutGlobalScopes()
                 ->where('order_id', $order->id)
                 ->where('service_id', $orderService->service_id)
-                ->first();
+                ->where(function ($q) {
+                    $q->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                })
+                ->get();
 
             $vendor = null;
-            if ($slot) {
+            foreach ($slots as $slot) {
                 $slot->loadMissing(['service', 'order.property', 'vendor']);
-                $cancelledSlotId = $slot->id;
-                $vendor = $slot->vendor;
+                if (!$cancelledSlotId) {
+                    $cancelledSlotId = $slot->id;
+                }
+                if (!$vendor) {
+                    $vendor = $slot->vendor;
+                }
 
                 // Delete Google Calendar event for the vendor so vendor calendar is freed
                 $oldEventId = $slot->google_event_id;
-                if ($vendor && $oldEventId && $vendor->google_access_token && class_exists(\App\Services\GoogleCalendarService::class)) {
+                $slotVendor = $slot->vendor;
+                if ($slotVendor && $oldEventId && $slotVendor->google_access_token && class_exists(\App\Services\GoogleCalendarService::class)) {
                     try {
                         $calendarService = app(\App\Services\GoogleCalendarService::class);
-                        $calendarService->deleteEvent($vendor, $oldEventId);
+                        $calendarService->deleteEvent($slotVendor, $oldEventId);
                     } catch (\Throwable $e) {
                         Log::warning("Failed to delete google calendar event for vendor during service cancel: " . $e->getMessage());
                     }
@@ -620,16 +630,20 @@ class OrderCancellationController extends Controller
         $isFree = true;
         $cancellationFee = 0.0;
 
-        if ($order->slots && $order->slots->isNotEmpty()) {
-            $earliestSlot = $order->slots->sortBy(function($slot) {
+        $activeSlots = $order->slots
+            ? $order->slots->filter(fn ($s) => ($s->status ?? 'booked') !== 'cancelled')
+            : collect();
+
+        if ($activeSlots->isNotEmpty()) {
+            $earliestSlot = $activeSlots->sortBy(function($slot) {
                 return $slot->date . ' ' . $slot->start_time;
             })->first();
 
             $vendor = $earliestSlot->vendor;
             $province = $order->property->state ?? $order->property->province ?? $order->province ?? 'BC';
-            $timezone = \App\Services\GoogleCalendarService::resolveTimezoneFromProvince($province, $vendor->timezone ?? $vendor->workHours->first()?->timezone ?? 'America/Vancouver');
+            $timezone = \App\Services\GoogleCalendarService::resolveTimezoneFromProvince($province, $vendor?->timezone ?? $vendor?->workHours?->timezone ?? 'America/Vancouver');
 
-            $bookingTime = Carbon::createFromFormat('Y-m-d H:i:s', "{$earliestSlot->date} {$earliestSlot->start_time}", $timezone);
+            $bookingTime = Carbon::parse("{$earliestSlot->date} {$earliestSlot->start_time}", $timezone);
             $thresholdHours = (int) ($portalSettings['cancellation_threshold_hours'] ?? 24);
             $deadline = $bookingTime->copy()->subHours($thresholdHours);
             
@@ -676,9 +690,9 @@ class OrderCancellationController extends Controller
         if ($slot) {
             $vendor = $slot->vendor;
             $province = $order->property->state ?? $order->property->province ?? $order->province ?? 'BC';
-            $timezone = \App\Services\GoogleCalendarService::resolveTimezoneFromProvince($province, $vendor->timezone ?? $vendor->workHours->first()?->timezone ?? 'America/Vancouver');
+            $timezone = \App\Services\GoogleCalendarService::resolveTimezoneFromProvince($province, $vendor?->timezone ?? $vendor?->workHours?->timezone ?? 'America/Vancouver');
 
-            $bookingTime = Carbon::createFromFormat('Y-m-d H:i:s', "{$slot->date} {$slot->start_time}", $timezone);
+            $bookingTime = Carbon::parse("{$slot->date} {$slot->start_time}", $timezone);
             $thresholdHours = (int) ($portalSettings['cancellation_threshold_hours'] ?? 24);
             $deadline = $bookingTime->copy()->subHours($thresholdHours);
             
@@ -753,7 +767,7 @@ class OrderCancellationController extends Controller
         }
 
         if ($user instanceof \App\Models\SubAccount) {
-            return $user->organization_id === $order->organization_id;
+            return $user->agent_id === $order->agent_id;
         }
 
         return false;

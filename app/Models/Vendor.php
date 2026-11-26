@@ -41,7 +41,8 @@ class Vendor extends Authenticatable
     protected $hidden = [
         'id',
         'password',
-
+        'google_access_token',
+        'google_refresh_token',
     ];
     
     protected $appends = ['avatar_url'];

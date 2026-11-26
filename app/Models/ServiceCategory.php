@@ -13,7 +13,9 @@ class ServiceCategory extends Model
 
     protected $fillable = [
         'uuid',
+        'organization_id',
         'name',
+        'title',
         'type',
         'add_ons',
         'duration',

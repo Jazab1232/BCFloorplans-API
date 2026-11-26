@@ -2,6 +2,7 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Str;
 
 class VendorWorkHour extends Model
 {
@@ -14,6 +15,11 @@ class VendorWorkHour extends Model
     protected $hidden = ['id'];
 
     protected $casts = ['work_days' => 'array'];
+
+    protected $attributes = [
+        'repeat_weekly' => true,
+        'timezone' => 'America/Vancouver',
+    ];
 
     protected static function booted()
     {

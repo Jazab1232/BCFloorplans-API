@@ -60,6 +60,8 @@ class Agent extends Authenticatable
     protected $hidden = [
         'id',
         'password',
+        'google_access_token',
+        'google_refresh_token',
     ];
     protected $attributes = [
         'status' => true,

@@ -299,7 +299,9 @@ class GoogleCalendarController extends Controller
      */
     public function getBusySlots(Request $request, $vendorId)
     {
-        $vendor = Vendor::findOrFail($vendorId);
+        $vendor = Vendor::where('uuid', $vendorId)
+            ->when(is_numeric($vendorId), fn ($q) => $q->orWhere('id', $vendorId))
+            ->firstOrFail();
         
         $startDate = Carbon::parse($request->start_date);
         $endDate = Carbon::parse($request->end_date);
@@ -683,20 +685,26 @@ class GoogleCalendarController extends Controller
             $unsyncedOrdersList = [];
 
             if ($isAgent) {
-                // Find agent orders where any slot in date window lacks agent_google_event_id
+                // Find agent orders where any active slot in date window lacks agent_google_event_id
                 $orders = \App\Models\Order::with(['property', 'slots' => function ($q) use ($startDate, $endDate) {
-                        $q->whereBetween('date', [$startDate->toDateString(), $endDate->toDateString()]);
+                        $q->whereBetween('date', [$startDate->toDateString(), $endDate->toDateString()])
+                          ->where(function ($sq) {
+                              $sq->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                          });
                     }, 'slots.service', 'slots.vendor'])
                     ->where('agent_id', $model->id)
                     ->where('order_status', '!=', 'Cancelled')
                     ->whereHas('slots', function ($q) use ($startDate, $endDate) {
                         $q->whereBetween('date', [$startDate->toDateString(), $endDate->toDateString()])
+                          ->where(function ($sq) {
+                              $sq->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                          })
                           ->whereNull('agent_google_event_id');
                     })
                     ->get();
 
                 foreach ($orders as $order) {
-                    $unsyncedSlots = $order->slots->filter(fn($s) => empty($s->agent_google_event_id));
+                    $unsyncedSlots = $order->slots->filter(fn($s) => ($s->status ?? 'booked') !== 'cancelled' && empty($s->agent_google_event_id));
                     if ($unsyncedSlots->isEmpty()) continue;
 
                     $earliestStart = $unsyncedSlots->map(fn($s) => Carbon::parse($s->date . ' ' . $s->start_time))->min();
@@ -715,21 +723,27 @@ class GoogleCalendarController extends Controller
                     ];
                 }
             } elseif ($isVendor) {
-                // Find vendor slots in date window where google_event_id is null
+                // Find vendor active slots in date window where google_event_id is null
                 $orders = \App\Models\Order::with(['property', 'slots' => function ($q) use ($model, $startDate, $endDate) {
                         $q->where('vendor_id', $model->id)
-                          ->whereBetween('date', [$startDate->toDateString(), $endDate->toDateString()]);
+                          ->whereBetween('date', [$startDate->toDateString(), $endDate->toDateString()])
+                          ->where(function ($sq) {
+                              $sq->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                          });
                     }, 'slots.service'])
                     ->where('order_status', '!=', 'Cancelled')
                     ->whereHas('slots', function ($q) use ($model, $startDate, $endDate) {
                         $q->where('vendor_id', $model->id)
                           ->whereBetween('date', [$startDate->toDateString(), $endDate->toDateString()])
+                          ->where(function ($sq) {
+                              $sq->whereNull('status')->orWhere('status', '!=', 'cancelled');
+                          })
                           ->whereNull('google_event_id');
                     })
                     ->get();
 
                 foreach ($orders as $order) {
-                    $vendorSlots = $order->slots->filter(fn($s) => $s->vendor_id == $model->id && empty($s->google_event_id));
+                    $vendorSlots = $order->slots->filter(fn($s) => $s->vendor_id == $model->id && ($s->status ?? 'booked') !== 'cancelled' && empty($s->google_event_id));
                     if ($vendorSlots->isEmpty()) continue;
 
                     $earliestStart = $vendorSlots->map(fn($s) => Carbon::parse($s->date . ' ' . $s->start_time))->min();
@@ -795,6 +809,30 @@ class GoogleCalendarController extends Controller
             }
 
             $orderIds = array_unique($request->order_ids);
+
+            // Enforce ownership of every requested order
+            foreach ($orderIds as $orderId) {
+                $targetOrder = \App\Models\Order::with('slots')->find($orderId);
+                if (!$targetOrder) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Order not found.'
+                    ], 404);
+                }
+                if ($model instanceof Agent && (int)$targetOrder->agent_id !== (int)$model->id) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Unauthorized: You do not own one or more requested orders.'
+                    ], 403);
+                }
+                if ($model instanceof Vendor && !$targetOrder->slots->contains('vendor_id', $model->id)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Unauthorized: You are not assigned to one or more requested orders.'
+                    ], 403);
+                }
+            }
+
             $totalOrders = count($orderIds);
             $syncResults = [];
             $failedOrders = [];
