@@ -7,11 +7,12 @@ use App\Models\Order;
 use App\Models\OrderService;
 use App\Models\OrderSlot;
 use App\Models\Organization;
+use App\Models\Permission;
 use App\Models\ProductOption;
 use App\Models\Property;
+use App\Models\Role;
 use App\Models\Service;
 use App\Models\ServiceCategory;
-use App\Models\Setting;
 use App\Models\User;
 use App\Models\Vendor;
 use App\Models\VendorAddress;
@@ -19,60 +20,87 @@ use App\Models\VendorBreak;
 use App\Models\VendorService;
 use App\Models\VendorSetting;
 use App\Models\VendorWorkHour;
+use App\Services\SettingsService;
 use Carbon\Carbon;
 use Illuminate\Database\Seeder;
-use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
-/**
- * Deterministic E2E Test Data Seeder for the 32 Frontend UI Tests (Playwright / Puppeteer).
- *
- * Usage on a disposable test database:
- *   php artisan migrate:fresh --seeder=BookingE2ESeeder
- *
- * Credentials seeded:
- *   Admin:  admin@e2e.test   / Password123!
- *   Agent:  agent@e2e.test   / Password123!
- *   Vendor: vendora@e2e.test / Password123!
- */
 class BookingE2ESeeder extends Seeder
 {
     public function run(): void
     {
+        $password = bcrypt('Password123!');
         $tz = 'America/Vancouver';
-        $today = Carbon::now($tz);
-        $targetDate = $today->copy()->addDays(5)->toDateString();      // T+5 days
-        $pastDate = $today->copy()->subDays(5)->toDateString();        // T-5 days (for UI-12 Admin past order)
-        $multiDayStart = $today->copy()->addDays(10)->toDateString();  // T+10..T+12 (for UI-26 multi-day break)
-        $multiDayEnd = $today->copy()->addDays(12)->toDateString();
+        $nowVan = Carbon::now($tz);
+        $dateT5 = $nowVan->copy()->addDays(5)->toDateString();
+        $datePast = $nowVan->copy()->subDays(5)->toDateString();
+        $dateT10 = $nowVan->copy()->addDays(10)->toDateString();
+        $dateT12 = $nowVan->copy()->addDays(12)->toDateString();
 
-        // 1. Organization
+        // Ensure Passport personal access clients exist for users, agents & vendors so /api/login works after migrate:fresh
+        if (DB::table('oauth_clients')->count() === 0) {
+            foreach (['users', 'agents', 'vendors'] as $provider) {
+                Artisan::call('passport:client', [
+                    '--personal' => true,
+                    '--provider' => $provider,
+                    '--name' => "BCF E2E {$provider} Personal Client",
+                    '--no-interaction' => true,
+                ]);
+            }
+        }
+
+        // 1. Organization + Portal Settings
         $org = Organization::create([
             'uuid' => Str::uuid()->toString(),
             'name' => 'BCF E2E Test Org',
-            'slug' => 'bcf-e2e-org',
+            'slug' => 'bcf-e2e-test-org',
+            'is_active' => true,
         ]);
 
-        // Portal Settings (enable allow_booking_through_lunch for UI-11)
-        Setting::create([
-            'uuid' => Str::uuid()->toString(),
-            'org_id' => $org->uuid,
-            'key' => 'portal_settings',
-            'value' => [
-                'cancellation_threshold_hours' => 24,
-                'cancellation_fee_percentage' => 25.00,
-                'allow_cancel_after_threshold' => true,
-                'allow_booking_through_lunch' => true,
-                'show_org_details_on_empty_schedule' => false,
-                'disable_next_day_booking' => false,
-                'booking_cutoff_time' => '17:00',
-            ],
-        ]);
+        // 2. Roles, Permissions, Admin & Agent
+        $adminRole = Role::firstOrCreate(['name' => 'admin']);
+        $agentRole = Role::firstOrCreate(['name' => 'agent']);
 
-        // 2. Admin & Agent Accounts
-        $password = Hash::make('Password123!');
+        $permissionNames = [
+            'Access Billing',
+            'Receive Notifications',
+            'Create Orders',
+            'Edit Orders',
+            'Book Appointments',
+            'Create Vendor',
+            'Update Vendor',
+            'Create Agent',
+            'Create Admin',
+            'View Admin',
+            'Create Services',
+            'View Orders',
+            'View Appointments',
+            'Edit Appointments',
+            'Set Discounts',
+            'Create Listing',
+            'View Listing',
+            'View Services',
+            'Create Tour Settings',
+            'Access Vendor Billing',
+            'View Vendor',
+            'View Agent',
+            'View All Orders',
+            'View Only Orders For Co-Agent',
+            'Create Sub-Accounts',
+            'View All Appointments',
+            'View Only Appointments For Co-Agent',
+            'Print Requests',
+        ];
 
-        User::create([
+        $permissionIds = [];
+        foreach ($permissionNames as $permName) {
+            $permissionIds[] = Permission::firstOrCreate(['name' => $permName])->id;
+        }
+        $adminRole->permissions()->syncWithoutDetaching($permissionIds);
+
+        $admin = User::create([
             'uuid' => Str::uuid()->toString(),
             'organization_id' => $org->id,
             'first_name' => 'E2E',
@@ -80,10 +108,38 @@ class BookingE2ESeeder extends Seeder
             'email' => 'admin@e2e.test',
             'password' => $password,
         ]);
+        $admin->roles()->syncWithoutDetaching([$adminRole->id]);
+        $admin->permissions()->syncWithoutDetaching($permissionIds);
+
+        app(SettingsService::class)->set($org->uuid, 'portal_settings', [
+            'show_org_details_on_empty_schedule' => false,
+            'disable_next_day_booking' => false,
+            'booking_cutoff_time' => '17:00',
+            'allow_print_request' => true,
+            'allow_booking_through_lunch' => true,
+        ], $admin->uuid);
+
+        $defaultTheme = [
+            'pageBg' => '#FFFFFF',
+            'pageText' => '#6D6D6D',
+            'pageTabColor' => '#4290E9',
+            'activeColor' => '#4290E9',
+            'sidebarBg' => '#F3F4F6',
+            'sidebarText' => '#4B5563',
+            'sidebarHoverBg' => '#E5E7EB',
+            'sidebarHoverText' => '#6D6D6D',
+        ];
+        app(SettingsService::class)->set($org->uuid, 'white_label_styles', [
+            'admin' => $defaultTheme,
+            'agent' => $defaultTheme,
+            'vendor' => $defaultTheme,
+            'co_agent' => $defaultTheme,
+        ], $admin->uuid);
 
         $agent = Agent::create([
             'uuid' => Str::uuid()->toString(),
             'organization_id' => $org->id,
+            'role_id' => $agentRole->id,
             'first_name' => 'E2E',
             'last_name' => 'Agent',
             'email' => 'agent@e2e.test',
@@ -92,149 +148,119 @@ class BookingE2ESeeder extends Seeder
         ]);
 
         // 3. Vendors
-        // Downtown Vancouver polygon (covers 100 Robson St, Vancouver)
-        $vancouverPolygon = json_encode([
-            ['lat' => 49.3200, 'lng' => -123.2000],
-            ['lat' => 49.3200, 'lng' => -123.0200],
+        $vancouverPolygon = [
+            ['lat' => 49.3000, 'lng' => -123.2200],
+            ['lat' => 49.3000, 'lng' => -123.0200],
             ['lat' => 49.2000, 'lng' => -123.0200],
-            ['lat' => 49.2000, 'lng' => -123.2000],
-        ]);
+            ['lat' => 49.2000, 'lng' => -123.2200],
+        ];
 
-        // Surrey-only polygon (excludes Downtown Vancouver -> out-of-area test UI-06 / UI-07)
-        $surreyPolygon = json_encode([
-            ['lat' => 49.2000, 'lng' => -122.9000],
-            ['lat' => 49.2000, 'lng' => -122.7000],
-            ['lat' => 49.0500, 'lng' => -122.7000],
-            ['lat' => 49.0500, 'lng' => -122.9000],
-        ]);
+        $surreyPolygon = [
+            ['lat' => 49.2200, 'lng' => -122.9000],
+            ['lat' => 49.2200, 'lng' => -122.7000],
+            ['lat' => 49.0800, 'lng' => -122.7000],
+            ['lat' => 49.0800, 'lng' => -122.9000],
+        ];
 
-        // Vendor A: Primary in-area Vancouver vendor (Mon-Fri 09:00-17:00, lunch 12:00-13:00, Sat/Sun OFF)
-        $vendorA = Vendor::create([
+        $victor = Vendor::create([
             'uuid' => Str::uuid()->toString(),
             'organization_id' => $org->id,
             'first_name' => 'Victor',
             'last_name' => 'Alpha',
             'email' => 'vendora@e2e.test',
+            'primary_phone' => '604-555-0101',
             'password' => $password,
             'status' => true,
-            'coordinates' => $vancouverPolygon,
-            'sync_google_calendar' => true,
+            'coordinates' => json_encode($vancouverPolygon),
         ]);
 
-        // Vendor B: Out-of-area vendor (Surrey polygon, force_service_area = false -> overridable by Admin)
-        $vendorB = Vendor::create([
-            'uuid' => Str::uuid()->toString(),
-            'organization_id' => $org->id,
-            'first_name' => 'Vanessa',
-            'last_name' => 'Beta',
-            'email' => 'vendorb@e2e.test',
-            'password' => $password,
-            'status' => true,
-            'coordinates' => $surreyPolygon,
-            'sync_google_calendar' => false,
-        ]);
-
-        // Vendor C: In-area vendor with NO start_location configured (for UI-22)
-        $vendorC = Vendor::create([
-            'uuid' => Str::uuid()->toString(),
-            'organization_id' => $org->id,
-            'first_name' => 'Charlie',
-            'last_name' => 'NoAddress',
-            'email' => 'vendorc@e2e.test',
-            'password' => $password,
-            'status' => true,
-            'coordinates' => $vancouverPolygon,
-            'sync_google_calendar' => false,
-        ]);
-
-        // Vendor Settings
-        VendorSetting::create([
-            'uuid' => Str::uuid()->toString(),
-            'vendor_id' => $vendorA->id,
-            'payment_per_km' => 1.25,
-            'enable_service_area' => true,
-            'force_service_area' => false,
-            'is_kilometers' => true,
-            'next_booking_slot_only' => false,
-        ]);
-
-        VendorSetting::create([
-            'uuid' => Str::uuid()->toString(),
-            'vendor_id' => $vendorB->id,
-            'payment_per_km' => 1.50,
-            'enable_service_area' => true,
-            'force_service_area' => false, // Hidden for Agent, overridable by Admin
-            'is_kilometers' => true,
-            'next_booking_slot_only' => false,
-        ]);
-
-        VendorSetting::create([
-            'uuid' => Str::uuid()->toString(),
-            'vendor_id' => $vendorC->id,
-            'payment_per_km' => 1.00,
-            'enable_service_area' => true,
-            'force_service_area' => false,
-            'is_kilometers' => true,
-            'next_booking_slot_only' => false,
-        ]);
-
-        // Vendor Addresses (Vendor C intentionally omitted for UI-22!)
         VendorAddress::create([
             'uuid' => Str::uuid()->toString(),
-            'vendor_id' => $vendorA->id,
+            'vendor_id' => $victor->id,
             'type' => 'start_location',
-            'address_line_1' => '800 W Georgia St',
+            'address_line_1' => '555 W Hastings St',
             'city' => 'Vancouver',
             'province' => 'BC',
             'country' => 'Canada',
         ]);
 
+        VendorSetting::create([
+            'uuid' => Str::uuid()->toString(),
+            'vendor_id' => $victor->id,
+            'enable_service_area' => true,
+            'force_service_area' => true,
+            'is_kilometers' => true,
+        ]);
+
+        $this->seedWorkHours($victor, $tz, satSunOff: true);
+
+        $vanessa = Vendor::create([
+            'uuid' => Str::uuid()->toString(),
+            'organization_id' => $org->id,
+            'first_name' => 'Vanessa',
+            'last_name' => 'Beta',
+            'email' => 'vendorb@e2e.test',
+            'primary_phone' => '604-555-0102',
+            'password' => $password,
+            'status' => true,
+            'coordinates' => json_encode($surreyPolygon),
+        ]);
+
         VendorAddress::create([
             'uuid' => Str::uuid()->toString(),
-            'vendor_id' => $vendorB->id,
+            'vendor_id' => $vanessa->id,
             'type' => 'start_location',
-            'address_line_1' => '10153 King George Blvd',
+            'address_line_1' => '10250 152 St',
             'city' => 'Surrey',
             'province' => 'BC',
             'country' => 'Canada',
         ]);
 
-        // Vendor Work Hours (Mon-Fri 09:00-17:00, lunch 12:00-13:00, Sat/Sun is_off = true for UI-28)
-        $workDays = [
-            ['day' => 'mon', 'start_time' => '09:00', 'end_time' => '17:00', 'is_off' => false, 'is_twilight' => true],
-            ['day' => 'tue', 'start_time' => '09:00', 'end_time' => '17:00', 'is_off' => false, 'is_twilight' => true],
-            ['day' => 'wed', 'start_time' => '09:00', 'end_time' => '17:00', 'is_off' => false, 'is_twilight' => true],
-            ['day' => 'thu', 'start_time' => '09:00', 'end_time' => '17:00', 'is_off' => false, 'is_twilight' => true],
-            ['day' => 'fri', 'start_time' => '09:00', 'end_time' => '17:00', 'is_off' => false, 'is_twilight' => true],
-            ['day' => 'sat', 'start_time' => '09:00', 'end_time' => '17:00', 'is_off' => true,  'is_twilight' => false],
-            ['day' => 'sun', 'start_time' => '09:00', 'end_time' => '17:00', 'is_off' => true,  'is_twilight' => false],
-        ];
-
-        foreach ([$vendorA, $vendorB, $vendorC] as $v) {
-            VendorWorkHour::create([
-                'uuid' => Str::uuid()->toString(),
-                'vendor_id' => $v->id,
-                'start_time' => '09:00',
-                'end_time' => '17:00',
-                'work_days' => $workDays,
-                'repeat_weekly' => true,
-                'break_start' => '12:00',
-                'break_end' => '13:00',
-                'commute_minutes' => 15,
-                'timezone' => $tz,
-            ]);
-        }
-
-        // 4. Service Categories & Services
-        $photoCat = ServiceCategory::create([
+        VendorSetting::create([
             'uuid' => Str::uuid()->toString(),
-            'organization_id' => $org->id,
-            'title' => 'Photography',
-            'type' => 'service',
+            'vendor_id' => $vanessa->id,
+            'enable_service_area' => true,
+            'force_service_area' => false,
+            'is_kilometers' => true,
         ]);
 
-        // Standard 60-min service (travel required)
-        $svcPhoto = Service::create([
+        $this->seedWorkHours($vanessa, $tz, satSunOff: false);
+
+        $charlie = Vendor::create([
+            'uuid' => Str::uuid()->toString(),
+            'organization_id' => $org->id,
+            'first_name' => 'Charlie',
+            'last_name' => 'NoAddress',
+            'email' => 'vendorc@e2e.test',
+            'primary_phone' => '604-555-0103',
+            'password' => $password,
+            'status' => true,
+        ]);
+
+        VendorSetting::create([
+            'uuid' => Str::uuid()->toString(),
+            'vendor_id' => $charlie->id,
+            'enable_service_area' => false,
+            'force_service_area' => false,
+            'is_kilometers' => true,
+        ]);
+
+        $this->seedWorkHours($charlie, $tz, satSunOff: false);
+
+        // 4. Categories & Services
+        $photoCat = ServiceCategory::create([
+            'uuid' => Str::uuid()->toString(),
+            'name' => 'Photography',
+            'type' => ['area'],
+        ]);
+
+        $twilightCat = ServiceCategory::create([
+            'uuid' => Str::uuid()->toString(),
+            'name' => 'Twilight Photos',
+            'type' => ['fixed'],
+        ]);
+
+        $svcPhotos = Service::create([
             'uuid' => Str::uuid()->toString(),
             'organization_id' => $org->id,
             'category_id' => $photoCat->id,
@@ -247,7 +273,6 @@ class BookingE2ESeeder extends Seeder
             'increment_sq_ft' => 1000,
         ]);
 
-        // Dynamic SqFt service (for UI-04: 45m base up to 1500sqft, +30m per 1000sqft -> 3500sqft = 105m)
         $svcFloorPlan = Service::create([
             'uuid' => Str::uuid()->toString(),
             'organization_id' => $org->id,
@@ -261,8 +286,7 @@ class BookingE2ESeeder extends Seeder
             'increment_sq_ft' => 1000,
         ]);
 
-        // Non-travel service (for UI-20: is_travel_required = false)
-        $svcVirtual = Service::create([
+        $svcNoTravel = Service::create([
             'uuid' => Str::uuid()->toString(),
             'organization_id' => $org->id,
             'category_id' => $photoCat->id,
@@ -270,43 +294,53 @@ class BookingE2ESeeder extends Seeder
             'status' => true,
             'is_travel_required' => false,
             'base_duration_mins' => 30,
+            'base_sq_ft' => 2000,
+            'increment_duration_mins' => 15,
+            'increment_sq_ft' => 1000,
         ]);
 
-        // Twilight service
         $svcTwilight = Service::create([
             'uuid' => Str::uuid()->toString(),
             'organization_id' => $org->id,
-            'category_id' => $photoCat->id,
+            'category_id' => $twilightCat->id,
             'name' => 'E2E Twilight Shoot',
-            'type' => 'twilight',
             'status' => true,
             'is_travel_required' => true,
             'base_duration_mins' => 60,
+            'base_sq_ft' => 2000,
+            'increment_duration_mins' => 30,
+            'increment_sq_ft' => 1000,
         ]);
 
-        // Product Options
-        foreach ([$svcPhoto, $svcFloorPlan, $svcVirtual, $svcTwilight] as $svc) {
+        $services = [$svcPhotos, $svcFloorPlan, $svcNoTravel, $svcTwilight];
+        foreach ($services as $svc) {
             ProductOption::create([
-                'uuid' => Str::uuid()->toString(),
                 'service_id' => $svc->id,
-                'title' => 'Standard Package',
-                'amount' => 200.00,
+                'title' => 'Standard',
+                'quantity' => 1,
+                'sq_ft_range' => '0-10000',
+                'amount' => 250.00,
+                'min_price' => 250.00,
                 'service_duration' => $svc->base_duration_mins,
+                'base_duration_mins' => $svc->base_duration_mins,
+                'base_sq_ft' => $svc->base_sq_ft,
+                'increment_duration_mins' => $svc->increment_duration_mins,
+                'increment_sq_ft' => $svc->increment_sq_ft,
             ]);
 
-            foreach ([$vendorA, $vendorB, $vendorC] as $v) {
+            foreach ([$victor, $vanessa, $charlie] as $vendor) {
                 VendorService::create([
-                    'uuid' => Str::uuid()->toString(),
-                    'vendor_id' => $v->id,
+                    'vendor_id' => $vendor->id,
                     'service_id' => $svc->id,
                     'status' => true,
+                    'pay_type' => 'fixed',
                     'vendor_price' => 100.00,
                 ]);
             }
         }
 
         // 5. Properties
-        $propVancouver = Property::create([
+        $propVan = new Property([
             'organization_id' => $org->id,
             'agent_id' => $agent->id,
             'address' => '100 Robson St',
@@ -315,180 +349,164 @@ class BookingE2ESeeder extends Seeder
             'postal_code' => 'V6B 2A7',
             'country' => 'Canada',
             'square_footage' => 2000,
-            'latitude' => 49.2775,
-            'longitude' => -123.1128,
         ]);
+        $propVan->user_id = $admin->id;
+        $propVan->save();
 
-        $propBurnaby = Property::create([
+        $propLarge = new Property([
             'organization_id' => $org->id,
             'agent_id' => $agent->id,
-            'address' => '100 Robson St', // Same street prefix, different city (UI-19)
-            'city' => 'Burnaby',
+            'address' => '200 Granville St',
+            'city' => 'Vancouver',
             'province' => 'BC',
-            'postal_code' => 'V5H 2A1',
+            'postal_code' => 'V6C 1S4',
+            'country' => 'Canada',
+            'square_footage' => 3500,
+        ]);
+        $propLarge->user_id = $admin->id;
+        $propLarge->save();
+
+        $propClean = new Property([
+            'organization_id' => $org->id,
+            'agent_id' => $agent->id,
+            'address' => '300 Burrard St',
+            'city' => 'Vancouver',
+            'province' => 'BC',
+            'postal_code' => 'V6C 2G8',
             'country' => 'Canada',
             'square_footage' => 2000,
-            'latitude' => 49.2276,
-            'longitude' => -123.0076,
         ]);
+        $propClean->user_id = $admin->id;
+        $propClean->save();
 
-        // 6. Seeded Orders & Slots
-        // (a) Active booking on T+5 at 10:00-11:00 for Vendor A (UI-01, UI-05, UI-08, UI-16, UI-17, UI-20)
-        $activeOrder = Order::create([
-            'uuid' => Str::uuid()->toString(),
-            'organization_id' => $org->id,
-            'agent_id' => $agent->id,
-            'property_id' => $propVancouver->id,
-            'amount' => 200.00,
-            'order_status' => 'Processing',
-            'payment_status' => 'UNPAID',
-        ]);
-        OrderService::create([
-            'uuid' => Str::uuid()->toString(),
-            'order_id' => $activeOrder->id,
-            'service_id' => $svcPhoto->id,
-            'amount' => 200.00,
-            'vendor_id' => $vendorA->uuid,
-            'status' => 'active',
-        ]);
-        OrderSlot::create([
-            'order_id' => $activeOrder->id,
-            'service_id' => $svcPhoto->id,
-            'vendor_id' => $vendorA->id,
-            'date' => $targetDate,
-            'start_time' => '10:00:00',
-            'end_time' => '11:00:00',
-            'address' => '100 Robson St, Vancouver, BC',
-            'status' => 'booked',
-        ]);
-
-        // (b) Cancelled booking on T+5 at 14:00-15:00 for Vendor A (UI-16)
-        $cancelledOrder = Order::create([
-            'uuid' => Str::uuid()->toString(),
-            'organization_id' => $org->id,
-            'agent_id' => $agent->id,
-            'property_id' => $propBurnaby->id,
-            'amount' => 200.00,
-            'order_status' => 'Cancelled',
-            'payment_status' => 'UNPAID',
-        ]);
-        OrderService::create([
-            'uuid' => Str::uuid()->toString(),
-            'order_id' => $cancelledOrder->id,
-            'service_id' => $svcPhoto->id,
-            'amount' => 200.00,
-            'vendor_id' => $vendorA->uuid,
-            'status' => 'cancelled',
-        ]);
-        OrderSlot::create([
-            'order_id' => $cancelledOrder->id,
-            'service_id' => $svcPhoto->id,
-            'vendor_id' => $vendorA->id,
-            'date' => $targetDate,
-            'start_time' => '14:00:00',
-            'end_time' => '15:00:00',
-            'address' => '100 Robson St, Burnaby, BC',
-            'status' => 'cancelled',
-        ]);
-
-        // (c) Past-dated order on T-5 for Admin edit test (UI-12)
-        $pastOrder = Order::create([
-            'uuid' => Str::uuid()->toString(),
-            'organization_id' => $org->id,
-            'agent_id' => $agent->id,
-            'property_id' => $propVancouver->id,
-            'amount' => 200.00,
-            'order_status' => 'Processing',
-            'payment_status' => 'UNPAID',
-        ]);
-        OrderService::create([
-            'uuid' => Str::uuid()->toString(),
-            'order_id' => $pastOrder->id,
-            'service_id' => $svcPhoto->id,
-            'amount' => 200.00,
-            'vendor_id' => $vendorA->uuid,
-            'status' => 'active',
-        ]);
-        OrderSlot::create([
-            'order_id' => $pastOrder->id,
-            'service_id' => $svcPhoto->id,
-            'vendor_id' => $vendorA->id,
-            'date' => $pastDate,
-            'start_time' => '10:00:00',
-            'end_time' => '11:00:00',
-            'address' => '100 Robson St, Vancouver, BC',
-            'status' => 'booked',
-        ]);
-
-        // (d) Today's future slot (now + 3h in Vancouver, capped at 21:00) for UI-31 (isSlotPast UTC bug)
-        $laterToday = $today->copy()->addHours(3);
-        if ($laterToday->toDateString() === $today->toDateString() && $laterToday->hour <= 21) {
-            $todayOrder = Order::create([
-                'uuid' => Str::uuid()->toString(),
-                'organization_id' => $org->id,
-                'agent_id' => $agent->id,
-                'property_id' => $propVancouver->id,
-                'amount' => 200.00,
-                'order_status' => 'Processing',
-                'payment_status' => 'UNPAID',
-            ]);
-            OrderService::create([
-                'uuid' => Str::uuid()->toString(),
-                'order_id' => $todayOrder->id,
-                'service_id' => $svcPhoto->id,
-                'amount' => 200.00,
-                'vendor_id' => $vendorA->uuid,
-                'status' => 'active',
-            ]);
-            OrderSlot::create([
-                'order_id' => $todayOrder->id,
-                'service_id' => $svcPhoto->id,
-                'vendor_id' => $vendorA->id,
-                'date' => $today->toDateString(),
-                'start_time' => $laterToday->format('H:00:00'),
-                'end_time' => $laterToday->copy()->addHour()->format('H:00:00'),
-                'address' => '100 Robson St, Vancouver, BC',
-                'status' => 'booked',
-            ]);
-        }
-
-        // 7. Vendor Breaks
-        // (a) One-time break on T+5 at 15:30-16:30 (UI-25: must NOT block T+6!)
-        VendorBreak::create([
-            'uuid' => Str::uuid()->toString(),
-            'vendor_id' => $vendorA->id,
-            'title' => 'E2E One-Time Dentist',
-            'date' => $targetDate,
-            'start_date' => $targetDate,
-            'end_date' => $targetDate,
-            'start_time' => '15:30:00',
-            'end_time' => '16:30:00',
-        ]);
-
-        // (b) Multi-day time-off on T+10..T+12 (UI-26 & UI-27)
-        VendorBreak::create([
-            'uuid' => Str::uuid()->toString(),
-            'vendor_id' => $vendorA->id,
-            'title' => 'E2E Multi-Day Vacation',
-            'date' => $multiDayStart,
-            'start_date' => $multiDayStart,
-            'end_date' => $multiDayEnd,
-            'start_time' => '09:00:00',
-            'end_time' => '15:00:00',
-        ]);
-
-        $this->command?->info('BookingE2ESeeder completed successfully!');
-        $this->command?->table(
-            ['Entity', 'Identifier / Value'],
-            [
-                ['Admin Login', 'admin@e2e.test / Password123!'],
-                ['Agent Login', 'agent@e2e.test / Password123!'],
-                ['Vendor A (Vancouver)', $vendorA->uuid],
-                ['Vendor B (Surrey / Out-of-Area)', $vendorB->uuid],
-                ['Vendor C (No start_location)', $vendorC->uuid],
-                ['Target Date (T+5)', $targetDate],
-                ['Past Order UUID (UI-12)', $pastOrder->uuid],
-            ]
+        // 6. Orders & Slots
+        // Active booking on T+5 (10:00-11:00)
+        $this->createOrderWithSlot(
+            $org, $agent, $propVan, $svcPhotos, $victor,
+            $dateT5, '10:00:00', '11:00:00', 'Processing', 'booked'
         );
+
+        // Cancelled booking on T+5 (14:00-15:00)
+        $this->createOrderWithSlot(
+            $org, $agent, $propVan, $svcPhotos, $victor,
+            $dateT5, '14:00:00', '15:00:00', 'Cancelled', 'cancelled'
+        );
+
+        // Past order on T-5 (10:00-11:00)
+        $this->createOrderWithSlot(
+            $org, $agent, $propVan, $svcPhotos, $victor,
+            $datePast, '10:00:00', '11:00:00', 'Completed', 'booked'
+        );
+
+        // Later-today slot (now + 3h in Vancouver, capped before 22:00)
+        $laterStart = $nowVan->copy()->addHours(3)->minute(0)->second(0);
+        if ($laterStart->hour >= 22) {
+            $laterStart = $nowVan->copy()->addDay()->hour(10)->minute(0)->second(0);
+        }
+        $laterEnd = $laterStart->copy()->addHour();
+        $this->createOrderWithSlot(
+            $org, $agent, $propVan, $svcPhotos, $victor,
+            $laterStart->toDateString(),
+            $laterStart->format('H:i:s'),
+            $laterEnd->format('H:i:s'),
+            'Processing',
+            'booked'
+        );
+
+        // 7. Breaks & Multi-day Time-Off
+        VendorBreak::create([
+            'vendor_id' => $victor->id,
+            'title' => 'E2E One-Time Break',
+            'date' => $dateT5,
+            'start_date' => $dateT5,
+            'end_date' => $dateT5,
+            'start_time' => '15:30',
+            'end_time' => '16:30',
+            'address' => 'Vancouver, BC',
+        ]);
+
+        VendorBreak::create([
+            'vendor_id' => $victor->id,
+            'title' => 'E2E Multi-Day Time Off',
+            'date' => $dateT10,
+            'start_date' => $dateT10,
+            'end_date' => $dateT12,
+            'start_time' => '00:00',
+            'end_time' => '23:59',
+            'address' => 'Vancouver, BC',
+        ]);
+    }
+
+    protected function seedWorkHours(Vendor $vendor, string $timezone, bool $satSunOff): void
+    {
+        $days = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+        $workDays = array_map(fn ($day) => [
+            'day' => $day,
+            'start_time' => '09:00',
+            'end_time' => '17:00',
+            'is_off' => $satSunOff && in_array($day, ['sat', 'sun'], true),
+            'is_twilight' => true,
+        ], $days);
+
+        VendorWorkHour::create([
+            'uuid' => Str::uuid()->toString(),
+            'vendor_id' => $vendor->id,
+            'start_time' => '09:00',
+            'end_time' => '17:00',
+            'work_days' => $workDays,
+            'repeat_weekly' => true,
+            'break_start' => '12:00',
+            'break_end' => '13:00',
+            'commute_minutes' => 15,
+            'timezone' => $timezone,
+        ]);
+    }
+
+    protected function createOrderWithSlot(
+        Organization $org,
+        Agent $agent,
+        Property $property,
+        Service $service,
+        Vendor $vendor,
+        string $date,
+        string $startTime,
+        string $endTime,
+        string $orderStatus,
+        string $slotStatus
+    ): Order {
+        $order = Order::create([
+            'uuid' => Str::uuid()->toString(),
+            'organization_id' => $org->id,
+            'agent_id' => $agent->id,
+            'property_id' => $property->id,
+            'property_address' => "{$property->address}, {$property->city}, {$property->province}, {$property->country}",
+            'amount' => 250.00,
+            'order_status' => $orderStatus,
+            'payment_status' => 'UNPAID',
+        ]);
+
+        OrderService::create([
+            'uuid' => Str::uuid()->toString(),
+            'order_id' => $order->id,
+            'service_id' => $service->id,
+            'vendor_id' => $vendor->uuid,
+            'amount' => 250.00,
+            'payment_status' => 'UNPAID',
+            'status' => $orderStatus,
+        ]);
+
+        OrderSlot::create([
+            'uuid' => Str::uuid()->toString(),
+            'order_id' => $order->id,
+            'service_id' => $service->id,
+            'vendor_id' => $vendor->id,
+            'date' => $date,
+            'start_time' => $startTime,
+            'end_time' => $endTime,
+            'address' => "{$property->address}, {$property->city}, {$property->province}, {$property->country}",
+            'status' => $slotStatus,
+        ]);
+
+        return $order;
     }
 }

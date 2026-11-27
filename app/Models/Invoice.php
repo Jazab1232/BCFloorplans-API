@@ -1306,7 +1306,11 @@ class Invoice extends Model
              $hasItems = false;
              $paidServiceIdsForAgent = collect();
 
-             if (!empty($invoice->split_details['splits'])) {
+             $isSplitInvoice = (bool) $order->split_invoice
+                 || !empty($invoice->split_details['splits'])
+                 || in_array($invoice->agent_type, ['co-agent', 'co_agent'], true);
+
+             if ($isSplitInvoice && $invoice->agent_id) {
                  $paidServiceIdsForAgent = InvoiceItem::where('is_extra', false)
                      ->whereNotNull('order_service_id')
                      ->whereHas('invoice', function ($query) use ($invoice) {
@@ -1342,7 +1346,7 @@ class Invoice extends Model
                      || (float)$item->refunded_amount > 0
                      || ($invoice->status === 'refunded')
                      || ($order->payment_status === 'REFUNDED');
-                 $servicePaidForInvoiceOwner = !empty($invoice->split_details['splits'])
+                 $servicePaidForInvoiceOwner = ($isSplitInvoice && $invoice->agent_id)
                      ? ($item->order_service_id && $paidServiceIdsForAgent->contains($item->order_service_id))
                      : ($item->orderService && $item->orderService->payment_status === 'PAID');
 
@@ -1389,9 +1393,9 @@ class Invoice extends Model
              } else {
                  // Check if there are actual payments on sibling service invoices for the paid services
                  $paidOrderServiceIds = $invoice->items
-                     ->filter(function($item) use ($invoice, $paidServiceIdsForAgent) {
+                     ->filter(function($item) use ($invoice, $paidServiceIdsForAgent, $isSplitInvoice) {
                          if (!$item->order_service_id) return false;
-                         return !empty($invoice->split_details['splits'])
+                         return ($isSplitInvoice && $invoice->agent_id)
                              ? $paidServiceIdsForAgent->contains($item->order_service_id)
                              : ($item->orderService && $item->orderService->payment_status === 'PAID');
                      })
@@ -1401,28 +1405,38 @@ class Invoice extends Model
 
                  $actualServicePayments = 0;
                  if (!empty($paidOrderServiceIds)) {
-                     // 1. Direct payments explicitly assigned to these order services
-                     $servicePayments = AgentPayment::where('order_id', $invoice->order_id)
+                     // 1. Direct payments explicitly assigned to these order services (scoped to invoice owner on split orders)
+                     $servicePaymentsQuery = AgentPayment::where('order_id', $invoice->order_id)
                          ->whereIn('order_service_id', $paidOrderServiceIds)
                          ->where('status', 'succeeded')
-                         ->where('payment_type', '!=', 'refund')
-                         ->get()
+                         ->where('payment_type', '!=', 'refund');
+
+                     if ($isSplitInvoice && $invoice->agent_id) {
+                         $servicePaymentsQuery->where('agent_id', $invoice->agent_id);
+                     }
+
+                     $servicePayments = $servicePaymentsQuery->get()
                          ->unique(fn($p) => $p->stripe_session_id ?: ($p->stripe_payment_intent_id ?: $p->id));
 
                      $coveredServiceIds = $servicePayments->pluck('order_service_id')->filter()->unique()->toArray();
                      $actualServicePayments += (float) $servicePayments->sum('amount');
 
-                     // 2. For paid services not covered by direct order_service_id payments, sum from sibling service invoices
+                     // 2. For paid services not covered by direct order_service_id payments, sum from sibling service invoices of the SAME agent
                      $uncoveredServiceIds = array_diff($paidOrderServiceIds, $coveredServiceIds);
                      if (!empty($uncoveredServiceIds)) {
-                         $siblingInvoices = static::where('order_id', $invoice->order_id)
+                         $siblingInvoicesQuery = static::where('order_id', $invoice->order_id)
                              ->where('id', '!=', $invoice->id)
                              ->whereIn('status', ['paid', 'partially_paid'])
                              ->whereHas('items', function($q) use ($uncoveredServiceIds) {
                                  $q->whereIn('order_service_id', $uncoveredServiceIds);
                              })
-                             ->with('payments')
-                             ->get();
+                             ->with('payments');
+
+                         if ($isSplitInvoice && $invoice->agent_id) {
+                             $siblingInvoicesQuery->where('agent_id', $invoice->agent_id);
+                         }
+
+                         $siblingInvoices = $siblingInvoicesQuery->get();
 
                          foreach ($siblingInvoices as $sibInv) {
                              $sibDirectPaid = (float) $sibInv->payments

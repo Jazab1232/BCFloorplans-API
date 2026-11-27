@@ -808,17 +808,20 @@ class QuickBooksService
      */
     public function syncInvoiceToQB(\App\Models\Invoice $invoice): ?array
     {
-        // 1. Resolve to Main Invoice if this is an individual service invoice
+        // 1. Resolve to Consolidated Invoice for the SAME agent if this is an individual service invoice
         if ($invoice->order_id && $invoice->notes && stripos($invoice->notes, 'service invoice') !== false) {
+            $isCoAgentInvoice = in_array($invoice->agent_type, ['co-agent', 'co_agent'], true);
+
             $mainInvoice = \App\Models\Invoice::with(['order.property', 'items.orderService.service', 'agent', 'order.organization'])
                 ->where('order_id', $invoice->order_id)
+                ->when($invoice->agent_id, fn ($q) => $q->where('agent_id', $invoice->agent_id))
                 ->where(function ($q) {
                     $q->where('notes', 'ilike', '%consolidated%')
                       ->orWhere('notes', 'ilike', '%add-on service invoice%');
                 })
                 ->first();
 
-            if (!$mainInvoice) {
+            if (!$mainInvoice && !$isCoAgentInvoice) {
                 $mainInvoice = \App\Models\Invoice::with(['order.property', 'items.orderService.service', 'agent', 'order.organization'])
                     ->where('order_id', $invoice->order_id)
                     ->where('agent_type', 'primary')
@@ -2529,11 +2532,21 @@ class QuickBooksService
 
         $qbInvoiceId = $mainInvoice->quickbooks_invoice_id;
 
-        // Find all successful payments for this order that have not yet been synced to QB
-        $unsyncedPayments = AgentPayment::where('order_id', $mainInvoice->order_id)
+        // Find all successful payments for this order (scoped to invoice owner on split orders) that have not yet been synced to QB
+        $isSplitOrder = ($mainInvoice->order && (bool) $mainInvoice->order->split_invoice)
+            || !empty($mainInvoice->split_details['splits'])
+            || in_array($mainInvoice->agent_type, ['co-agent', 'co_agent'], true);
+
+        $unsyncedPaymentsQuery = AgentPayment::where('order_id', $mainInvoice->order_id)
             ->where('status', 'succeeded')
             ->where('amount', '>', 0)
-            ->whereNull('quickbooks_payment_id')
+            ->whereNull('quickbooks_payment_id');
+
+        if ($isSplitOrder && $mainInvoice->agent_id) {
+            $unsyncedPaymentsQuery->where('agent_id', $mainInvoice->agent_id);
+        }
+
+        $unsyncedPayments = $unsyncedPaymentsQuery
             ->orderBy('id', 'asc')
             ->get()
             ->values();

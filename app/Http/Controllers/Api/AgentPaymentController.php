@@ -615,14 +615,19 @@ class AgentPaymentController extends Controller
     private function dispatchQuickBooksJob($payment)
     {
         $invoiceId = null;
+        $paymentInvoice = $payment->invoice_id
+            ? \App\Models\Invoice::withoutGlobalScopes()->find($payment->invoice_id)
+            : null;
+        $isCoAgentPayment = $paymentInvoice && in_array($paymentInvoice->agent_type, ['co-agent', 'co_agent'], true);
 
-        // In One Main Invoice Per Order model, always prioritize resolving the Order's Main (Consolidated) Invoice
-        if ($payment->order_id) {
+        // In One Main Invoice Per Order model, resolve the Consolidated Invoice for the payment's agent
+        if ($payment->order_id && !$isCoAgentPayment) {
             $invoiceId = \App\Models\Invoice::where('order_id', $payment->order_id)
                 ->where(function ($q) {
                     $q->where('notes', 'ilike', '%consolidated%')
                       ->orWhere('notes', 'ilike', '%add-on service invoice%');
                 })
+                ->when($payment->agent_id, fn ($q) => $q->where('agent_id', $payment->agent_id))
                 ->value('id');
 
             if (!$invoiceId) {
@@ -634,6 +639,14 @@ class AgentPaymentController extends Controller
                     })
                     ->value('id');
             }
+        } elseif ($payment->order_id && $isCoAgentPayment && $paymentInvoice->agent_id) {
+            $invoiceId = \App\Models\Invoice::where('order_id', $payment->order_id)
+                ->where('agent_id', $paymentInvoice->agent_id)
+                ->where(function ($q) {
+                    $q->where('notes', 'ilike', '%consolidated%')
+                      ->orWhere('notes', 'ilike', '%add-on service invoice%');
+                })
+                ->value('id');
         }
 
         // Fallback to payment's direct invoice_id if no main invoice found

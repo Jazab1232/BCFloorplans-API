@@ -215,32 +215,47 @@ class InvoiceController extends Controller
             ]);
 
             if ($isAgent) {
-                $query->where(function($q) use ($user) {
-                    $q->where('agent_id', $user->id)
-                      ->orWhereHas('order', function($oq) use ($user) {
-                          $oq->where('agent_id', $user->id);
-                      });
-                });
-            } elseif ($isSubAccount) {
-                if ($user->canViewAllAgentOrders()) {
+                if ($request->filled('order_uuid')) {
                     $query->where(function($q) use ($user) {
-                        $q->where('agent_id', $user->agent_id)
+                        $q->where('agent_id', $user->id)
                           ->orWhereHas('order', function($oq) use ($user) {
-                              $oq->where('agent_id', $user->agent_id);
+                              $oq->where('agent_id', $user->id);
                           });
                     });
                 } else {
+                    // On the main invoices list, each agent (primary or co-agent) only sees their own invoices
+                    $query->where('agent_id', $user->id);
+                }
+            } elseif ($isSubAccount) {
+                if ($user->canViewAllAgentOrders()) {
+                    if ($request->filled('order_uuid')) {
+                        $query->where(function($q) use ($user) {
+                            $q->where('agent_id', $user->agent_id)
+                              ->orWhereHas('order', function($oq) use ($user) {
+                                  $oq->where('agent_id', $user->agent_id);
+                              });
+                        });
+                    } else {
+                        $query->where('agent_id', $user->agent_id);
+                    }
+                } else {
                     $subUuid = (string)$user->uuid;
                     $subEmail = (string)$user->primary_email;
-                    $query->where(function($q) use ($subUuid, $subEmail) {
-                        $q->whereHas('order', function($oq) use ($subUuid, $subEmail) {
-                            $oq->whereJsonContains('co_agents', ['agent_uuid' => $subUuid])
-                               ->orWhereJsonContains('co_agents', ['uuid' => $subUuid])
-                               ->orWhereJsonContains('co_agents', ['email' => $subEmail])
-                               ->orWhereJsonContains('co_agents', ['primary_email' => $subEmail])
-                               ->orWhere('co_agents', 'like', '%' . $subEmail . '%')
-                               ->orWhere('co_agents', 'like', '%' . $subUuid . '%');
-                        });
+                    $coAgentRecordId = $subEmail ? Agent::where('email', $subEmail)->value('id') : null;
+                    $query->where(function($q) use ($subUuid, $subEmail, $coAgentRecordId) {
+                        if ($coAgentRecordId) {
+                            $q->where('agent_id', $coAgentRecordId);
+                        } else {
+                            $q->whereIn('agent_type', ['co-agent', 'co_agent'])
+                              ->whereHas('order', function($oq) use ($subUuid, $subEmail) {
+                                  $oq->whereJsonContains('co_agents', ['agent_uuid' => $subUuid])
+                                     ->orWhereJsonContains('co_agents', ['uuid' => $subUuid])
+                                     ->orWhereJsonContains('co_agents', ['email' => $subEmail])
+                                     ->orWhereJsonContains('co_agents', ['primary_email' => $subEmail])
+                                     ->orWhere('co_agents', 'like', '%' . $subEmail . '%')
+                                     ->orWhere('co_agents', 'like', '%' . $subUuid . '%');
+                              });
+                        }
                     });
                 }
             }

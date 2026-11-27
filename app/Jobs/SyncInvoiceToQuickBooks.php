@@ -53,18 +53,21 @@ class SyncInvoiceToQuickBooks implements ShouldQueue
 
         // ONE MAIN INVOICE PER ORDER MODEL:
         // If this is an individual service invoice (e.g. notes = 'Service Invoice: ...'),
-        // resolve the Order's Main (Consolidated) Invoice instead of creating a duplicate QB invoice.
+        // resolve the Consolidated Invoice for the SAME agent instead of creating a duplicate QB invoice.
         if ($invoice->order_id && $invoice->notes && stripos($invoice->notes, 'service invoice') !== false) {
+            $isCoAgentInvoice = in_array($invoice->agent_type, ['co-agent', 'co_agent'], true);
+
             $mainInvoice = Invoice::with(['order.property', 'items.orderService.service', 'agent', 'order.organization'])
                 ->where('order_id', $invoice->order_id)
+                ->when($invoice->agent_id, fn ($q) => $q->where('agent_id', $invoice->agent_id))
                 ->where(function ($q) {
                     $q->where('notes', 'ilike', '%consolidated%')
                       ->orWhere('notes', 'ilike', '%add-on service invoice%');
                 })
                 ->first();
 
-            // Fallback: look for primary agent invoice not flagged as service invoice
-            if (!$mainInvoice) {
+            // Fallback: look for primary agent invoice not flagged as service invoice (only if not a co-agent invoice)
+            if (!$mainInvoice && !$isCoAgentInvoice) {
                 $mainInvoice = Invoice::with(['order.property', 'items.orderService.service', 'agent', 'order.organization'])
                     ->where('order_id', $invoice->order_id)
                     ->where('agent_type', 'primary')
