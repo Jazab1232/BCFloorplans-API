@@ -364,8 +364,9 @@ class ServiceController extends Controller
             'product_options.*.base_sq_ft' => 'nullable|integer|min:0',
             'product_options.*.increment_duration_mins' => 'nullable|integer|min:0',
             'product_options.*.increment_sq_ft' => 'nullable|integer|min:0',
+            'sync_add_ons' => 'sometimes|boolean',
             'add_ons' => 'sometimes|array',
-            'add_ons.*.uuid' => 'sometimes|string|exists:service_add_ons,uuid',
+            'add_ons.*.uuid' => 'sometimes|nullable|string|max:255',
             'add_ons.*.title' => 'required_with:add_ons|string|max:255',
             'add_ons.*.amount' => 'required_with:add_ons|numeric|min:0',
         ], [
@@ -384,7 +385,6 @@ class ServiceController extends Controller
             'product_options.*.amount.numeric' => 'The amount must be a number.',
             'product_options.*.amount.min' => 'The amount must be at least 0.',
             'add_ons.array' => 'Add-ons must be an array.',
-            'add_ons.*.uuid.exists' => 'The selected add-on does not exist.',
             'add_ons.*.title.required_with' => 'Each add-on must have a title.',
             'add_ons.*.title.string' => 'The title of each add-on must be a string.',
             'add_ons.*.title.max' => 'The title of each add-on may not exceed 255 characters.',
@@ -431,6 +431,9 @@ class ServiceController extends Controller
             if (!$orgId && auth()->user() && isset(auth()->user()->organization_id)) {
                 $orgId = auth()->user()->organization_id;
             }
+
+            $shouldSyncAddOns = $request->has('add_ons') || $request->boolean('sync_add_ons');
+            $incomingAddOns = (isset($data['add_ons']) && is_array($data['add_ons'])) ? $data['add_ons'] : [];
 
             if ($orgId) {
                 // Update master service properties (e.g. thumbnail, name, category, colors) if provided
@@ -512,17 +515,23 @@ class ServiceController extends Controller
                     $orgSyncData['options_override'] = $optionsOverride;
                 }
 
-                if ($request->has('add_ons') && is_array($data['add_ons'])) {
+                if ($shouldSyncAddOns) {
                     $addOnsOverride = [];
-                    foreach ($data['add_ons'] as $aoData) {
+                    foreach ($incomingAddOns as $aoData) {
                         $addOnsOverride[] = [
-                            'uuid' => $aoData['uuid'] ?? (string) Str::uuid(),
+                            'uuid' => !empty($aoData['uuid']) ? $aoData['uuid'] : (string) Str::uuid(),
                             'title' => $aoData['title'] ?? null,
                             'amount' => $aoData['amount'] ?? null,
                             'is_enabled' => $aoData['is_enabled'] ?? true,
                         ];
                     }
                     $orgSyncData['add_ons_override'] = $addOnsOverride;
+
+                    // If this service belongs exclusively to this organization (not a shared global service),
+                    // keep master service_add_ons rows synchronized as well so deleted add-ons do not linger.
+                    if ($service->organization_id !== null && (int) $service->organization_id === (int) $orgId) {
+                        $this->syncServiceAddOns($service, $addOnsOverride);
+                    }
                 }
 
                 OrganizationService::updateOrCreate(
@@ -561,31 +570,8 @@ class ServiceController extends Controller
                     $service->productOptions()->delete();
                 }
 
-                if ($request->has('add_ons')) {
-                    $currentAddOnIds = $service->serviceAddOns->pluck('id')->toArray();
-                    $updatedAddOnIds = [];
-
-                    foreach ($data['add_ons'] as $addOnData) {
-                        if (isset($addOnData['uuid'])) {
-                            $addOn = ServiceAddOn::where('uuid', $addOnData['uuid'])->first();
-                            if ($addOn && $addOn->service_id === $service->id) {
-                                $addOn->update($addOnData);
-                                $updatedAddOnIds[] = $addOn->id;
-                            }
-                        } else {
-                            $addOnData['uuid'] = Str::uuid()->toString();
-                            $addOnData['service_id'] = $service->id;
-                            $addOn = $service->serviceAddOns()->create($addOnData);
-                            $updatedAddOnIds[] = $addOn->id;
-                        }
-                    }
-
-                    $addOnsToDelete = array_diff($currentAddOnIds, $updatedAddOnIds);
-                    if (!empty($addOnsToDelete)) {
-                        ServiceAddOn::whereIn('id', $addOnsToDelete)->delete();
-                    }
-                } elseif ($request->add_ons === []) {
-                    $service->serviceAddOns()->delete();
+                if ($shouldSyncAddOns) {
+                    $this->syncServiceAddOns($service, $incomingAddOns);
                 }
             }
 
@@ -1061,7 +1047,7 @@ class ServiceController extends Controller
             $service->setRelation('productOptions', $sortedOptions);
         }
 
-        if (!empty($override->add_ons_override) && is_array($override->add_ons_override)) {
+        if ($override->add_ons_override !== null && is_array($override->add_ons_override)) {
             $masterAddOnsByUuid = $service->serviceAddOns->keyBy('uuid');
             $customizedAddOns = collect();
 
@@ -1099,5 +1085,45 @@ class ServiceController extends Controller
         }
 
         return $service;
+    }
+
+    private function syncServiceAddOns(Service $service, array $incomingAddOns): void
+    {
+        $currentAddOnIds = $service->serviceAddOns()->pluck('id')->toArray();
+        $updatedAddOnIds = [];
+
+        foreach ($incomingAddOns as $addOnData) {
+            $addOn = null;
+            if (!empty($addOnData['uuid'])) {
+                $addOn = ServiceAddOn::where('uuid', $addOnData['uuid'])
+                    ->where('service_id', $service->id)
+                    ->first();
+            }
+
+            if ($addOn) {
+                $addOn->update([
+                    'title' => $addOnData['title'],
+                    'amount' => $addOnData['amount'],
+                ]);
+                $updatedAddOnIds[] = $addOn->id;
+            } else {
+                $candidateUuid = !empty($addOnData['uuid']) ? $addOnData['uuid'] : (string) Str::uuid();
+                if (ServiceAddOn::where('uuid', $candidateUuid)->exists()) {
+                    $candidateUuid = (string) Str::uuid();
+                }
+                $created = $service->serviceAddOns()->create([
+                    'uuid' => $candidateUuid,
+                    'service_id' => $service->id,
+                    'title' => $addOnData['title'],
+                    'amount' => $addOnData['amount'],
+                ]);
+                $updatedAddOnIds[] = $created->id;
+            }
+        }
+
+        $addOnsToDelete = array_diff($currentAddOnIds, $updatedAddOnIds);
+        if (!empty($addOnsToDelete)) {
+            ServiceAddOn::whereIn('id', $addOnsToDelete)->delete();
+        }
     }
 }
